@@ -1,0 +1,40 @@
+# Decision Log
+
+This log records product decisions that define the V1 baseline. Dates use the project timezone.
+
+| Date | Decision | Rationale and consequence |
+| --- | --- | --- |
+| 2026-07-30 | Name the product `Speech Capture` and use plugin ID `speech-capture`. | The identity is concise and can cover audio intake, transcript review, and knowledge capture. Registry availability must be checked again before community submission. |
+| 2026-07-30 | Build a companion Worker rather than running large models inside Obsidian. | Long jobs, ML runtimes, recovery, and remote processing need an independent durable service. |
+| 2026-07-30 | Make local processing the default. | Private audio stays on user-owned hardware; cloud fallback remains optional and explicit. |
+| 2026-07-30 | Target Apple Silicon macOS for the V1 Worker. | `mlx-qwen3-asr` and the current personal environment make this the smallest reliable first platform. |
+| 2026-07-30 | Use a provider-independent HTTPS Worker API. | Google Drive, Obsidian Sync, iCloud, Dropbox, or another sync tool can change without redesigning task transport. |
+| 2026-07-30 | Recommend Tailscale for remote V1 access, without hardcoding it. | It provides a practical private network while preserving protocol portability. |
+| 2026-07-30 | Run the Worker as a background service and persist pairing. | Accepted jobs continue without Obsidian or a graphical Worker window; routine restart does not require re-pairing. |
+| 2026-07-30 | Treat disk encryption as an explicit operational boundary. | A service cannot access models or data until an encrypted disk is unlocked. |
+| 2026-07-30 | Support multiple Vaults and Workers, with one default Worker per Vault. | The data model stays usable beyond a single personal machine without making the first flow complex. |
+| 2026-07-30 | Use resumable chunked uploads and whole-file verification. | Large remote files must survive disconnects and must not enter ASR when incomplete. |
+| 2026-07-30 | Show progressive transcript results after verified upload. | Long processing should provide visible value and state without pretending provisional text is final. |
+| 2026-07-30 | Default to Qwen3-ASR 1.7B and offer 0.6B as a speed profile. | Accuracy is preferred, with an explicit lighter option for constrained resources. |
+| 2026-07-30 | Add local pyannote diarization for multi-speaker material. | Meetings and interviews require speaker distinction; names remain user-confirmed. |
+| 2026-07-30 | Use local Ollama hierarchical summarization with Qwen3 14B and an 8B lighter profile. | Every chunk must participate in extraction; summary and ASR resource choices remain independent. |
+| 2026-07-30 | Automatically detect content type and permit override. | The output should adapt to meetings, interviews, courses, speeches, memos, and unknown material. |
+| 2026-07-30 | Preserve spoken language and default structured notes to Simplified Chinese. | Code-switching and proper nouns remain faithful; translation is a separate optional product behavior. |
+| 2026-07-30 | Store raw evidence, reviewed transcript, structured JSON, and a human note separately. | Corrections and summaries must not destroy or obscure original model output. |
+| 2026-07-30 | Require stable evidence links for important generated claims. | Summary usefulness must be auditable against the transcript. |
+| 2026-07-30 | Protect `我的补充` and other user-owned content during regeneration. | A model refresh cannot overwrite human notes. |
+| 2026-07-30 | Resolve recording date by explicit input, metadata, filename, suggested birth time, then `Undated`. | Old recordings cannot be organized reliably by import date alone. |
+| 2026-07-30 | Default the Vault-relative output root to `Work/Speech Notes/`. | It fits the personal Vault while remaining portable and configurable. |
+| 2026-07-30 | Use a queue with one active full processing job by default. | Resource-heavy local inference needs predictable memory and thermal behavior. |
+| 2026-07-30 | Reserve the larger of 20 GB or 10% free disk. | The system should block safely before large temporary files threaten the host. |
+| 2026-07-30 | Pause safely under severe sustained memory pressure. | Slower processing is acceptable; silent corruption or system instability is not. |
+| 2026-07-30 | Separate `processed` from `published`. | Remote completion can occur while no device is available to write the target Vault. |
+| 2026-07-30 | Use one publication lease per job and Vault. | Multiple synced devices must not race to write the same package. |
+| 2026-07-30 | Disable cloud fallback and telemetry by default. | Privacy-boundary changes require explicit informed action. |
+| 2026-07-30 | Keep real test recordings local and outside Git. | Personal audio will validate quality without becoming repository or cloud data. |
+| 2026-07-30 | Align the UI direction with Reading Capture. | The two Obsidian tools should feel related while Speech Capture remains optimized for long-running tasks and evidence review. |
+| 2026-07-30 | Defer interview-intent recognition to a later version. | V1 prioritizes faithful transcription and useful evidence-based extraction. |
+| 2026-07-30 | Develop as a monorepo and publish a design baseline before functional code. | Protocol, Worker, Manager, and plugin changes need one coordinated history initially. |
+| 2026-07-30 | Use PolyForm Noncommercial License 1.0.0. | Personal learning and noncommercial use are allowed; commercial use requires separate permission. |
+
+New decisions should be appended with their alternatives and compatibility impact. Existing rows should not be rewritten merely because implementation work begins.

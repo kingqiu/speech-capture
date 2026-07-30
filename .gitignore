@@ -1,0 +1,52 @@
+# macOS
+.DS_Store
+
+# JavaScript / TypeScript
+node_modules/
+dist/
+build/
+coverage/
+*.tsbuildinfo
+.pnpm-store/
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Swift / Xcode
+.build/
+DerivedData/
+*.xcworkspace/xcuserdata/
+*.xcodeproj/xcuserdata/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+.secrets/
+*.pem
+*.key
+*.p12
+*.mobileprovision
+
+# Speech Capture local state
+models/
+runtime/
+artifacts/
+tmp/
+*.log
+
+# Private and generated test data
+test-data-private/
+tests/fixtures/private/
+tests/output/
+
+# Editors
+.idea/
+.vscode/
