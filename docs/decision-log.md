@@ -39,5 +39,6 @@ This log records product decisions that define the V1 baseline. Dates use the pr
 | 2026-07-30 | Keep 1.7B as the accuracy default and validate 0.6B as the speed profile. | On the first bilingual synthetic fixture, 1.7B reached 0% CER while 0.6B reached 1.05% CER; 0.6B completed in about 40% of the elapsed time and used about 61% of measured peak process memory. Real-audio testing remains required. |
 | 2026-07-30 | Persist Worker jobs, events, and private checkpoints in SQLite with WAL and full synchronous durability. | Job state and event history commit atomically; private processing payloads remain separate from routine events. |
 | 2026-07-30 | Recover interrupted processing to `queued` and interrupted publication to `processed`. | The active work unit can retry from checkpoints while completed evidence and unpublished artifacts remain intact. |
+| 2026-07-30 | Require explicit design approval before implementing the Obsidian frontend. | The Worker contract is completed first; page architecture, state coverage, and key interaction visuals generated through Codex GPT Image are then reviewed with the project owner. This prevents unconfirmed flows from becoming implementation constraints. |
 
 New decisions should be appended with their alternatives and compatibility impact. Existing rows should not be rewritten merely because implementation work begins.

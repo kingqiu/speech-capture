@@ -30,24 +30,55 @@ Goal: prove the two most uncertain foundations before building a polished plugin
 
 Exit condition: at least one representative long recording is completely accounted for, speaker labeling is measurable, and important summary claims link to evidence.
 
-## Phase 2 — Local personal alpha
+## Phase 2 — Backend personal alpha
 
-Goal: complete the full same-Mac workflow.
+Goal: complete the durable local processing contract before frontend implementation.
 
 - versioned protocol and generated types;
 - durable Worker database and artifact store;
 - local pairing and authentication;
-- Obsidian submission flow;
+- resumable intake and source verification;
 - job queue and resource preflight;
-- progressive transcript preview;
+- progressive transcript snapshot and event contract;
 - content detection and structured output;
-- atomic Vault publication;
+- publication protocol and atomic-package fixtures;
 - transcript corrections and protected human sections;
 - basic Worker Manager setup.
 
-Exit condition: a user can process and publish real recordings locally without using development commands.
+Exit condition: representative local jobs can be submitted through backend test tools, processed, recovered, and published through stable protocol fixtures, with every plugin-visible state represented.
 
-## Phase 3 — Remote personal alpha
+## Phase 3 — Obsidian interaction design gate
+
+Goal: validate the complete plugin experience before writing its user-facing pages.
+
+- page and navigation information architecture;
+- local and remote end-to-end wireflows;
+- complete normal, warning, blocked, interrupted, recovery, and publication state matrix;
+- protocol-to-interface mappings;
+- Reading Capture-aligned visual system and component direction;
+- key interaction visuals generated through Codex GPT Image with synthetic data;
+- narrow-pane, keyboard, reduced-motion, light-theme, and dark-theme behavior;
+- project-owner review, revision, and explicit approval.
+
+Exit condition: the project owner approves the task workbench, progressive transcript, reader, speaker review, resource warning, reconnect, and publication designs. No Obsidian page implementation begins before this condition is met.
+
+## Phase 4 — Obsidian local personal alpha
+
+Goal: implement the approved same-Mac plugin workflow.
+
+- Obsidian source selection and submission;
+- Worker selection and local connection states;
+- upload, verification, queue, and job controls;
+- progressive transcript preview;
+- disk, memory, model, and recovery actions;
+- atomic Vault publication;
+- transcript reader, speaker review, and corrections;
+- structured-note regeneration with protected human sections;
+- accessibility and theme conformance.
+
+Exit condition: a user can process, review, and publish real recordings locally without using development commands, and the implementation matches the approved design contract.
+
+## Phase 5 — Remote personal alpha
 
 Goal: submit from another Obsidian desktop and continue independently.
 
@@ -62,7 +93,7 @@ Goal: submit from another Obsidian desktop and continue independently.
 
 Exit condition: a laptop can submit, disconnect, and later receive a verified package processed by the home Mac.
 
-## Phase 4 — Reliability and quality
+## Phase 6 — Reliability and quality
 
 Goal: turn the personal alpha into a dependable daily tool.
 
@@ -78,22 +109,22 @@ Goal: turn the personal alpha into a dependable daily tool.
 
 Exit condition: the acceptance principles in the product requirements pass on the private test matrix.
 
-## Phase 5 — Packaging and design refinement
+## Phase 7 — Packaging and experience refinement
 
-Goal: remove developer-only setup and finalize the experience.
+Goal: remove developer-only setup and refine the approved experience without changing its core flows silently.
 
 - packaged Worker runtime;
 - model download, activation, and rollback;
 - refined SwiftUI Worker Manager;
-- Reading Capture-aligned component system;
-- high-fidelity workbench and reader states;
+- component-level polish and design QA;
+- additional long-tail workbench and reader states;
 - accessibility and localization;
 - controlled plugin and Worker update flow;
 - install, update, downgrade, and uninstall tests.
 
 Exit condition: the project owner can install a clean build on a fresh supported Mac and recover from common failures without opening a terminal.
 
-## Phase 6 — Friend-ready preview
+## Phase 8 — Friend-ready preview
 
 Goal: safely share the noncommercial personal version.
 

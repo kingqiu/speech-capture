@@ -55,6 +55,7 @@ The V1 Worker targets Apple Silicon Macs. The plugin protocol is designed so oth
 - [Testing strategy](docs/testing-strategy.md)
 - [Local model spike](docs/model-spike.md)
 - [UI direction](docs/ui-direction.md)
+- [Obsidian frontend design gate](docs/frontend-design-gate.md)
 - [Decision log](docs/decision-log.md)
 - [Roadmap](docs/roadmap.md)
 - [Reference projects](docs/references.md)

@@ -215,7 +215,18 @@ V1 may define provider interfaces without shipping a cloud provider implementati
 
 The schema may reserve optional fields for future interview-intent analysis without implementing the feature.
 
-## 11. Acceptance principles
+## 11. Frontend design and approval gate
+
+The Obsidian user-facing pages are implemented only after:
+
+- the Worker and protocol behaviors required by the personal V1 are stable enough to drive every visible state;
+- page information architecture, end-to-end flows, state coverage, and protocol-to-interface mappings are documented;
+- key interaction visuals are produced with the GPT Image capability provided through Codex, using synthetic data only;
+- the project owner reviews the design and gives explicit approval.
+
+Backend and protocol work continues before this approval. User-facing plugin page code does not. The required deliverables and approval checklist are defined in [Obsidian Frontend Design Gate](frontend-design-gate.md).
+
+## 12. Acceptance principles
 
 A V1 release is not acceptable unless:
 
@@ -226,4 +237,5 @@ A V1 release is not acceptable unless:
 - all critical decisions and actions in the structured note are evidence-linked;
 - unsupported critical claims are absent;
 - restart, disconnect, low-disk, and memory-pressure paths have been tested;
+- the approved frontend design states and recovery actions are represented in the implementation;
 - private test audio and credentials remain outside Git.
