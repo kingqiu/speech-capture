@@ -28,6 +28,7 @@ The Worker core now has an executable local foundation for:
 - one-chunk-at-a-time local MLX execution, retry, replay, and safe resource pause;
 - durable whole-transcript alignment, evidence, and timeline-readiness reports;
 - a strict completeness gate before speaker diarization;
+- conservative, checksummed PCM evidence for uncovered timeline ranges;
 - stable machine-readable errors;
 - a developer CLI.
 
@@ -64,6 +65,7 @@ This is not yet the network Worker service. It can execute or replay one local A
 27. A job cannot enter diarization until every planned chunk has matching durable raw evidence and a materialization checkpoint.
 28. A job cannot enter diarization while transcribed timing is estimated, a source range lacks a stable outcome, or an inaudible or failed range remains.
 29. Alignment checkpoints contain ranges, counts, and stable issue codes, but never transcript text.
+30. Gap analysis may prove sufficiently long near-digital silence, but audible or uncertain PCM remains unresolved and cannot be silently labeled non-speech.
 
 ## 3. SQLite layout
 
@@ -516,6 +518,26 @@ job in `aligning`. Only a fully verified report advances the job to `diarizing`.
 Calling the finalizer again after restart returns the same report without a
 second model call or a duplicate state transition.
 
+### 12.6 Conservative PCM gap evidence
+
+While a job remains in `aligning`, `analyze-gaps` reads the exact unresolved
+ranges from the durable alignment report and measures them against the
+checksummed normalized WAV. The resulting `gap_audio_evidence` checkpoint stores:
+
+- source and PCM frame boundaries;
+- duration, peak amplitude, RMS, and nonzero-sample ratio;
+- the ratio of quiet measurement windows;
+- either `definite_silence` or `unresolved`;
+- one stable reason code;
+- the source alignment-report generation and payload SHA-256.
+
+Only a range at least 100 ms long whose every PCM sample stays at or below the
+default near-digital-silence threshold is classified as definite silence.
+Short, audible, unavailable, or otherwise uncertain PCM remains unresolved.
+The report contains no transcript text, filenames, or absolute paths. Repeating
+the same analysis is idempotent; revising the source alignment report creates a
+new anchored gap-evidence generation.
+
 ## 13. Developer CLI
 
 From `services/speech-worker/`:
@@ -573,6 +595,10 @@ uv run speech-capture-worker run-asr-next \
   job_example
 
 uv run speech-capture-worker finalize-alignment \
+  --data-dir runtime/dev-worker \
+  job_example
+
+uv run speech-capture-worker analyze-gaps \
   --data-dir runtime/dev-worker \
   job_example
 
@@ -650,6 +676,11 @@ The Worker package currently tests:
 - estimated-timing and missing-evidence blocking;
 - alignment-finalization idempotency across Worker restart;
 - machine-readable `finalize-alignment` CLI output.
+- conservative definite-silence classification and short-gap rejection;
+- audible-PCM preservation as unresolved evidence;
+- alignment-report validation, generation anchoring, and idempotent replay;
+- normalized-audio tamper rejection;
+- machine-readable `analyze-gaps` CLI output.
 
 A separate CLI integration run advanced a job to `transcribing`, closed the store, recovered it to `queued`, and verified all seven events and database integrity.
 
@@ -661,7 +692,7 @@ The scheduler integration continued that source into a bound revision-three queu
 
 The next layer will add:
 
-1. classify silence, non-speech, and unresolved gaps so incomplete alignment reports can reach full timeline accounting safely;
+1. materialize proven silence as an explicit timeline outcome and safely classify the remaining non-speech or inaudible gaps;
 2. add a controlled forced-alignment fallback for any stable text that still has estimated timing;
 3. integrate pyannote diarization and anonymous speaker attribution;
 4. run a continuous restart-safe stage loop rather than one backend command per chunk;

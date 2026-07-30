@@ -1,6 +1,6 @@
 # Speech Capture Worker
 
-Status: local model spike, persistent Worker core, durable media intake, one-active-job scheduling, progressive transcript persistence, deterministic normalization, restart-safe local ASR chunk execution, and durable whole-transcript alignment finalization. There is no network Worker service yet.
+Status: local model spike, persistent Worker core, durable media intake, one-active-job scheduling, progressive transcript persistence, deterministic normalization, restart-safe local ASR chunk execution, durable whole-transcript alignment finalization, and conservative PCM gap evidence. There is no network Worker service yet.
 
 The Worker performs durable local processing outside Obsidian. It will own:
 
@@ -37,6 +37,8 @@ The package now contains:
 - real MLX Qwen3-ASR chunk execution with validation, retry, and safe boundary pause;
 - a private alignment report that separately proves raw evidence, aligned timing,
   complete timeline accounting, and transcript completeness before diarization;
+- a private gap-analysis report that classifies only sufficiently long
+  near-digital silence and leaves all audible or uncertain PCM unresolved;
 - idempotent creation, revision guards, and restart recovery;
 - disk and memory preflight.
 
@@ -91,9 +93,18 @@ uv run speech-capture-worker run-asr-next \
 uv run speech-capture-worker finalize-alignment \
   --data-dir runtime/dev-worker \
   job_example
+
+uv run speech-capture-worker analyze-gaps \
+  --data-dir runtime/dev-worker \
+  job_example
 ```
 
 `runtime/` is ignored by Git. The CLI requires an explicit data directory and does not create a global service installation.
+
+`analyze-gaps` consumes the latest durable alignment report while the job remains
+in `aligning`. Its evidence is anchored to that report generation and the
+checksummed normalized WAV. It does not infer non-speech from audible PCM or
+advance the job by itself.
 
 Upload completion requires FFprobe. The packaged Worker will own that dependency; during development it must be available on `PATH`.
 

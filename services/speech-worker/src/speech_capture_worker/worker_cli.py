@@ -22,6 +22,12 @@ from speech_capture_worker.domain import (
     UploadCreateRequest,
 )
 from speech_capture_worker.errors import UploadStorageError, WorkerCoreError
+from speech_capture_worker.gap_analysis import (
+    DEFAULT_DEFINITE_SILENCE_PEAK,
+    DEFAULT_MIN_DEFINITE_SILENCE_MS,
+    DEFAULT_WINDOW_MS,
+    TranscriptGapAnalyzer,
+)
 from speech_capture_worker.job_store import JobStore
 from speech_capture_worker.resources import (
     check_resource_preflight,
@@ -292,6 +298,24 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     _add_data_dir(finalize_alignment)
     finalize_alignment.add_argument("job_id")
+
+    analyze_gaps = subparsers.add_parser(
+        "analyze-gaps",
+        help="Measure conservative PCM evidence for uncovered timeline ranges.",
+    )
+    _add_data_dir(analyze_gaps)
+    analyze_gaps.add_argument("job_id")
+    analyze_gaps.add_argument("--window-ms", type=int, default=DEFAULT_WINDOW_MS)
+    analyze_gaps.add_argument(
+        "--minimum-definite-silence-ms",
+        type=int,
+        default=DEFAULT_MIN_DEFINITE_SILENCE_MS,
+    )
+    analyze_gaps.add_argument(
+        "--definite-silence-peak-threshold",
+        type=int,
+        default=DEFAULT_DEFINITE_SILENCE_PEAK,
+    )
 
     list_asr_attempts = subparsers.add_parser(
         "list-asr-attempts",
@@ -592,6 +616,17 @@ def _dispatch(args: argparse.Namespace) -> int:
                 }
                 else 2
             )
+        if args.command == "analyze-gaps":
+            result = TranscriptGapAnalyzer(
+                store,
+                window_ms=args.window_ms,
+                minimum_definite_silence_ms=args.minimum_definite_silence_ms,
+                definite_silence_peak_threshold=(
+                    args.definite_silence_peak_threshold
+                ),
+            ).analyze(args.job_id)
+            _write_json(result.to_dict())
+            return 0
         if args.command == "list-asr-attempts":
             attempts = store.list_asr_attempts(
                 args.job_id,

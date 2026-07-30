@@ -118,6 +118,9 @@ For each validated source:
 - estimated transcript timing blocks the alignment exit gate;
 - uncovered ranges are persisted without transcript text and block diarization;
 - a complete report is idempotent across restart and advances exactly once.
+- uncovered-range PCM evidence is anchored to the exact alignment report and normalized-audio checksum;
+- only sufficiently long near-digital silence receives a definite classification;
+- short or audible PCM remains unresolved, and changed normalized audio invalidates prior measurement assumptions.
 
 The core automated assertion is:
 

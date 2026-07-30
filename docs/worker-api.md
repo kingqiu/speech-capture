@@ -170,6 +170,19 @@ not expose transcript text through routine events or diagnostics. Estimated
 timing, missing evidence, uncovered ranges, and partial outcomes keep the job
 out of diarization.
 
+### 7.3 Conservative uncovered-range evidence
+
+The core developer boundary can analyze the unresolved ranges in the latest
+alignment report against the private normalized PCM. The persisted report is
+anchored to the alignment-report generation and checksum and contains only
+range boundaries, aggregate amplitude measurements, stable classifications,
+and reason codes.
+
+Only sufficiently long near-digital silence is reported as
+`definite_silence`. Audible, short, missing, or uncertain PCM is reported as
+`unresolved`; it is not assumed to be non-speech. This command does not expose
+transcript text, change stable transcript outcomes, or advance the job.
+
 ## 8. Job snapshot
 
 The implemented core snapshot is an internally consistent, bounded read containing:
