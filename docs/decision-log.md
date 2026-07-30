@@ -36,5 +36,6 @@ This log records product decisions that define the V1 baseline. Dates use the pr
 | 2026-07-30 | Defer interview-intent recognition to a later version. | V1 prioritizes faithful transcription and useful evidence-based extraction. |
 | 2026-07-30 | Develop as a monorepo and publish a design baseline before functional code. | Protocol, Worker, Manager, and plugin changes need one coordinated history initially. |
 | 2026-07-30 | Use PolyForm Noncommercial License 1.0.0. | Personal learning and noncommercial use are allowed; commercial use requires separate permission. |
+| 2026-07-30 | Keep 1.7B as the accuracy default and validate 0.6B as the speed profile. | On the first bilingual synthetic fixture, 1.7B reached 0% CER while 0.6B reached 1.05% CER; 0.6B completed in about 40% of the elapsed time and used about 61% of measured peak process memory. Real-audio testing remains required. |
 
 New decisions should be appended with their alternatives and compatibility impact. Existing rows should not be rewritten merely because implementation work begins.

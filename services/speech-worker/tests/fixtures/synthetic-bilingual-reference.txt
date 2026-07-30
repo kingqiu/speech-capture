@@ -1,0 +1,1 @@
+这是语音捕捉项目的双语模型测试。第一项任务是确认每一段音频都有明确的处理结果。第二项任务是检查长音频分块之间没有静默丢失。第三项任务是保存原始逐字稿，并记录模型运行的速度、内存和时间戳。Speech Capture keeps the original transcript. The worker must not silently drop any spoken content. Every important summary claim must link back to evidence. 最后一项任务是验证中文和英文切换以后，系统仍然能够继续识别。遇到磁盘空间不足或者内存压力时，任务应该安全暂停。这个合成样本不包含任何真实用户信息。
