@@ -1,0 +1,68 @@
+{
+  "benchmark_version": "1.0.0",
+  "date": "2026-07-30",
+  "environment": {
+    "chip_class": "Apple M4",
+    "unified_memory_gib": 32,
+    "python": "3.11.14",
+    "mlx_qwen3_asr": "0.3.5",
+    "ffmpeg": "8.0.1"
+  },
+  "fixture": {
+    "kind": "synthetic_system_speech",
+    "languages": [
+      "zh-CN",
+      "en-US",
+      "zh-CN"
+    ],
+    "container": "M4A",
+    "codec": "AAC",
+    "duration_sec": 47.987,
+    "reference_characters_normalized": 286,
+    "private_data": false
+  },
+  "forced_aligner": "Qwen/Qwen3-ForcedAligner-0.6B",
+  "profiles": [
+    {
+      "model": "Qwen/Qwen3-ASR-1.7B",
+      "model_load_sec": 2.616071,
+      "elapsed_sec": 29.619412,
+      "real_time_factor": 0.617238,
+      "time_to_first_completed_chunk_sec": 15.792959,
+      "max_resident_set_bytes": 5746573312,
+      "chunk_count": 2,
+      "timestamp_segment_count": 179,
+      "truncated": false,
+      "timeline_complete": true,
+      "timestamp_issues": 0,
+      "character_error_distance": 0,
+      "character_error_rate": 0.0
+    },
+    {
+      "model": "Qwen/Qwen3-ASR-0.6B",
+      "model_load_sec": 0.84974,
+      "elapsed_sec": 11.758333,
+      "real_time_factor": 0.245032,
+      "time_to_first_completed_chunk_sec": 6.142914,
+      "max_resident_set_bytes": 3533242368,
+      "chunk_count": 2,
+      "timestamp_segment_count": 178,
+      "truncated": false,
+      "timeline_complete": true,
+      "timestamp_issues": 0,
+      "character_error_distance": 3,
+      "character_error_rate": 0.01048951048951049
+    }
+  ],
+  "interpretation": {
+    "accuracy_default": "Qwen/Qwen3-ASR-1.7B",
+    "speed_profile": "Qwen/Qwen3-ASR-0.6B",
+    "speed_profile_relative_elapsed_time": 0.396982,
+    "limitations": [
+      "Synthetic speech is easier than many real recordings.",
+      "One fixture cannot establish a production quality threshold.",
+      "Speaker diarization was not exercised.",
+      "Long multi-hour memory stability was not exercised."
+    ]
+  }
+}

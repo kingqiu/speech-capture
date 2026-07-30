@@ -43,9 +43,9 @@ tmp/
 *.log
 
 # Private and generated test data
-test-data-private/
-tests/fixtures/private/
-tests/output/
+**/test-data-private/
+**/tests/fixtures/private/
+**/tests/output/
 
 # Editors
 .idea/

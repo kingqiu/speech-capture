@@ -52,6 +52,7 @@ The V1 Worker targets Apple Silicon Macs. The plugin protocol is designed so oth
 - [Data model and output package](docs/data-model-and-output.md)
 - [Security, privacy, and recovery](docs/security-privacy-and-recovery.md)
 - [Testing strategy](docs/testing-strategy.md)
+- [Local model spike](docs/model-spike.md)
 - [UI direction](docs/ui-direction.md)
 - [Decision log](docs/decision-log.md)
 - [Roadmap](docs/roadmap.md)
