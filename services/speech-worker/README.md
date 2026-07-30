@@ -1,6 +1,6 @@
 # Speech Capture Worker
 
-Status: local model spike and persistent Worker core. There is no network Worker service yet.
+Status: local model spike, persistent Worker core, and durable media intake. There is no network Worker service yet.
 
 The Worker performs durable local processing outside Obsidian. It will own:
 
@@ -21,7 +21,14 @@ Planned implementation: Python 3.11, FastAPI, SQLite, FFmpeg, MLX, pyannote, Oll
 
 ## Persistent Worker core
 
-The package now contains a strict job state machine, SQLite job/event/checkpoint storage, idempotent creation, revision guards, restart recovery, and disk/memory preflight.
+The package now contains:
+
+- a strict job state machine;
+- SQLite job, event, checkpoint, upload-manifest, and part-receipt storage;
+- resumable checksum-bound upload parts;
+- atomic whole-source assembly and FFprobe validation;
+- idempotent creation, revision guards, and restart recovery;
+- disk and memory preflight.
 
 Developer commands:
 
@@ -36,9 +43,20 @@ uv run speech-capture-worker preflight \
   --profile accuracy \
   --source-size-bytes 536870912 \
   --duration-sec 3600
+
+uv run speech-capture-worker create-upload \
+  --data-dir runtime/dev-worker \
+  --vault-id vault_primary \
+  --source-name meeting.m4a \
+  --source-sha256 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  --source-size-bytes 536870912 \
+  --media-type audio/mp4 \
+  --idempotency-key upload-test-001
 ```
 
 `runtime/` is ignored by Git. The CLI requires an explicit data directory and does not create a global service installation.
+
+Upload completion requires FFprobe. The packaged Worker will own that dependency; during development it must be available on `PATH`.
 
 See [Persistent Worker core](../../docs/worker-core.md) for state, schema, recovery, resource rules, and current boundaries.
 

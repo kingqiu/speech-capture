@@ -12,10 +12,14 @@ The Worker core now has an executable local foundation for:
 - private stage checkpoints;
 - safe restart recovery;
 - disk and memory preflight;
+- idempotent upload manifests;
+- resumable checksum-bound upload parts;
+- atomic whole-source assembly and SHA-256 verification;
+- FFprobe audio-stream and duration validation;
 - stable machine-readable errors;
 - a developer CLI.
 
-This is not yet the network Worker service. It does not accept uploads, run the ASR pipeline as a queued job, expose FastAPI, authenticate devices, or publish to a Vault.
+This is not yet the network Worker service. It does not run the ASR pipeline as a queued job, expose FastAPI, authenticate devices, or publish to a Vault.
 
 ## 2. Core invariants
 
@@ -29,10 +33,13 @@ This is not yet the network Worker service. It does not accept uploads, run the 
 8. Stage checkpoints survive pause, failure, cancellation, and Worker restart.
 9. Routine job events never contain transcript text.
 10. A job cannot start model work after a blocking resource preflight.
+11. An accepted upload part cannot change checksum unless corruption recovery first invalidates its receipt.
+12. A source becomes complete only after part, byte-length, whole-file checksum, and media checks pass.
+13. Worker records and CLI responses never expose the absolute source-storage path.
 
 ## 3. SQLite layout
 
-Schema version one contains three tables:
+Schema version two contains five tables:
 
 ### 3.1 `jobs`
 
@@ -79,6 +86,30 @@ Writing the same payload is idempotent. Replacing it increments the checkpoint g
 
 Transcript text may exist inside this private table later. It is never copied into state events or routine progress logs.
 
+### 3.4 `uploads`
+
+Stores:
+
+- Worker upload ID and Vault identity;
+- display-only filename, media type, source byte size, and whole-file SHA-256;
+- Worker-selected chunk size and part count;
+- upload state and safe error;
+- idempotency key and request fingerprint;
+- detected media format, audio duration, and audio-stream count after verification;
+- a Worker-relative source location, never an absolute path.
+
+States are `uploading`, `verifying`, `complete`, and `failed`. A failed manifest can retry verification when the failure is recoverable, such as repairing a missing FFprobe runtime.
+
+### 3.5 `upload_parts`
+
+Stores one durable receipt per 1-based part number:
+
+- exact byte length;
+- SHA-256;
+- creation and update timestamps.
+
+Binary part data lives under the private Worker application-data directory. Database receipts contain no audio bytes.
+
 ## 4. Durability configuration
 
 The current store uses:
@@ -94,6 +125,16 @@ The current store uses:
 - a newly created application-data directory mode `0700`.
 
 The Worker Manager will own the final application-data directory. The developer CLI requires an explicit directory and does not invent a global location.
+
+Upload parts and assembled sources use:
+
+- private directories with mode `0700`;
+- files created with mode `0600`;
+- same-directory temporary files;
+- file and directory `fsync`;
+- atomic replace;
+- generated upload IDs and part numbers rather than user-supplied path components;
+- symbolic-link and resolved-path boundary checks.
 
 ## 5. State machine
 
@@ -214,7 +255,39 @@ Every issue includes:
 
 Speech Capture never deletes unrelated files in response.
 
-## 9. Developer CLI
+## 9. Durable media intake
+
+### 9.1 Manifest and chunk policy
+
+The client declares source size, media type, and whole-file SHA-256. The Worker chooses an 8 MiB default part size and may increase it for very large files while remaining within the supported part-count and 64 MiB per-part limits.
+
+Part numbers are 1-based. Each accepted part must:
+
+- fall within the manifest's part range;
+- have the exact expected length, including the shorter final part;
+- match the client-declared part SHA-256;
+- either be new or match the checksum already bound to that part number.
+
+Parts can arrive out of order. Repeating an identical part is idempotent. A reconnecting client reads received-byte and part counts plus the exact missing part numbers.
+
+### 9.2 Completion
+
+Completion first verifies that every database receipt exists. The Worker then:
+
+1. streams every part in order into a private temporary file;
+2. rechecks each persisted part's length and SHA-256;
+3. verifies assembled byte length and whole-file SHA-256;
+4. runs FFprobe and requires at least one positive-duration audio stream;
+5. atomically replaces the final Worker-owned source;
+6. marks the manifest `complete`.
+
+A corrupt persisted part has its receipt removed and returns the manifest to `uploading`, allowing only that part to be sent again. A whole-source checksum or media failure preserves all parts and records a stable safe error. No transcription state can use this source yet; verified-upload-to-job binding is the next boundary.
+
+### 9.3 Restart recovery
+
+If the Worker stops during assembly or media probing, startup recovery moves `verifying` back to `uploading`, preserves every accepted part, removes only Worker-owned incomplete assembly files, and allows completion to be retried.
+
+## 10. Developer CLI
 
 From `services/speech-worker/`:
 
@@ -235,13 +308,22 @@ uv run speech-capture-worker create-job \
   --source-sha256 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
   --source-size-bytes 536870912 \
   --idempotency-key local-test-001
+
+uv run speech-capture-worker create-upload \
+  --data-dir runtime/dev-worker \
+  --vault-id vault_primary \
+  --source-name meeting.m4a \
+  --source-sha256 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  --source-size-bytes 536870912 \
+  --media-type audio/mp4 \
+  --idempotency-key upload-test-001
 ```
 
-Additional development commands list jobs, apply guarded transitions, read events, run recovery, and check database integrity.
+Additional development commands store upload parts, report missing parts, complete and media-verify uploads, list jobs, apply guarded transitions, read events, run recovery, and check database integrity.
 
 The CLI is an engineering tool. The Obsidian plugin will eventually call the versioned Worker API rather than shell commands.
 
-## 10. Test evidence
+## 11. Test evidence
 
 The Worker package currently tests:
 
@@ -262,17 +344,30 @@ The Worker package currently tests:
 - memory and swap warning and blocked states;
 - model-profile memory minimums;
 - CLI initialization, idempotency, listing, and stable errors.
+- schema-one to schema-two migration;
+- idempotent upload creation and manifest conflicts;
+- out-of-order part receipt and exact resume status;
+- part checksum, size, number, and replacement conflicts;
+- incomplete-upload reporting;
+- whole-source checksum and FFprobe gates;
+- corrupt persisted-part recovery;
+- interrupted verification recovery;
+- concurrent identical upload creation;
+- upload storage permissions and symbolic-link escape rejection;
+- redaction of FFprobe paths and diagnostic text;
+- end-to-end synthetic M4A intake through the real local FFprobe binary.
 
 A separate CLI integration run advanced a job to `transcribing`, closed the store, recovered it to `queued`, and verified all seven events and database integrity.
 
-## 11. Next implementation boundary
+An additional CLI integration generated a one-second synthetic M4A, received it as an upload part, assembled it, verified its checksum, and accepted one audio stream with a one-second duration.
+
+## 12. Next implementation boundary
 
 The next layer will add:
 
-1. durable upload manifests and chunk receipt;
-2. source checksum and decode verification;
-3. a one-active-job scheduler;
-4. ASR chunk execution using the existing probe integration;
-5. progress snapshots and bounded event cursors;
-6. safe pause at chunk boundaries;
-7. FastAPI only after the core behavior is stable under integration tests.
+1. bind only verified complete uploads to jobs;
+2. a one-active-job scheduler;
+3. ASR chunk execution using the existing probe integration;
+4. progress snapshots and bounded event cursors;
+5. safe pause at chunk boundaries;
+6. FastAPI only after the core behavior is stable under integration tests.

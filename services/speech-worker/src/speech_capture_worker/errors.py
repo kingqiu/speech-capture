@@ -45,3 +45,39 @@ class IdempotencyConflict(WorkerCoreError):
 
 class ResourceBlocked(WorkerCoreError):
     code = "RESOURCE_PREFLIGHT_BLOCKED"
+
+
+class UploadNotFound(WorkerCoreError):
+    code = "UPLOAD_NOT_FOUND"
+
+
+class UploadStateConflict(WorkerCoreError):
+    code = "UPLOAD_STATE_CONFLICT"
+
+
+class UploadPartConflict(WorkerCoreError):
+    code = "UPLOAD_PART_CONFLICT"
+
+
+class UploadPartChecksumMismatch(WorkerCoreError):
+    code = "UPLOAD_PART_CHECKSUM_MISMATCH"
+
+
+class UploadIncomplete(WorkerCoreError):
+    code = "UPLOAD_INCOMPLETE"
+
+
+class UploadChecksumMismatch(WorkerCoreError):
+    code = "UPLOAD_CHECKSUM_MISMATCH"
+
+
+class UploadStorageError(WorkerCoreError):
+    code = "UPLOAD_STORAGE_ERROR"
+
+
+class SourceUndecodable(WorkerCoreError):
+    code = "SOURCE_UNDECODABLE"
+
+
+class MediaProbeUnavailable(WorkerCoreError):
+    code = "MEDIA_PROBE_UNAVAILABLE"

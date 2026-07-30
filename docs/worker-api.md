@@ -110,6 +110,21 @@ An upload manifest includes:
 
 The Worker records every accepted chunk checksum. Completion fails if any chunk is missing or if the assembled whole-file checksum differs.
 
+The implemented core contract further establishes:
+
+- part numbers are 1-based;
+- the default part size is 8 MiB, with a Worker-selected increase for very large sources;
+- the final part has the exact remaining length;
+- identical part retries are idempotent;
+- a part number cannot silently change checksum;
+- upload status reports received bytes, received part count, and exact missing part numbers;
+- persisted parts are rechecked during assembly rather than trusting database receipts alone;
+- `complete` requires a positive-duration audio stream reported by FFprobe;
+- assembled sources are atomically installed in private Worker storage;
+- absolute Worker paths are not returned to clients.
+
+Upload states are `uploading`, `verifying`, `complete`, and `failed`. An interrupted `verifying` state recovers to `uploading` while accepted parts remain valid.
+
 ## 7. Job snapshot
 
 A job snapshot is bounded and contains:

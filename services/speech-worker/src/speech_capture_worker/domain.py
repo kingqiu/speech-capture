@@ -12,6 +12,10 @@ from speech_capture_worker.errors import InvalidJobRequest, InvalidTransition
 
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 SAFE_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+MEDIA_TYPE_PATTERN = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,63}/"
+    r"[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,63}$"
+)
 
 
 class JobState(StrEnum):
@@ -44,6 +48,13 @@ class ResourceStatus(StrEnum):
     READY = "ready"
     WARNING = "warning"
     BLOCKED = "blocked"
+
+
+class UploadState(StrEnum):
+    UPLOADING = "uploading"
+    VERIFYING = "verifying"
+    COMPLETE = "complete"
+    FAILED = "failed"
 
 
 ALLOWED_TRANSITIONS: dict[JobState, frozenset[JobState]] = {
@@ -151,27 +162,9 @@ class JobCreateRequest:
 
     def validate(self) -> None:
         _validate_identifier("vault_id", self.vault_id)
-        if (
-            not self.source_display_name
-            or self.source_display_name in {".", ".."}
-            or len(self.source_display_name) > 255
-            or "\x00" in self.source_display_name
-            or any(not character.isprintable() for character in self.source_display_name)
-            or PurePath(self.source_display_name).name != self.source_display_name
-            or "/" in self.source_display_name
-            or "\\" in self.source_display_name
-        ):
-            raise InvalidJobRequest(
-                "source_display_name must be a filename without directory components."
-            )
-        if not SHA256_PATTERN.fullmatch(self.source_sha256):
-            raise InvalidJobRequest("source_sha256 must be 64 lowercase hexadecimal characters.")
-        if (
-            not isinstance(self.source_size_bytes, int)
-            or isinstance(self.source_size_bytes, bool)
-            or self.source_size_bytes <= 0
-        ):
-            raise InvalidJobRequest("source_size_bytes must be greater than zero.")
+        _validate_source_display_name(self.source_display_name)
+        _validate_sha256("source_sha256", self.source_sha256)
+        _validate_source_size(self.source_size_bytes)
         if not isinstance(self.model_profile, ModelProfile):
             raise InvalidJobRequest("model_profile is not supported.")
         if not isinstance(self.options, dict):
@@ -186,6 +179,25 @@ class JobCreateRequest:
             )
         if self.content_type_override is not None:
             _validate_identifier("content_type_override", self.content_type_override)
+
+
+@dataclass(frozen=True)
+class UploadCreateRequest:
+    vault_id: str
+    source_display_name: str
+    source_sha256: str
+    source_size_bytes: int
+    media_type: str
+
+    def validate(self) -> None:
+        _validate_identifier("vault_id", self.vault_id)
+        _validate_source_display_name(self.source_display_name)
+        _validate_sha256("source_sha256", self.source_sha256)
+        _validate_source_size(self.source_size_bytes)
+        if not MEDIA_TYPE_PATTERN.fullmatch(self.media_type):
+            raise InvalidJobRequest(
+                "media_type must be a media type without parameters, such as audio/mp4."
+            )
 
 
 @dataclass(frozen=True)
@@ -241,6 +253,45 @@ class CheckpointRecord:
         return asdict(self)
 
 
+@dataclass(frozen=True)
+class UploadRecord:
+    upload_id: str
+    vault_id: str
+    source_display_name: str
+    source_sha256: str
+    source_size_bytes: int
+    media_type: str
+    state: UploadState
+    chunk_size_bytes: int
+    part_count: int
+    received_part_count: int
+    received_bytes: int
+    duration_seconds: float | None
+    audio_stream_count: int | None
+    detected_format_name: str | None
+    last_error_code: str | None
+    last_error_message: str | None
+    created_at: str
+    updated_at: str
+    completed_at: str | None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class UploadPartRecord:
+    upload_id: str
+    part_number: int
+    size_bytes: int
+    sha256: str
+    created_at: str
+    updated_at: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
 def ensure_transition_allowed(current: JobState, target: JobState) -> None:
     if target not in ALLOWED_TRANSITIONS[current]:
         raise InvalidTransition(
@@ -271,4 +322,32 @@ def _validate_identifier(name: str, value: str) -> None:
         raise InvalidJobRequest(
             f"{name} must start with a letter or number and contain only "
             "safe identifier characters."
+        )
+
+
+def _validate_source_display_name(value: str) -> None:
+    if (
+        not value
+        or value in {".", ".."}
+        or len(value) > 255
+        or "\x00" in value
+        or any(not character.isprintable() for character in value)
+        or PurePath(value).name != value
+        or "/" in value
+        or "\\" in value
+    ):
+        raise InvalidJobRequest(
+            "source_display_name must be a filename without directory components."
+        )
+
+
+def _validate_sha256(name: str, value: str) -> None:
+    if not SHA256_PATTERN.fullmatch(value):
+        raise InvalidJobRequest(f"{name} must be 64 lowercase hexadecimal characters.")
+
+
+def _validate_source_size(value: int) -> None:
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0 or value > 2**63 - 1:
+        raise InvalidJobRequest(
+            "source_size_bytes must be between 1 and the supported storage limit."
         )

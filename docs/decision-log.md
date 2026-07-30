@@ -40,5 +40,7 @@ This log records product decisions that define the V1 baseline. Dates use the pr
 | 2026-07-30 | Persist Worker jobs, events, and private checkpoints in SQLite with WAL and full synchronous durability. | Job state and event history commit atomically; private processing payloads remain separate from routine events. |
 | 2026-07-30 | Recover interrupted processing to `queued` and interrupted publication to `processed`. | The active work unit can retry from checkpoints while completed evidence and unpublished artifacts remain intact. |
 | 2026-07-30 | Require explicit design approval before implementing the Obsidian frontend. | The Worker contract is completed first; page architecture, state coverage, and key interaction visuals generated through Codex GPT Image are then reviewed with the project owner. This prevents unconfirmed flows from becoming implementation constraints. |
+| 2026-07-30 | Persist 1-based checksum-bound upload parts and revalidate them during assembly. | Large files can resume out of order without trusting a stale receipt; an accepted part number cannot silently change content. |
+| 2026-07-30 | Require whole-file SHA-256 and FFprobe audio validation before an upload becomes complete. | The model must never start from a truncated, reordered, non-audio, or undecodable source. Atomic Worker-owned storage preserves the verified result without exposing private paths. |
 
 New decisions should be appended with their alternatives and compatibility impact. Existing rows should not be rewritten merely because implementation work begins.

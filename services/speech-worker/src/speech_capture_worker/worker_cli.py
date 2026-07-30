@@ -9,8 +9,13 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-from speech_capture_worker.domain import JobCreateRequest, JobState, ModelProfile
-from speech_capture_worker.errors import WorkerCoreError
+from speech_capture_worker.domain import (
+    JobCreateRequest,
+    JobState,
+    ModelProfile,
+    UploadCreateRequest,
+)
+from speech_capture_worker.errors import UploadStorageError, WorkerCoreError
 from speech_capture_worker.job_store import JobStore
 from speech_capture_worker.resources import (
     check_resource_preflight,
@@ -52,6 +57,48 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     create.add_argument("--language-hint")
     create.add_argument("--content-type")
+
+    create_upload = subparsers.add_parser(
+        "create-upload",
+        help="Create an idempotent resumable-upload manifest.",
+    )
+    _add_data_dir(create_upload)
+    create_upload.add_argument("--vault-id", required=True)
+    create_upload.add_argument("--source-name", required=True)
+    create_upload.add_argument("--source-sha256", required=True)
+    create_upload.add_argument("--source-size-bytes", required=True, type=int)
+    create_upload.add_argument("--media-type", required=True)
+    create_upload.add_argument("--idempotency-key", required=True)
+
+    get_upload = subparsers.add_parser(
+        "get-upload",
+        help="Read upload progress and missing part numbers.",
+    )
+    _add_data_dir(get_upload)
+    get_upload.add_argument("upload_id")
+
+    put_upload_part = subparsers.add_parser(
+        "put-upload-part",
+        help="Store one checksum-bound upload part.",
+    )
+    _add_data_dir(put_upload_part)
+    put_upload_part.add_argument("upload_id")
+    put_upload_part.add_argument("part_number", type=int)
+    put_upload_part.add_argument("--part-file", type=Path, required=True)
+    put_upload_part.add_argument("--part-sha256", required=True)
+
+    complete_upload = subparsers.add_parser(
+        "complete-upload",
+        help="Assemble, checksum, and media-verify a complete upload.",
+    )
+    _add_data_dir(complete_upload)
+    complete_upload.add_argument("upload_id")
+
+    recover_uploads = subparsers.add_parser(
+        "recover-uploads",
+        help="Return interrupted upload verification to its resumable boundary.",
+    )
+    _add_data_dir(recover_uploads)
 
     list_jobs = subparsers.add_parser("list-jobs", help="List persisted jobs.")
     _add_data_dir(list_jobs)
@@ -139,6 +186,63 @@ def _dispatch(args: argparse.Namespace) -> int:
             )
             job, created = store.create_job(request, idempotency_key=args.idempotency_key)
             _write_json({"created": created, "job": job.to_dict()})
+            return 0
+        if args.command == "create-upload":
+            request = UploadCreateRequest(
+                vault_id=args.vault_id,
+                source_display_name=args.source_name,
+                source_sha256=args.source_sha256,
+                source_size_bytes=args.source_size_bytes,
+                media_type=args.media_type,
+            )
+            upload, created = store.create_upload(
+                request,
+                idempotency_key=args.idempotency_key,
+            )
+            _write_json(
+                {
+                    "created": created,
+                    "upload": upload.to_dict(),
+                    "missing_part_numbers": store.list_missing_upload_parts(upload.upload_id),
+                }
+            )
+            return 0
+        if args.command == "get-upload":
+            upload = store.get_upload(args.upload_id)
+            _write_json(
+                {
+                    "upload": upload.to_dict(),
+                    "missing_part_numbers": store.list_missing_upload_parts(upload.upload_id),
+                }
+            )
+            return 0
+        if args.command == "put-upload-part":
+            try:
+                content = args.part_file.read_bytes()
+            except OSError as exc:
+                raise UploadStorageError("The local upload-part file could not be read.") from exc
+            part, created = store.put_upload_part(
+                args.upload_id,
+                part_number=args.part_number,
+                content=content,
+                part_sha256=args.part_sha256,
+            )
+            upload = store.get_upload(args.upload_id)
+            _write_json(
+                {
+                    "created": created,
+                    "part": part.to_dict(),
+                    "upload": upload.to_dict(),
+                }
+            )
+            return 0
+        if args.command == "complete-upload":
+            upload, completed = store.complete_upload(args.upload_id)
+            _write_json({"completed": completed, "upload": upload.to_dict()})
+            return 0
+        if args.command == "recover-uploads":
+            recovered = store.recover_interrupted_uploads()
+            _write_json({"recovered_uploads": [upload.to_dict() for upload in recovered]})
             return 0
         if args.command == "list-jobs":
             states = [JobState(value) for value in args.state] if args.state else None

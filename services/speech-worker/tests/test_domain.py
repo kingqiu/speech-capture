@@ -6,6 +6,7 @@ from speech_capture_worker.domain import (
     JobCreateRequest,
     JobState,
     ModelProfile,
+    UploadCreateRequest,
     ensure_transition_allowed,
 )
 from speech_capture_worker.errors import InvalidJobRequest, InvalidTransition
@@ -93,3 +94,29 @@ def test_valid_job_request_passes_validation() -> None:
         content_type_override="meeting",
         options={"timestamps": True},
     ).validate()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("vault_id", "../vault"),
+        ("source_display_name", "folder/meeting.m4a"),
+        ("source_sha256", "A" * 64),
+        ("source_size_bytes", 0),
+        ("source_size_bytes", True),
+        ("media_type", "audio/mp4\nprivate"),
+        ("media_type", "not-a-media-type"),
+    ],
+)
+def test_invalid_upload_request_is_rejected(field, value) -> None:
+    values = {
+        "vault_id": "vault_primary",
+        "source_display_name": "meeting.m4a",
+        "source_sha256": "a" * 64,
+        "source_size_bytes": 1024,
+        "media_type": "audio/mp4",
+    }
+    values[field] = value
+
+    with pytest.raises(InvalidJobRequest):
+        UploadCreateRequest(**values).validate()
