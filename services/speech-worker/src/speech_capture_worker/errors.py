@@ -81,3 +81,11 @@ class SourceUndecodable(WorkerCoreError):
 
 class MediaProbeUnavailable(WorkerCoreError):
     code = "MEDIA_PROBE_UNAVAILABLE"
+
+
+class VerifiedUploadRequired(WorkerCoreError):
+    code = "SOURCE_UPLOAD_NOT_VERIFIED"
+
+
+class SchedulerBusy(WorkerCoreError):
+    code = "WORKER_PROCESSING_BUSY"

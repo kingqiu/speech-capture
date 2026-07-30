@@ -81,6 +81,7 @@ def test_recovery_targets_only_active_processing_states() -> None:
         ("options", []),
         ("language_hint", "Chinese\nEnglish"),
         ("content_type_override", "meeting/../../other"),
+        ("source_upload_id", "../../upload"),
     ],
 )
 def test_invalid_job_request_is_rejected(field, value) -> None:

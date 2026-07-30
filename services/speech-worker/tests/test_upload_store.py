@@ -91,13 +91,15 @@ def test_upload_manifest_is_idempotent_and_survives_reopen(tmp_path) -> None:
     assert missing == [1, 2, 3]
 
 
-def test_schema_one_database_is_migrated_without_losing_job_tables(tmp_path) -> None:
+def test_schema_one_database_migrates_through_verified_job_schema(tmp_path) -> None:
     database = tmp_path / "worker.sqlite3"
     with JobStore(database):
         pass
     connection = sqlite3.connect(database)
     connection.executescript(
         """
+        DROP INDEX jobs_source_upload_idx;
+        ALTER TABLE jobs DROP COLUMN source_upload_id;
         DROP TABLE upload_parts;
         DROP TABLE uploads;
         PRAGMA user_version = 1;

@@ -132,6 +132,21 @@ def test_disk_estimate_includes_staging_pcm_work_and_artifacts() -> None:
     assert estimated > source_size + 3600 * 16_000 * 2
 
 
+def test_processing_estimate_does_not_count_already_staged_source_twice() -> None:
+    source_size = 100 * 1024**2
+    intake_estimate = estimate_job_disk_bytes(
+        source_size_bytes=source_size,
+        duration_sec=3600,
+    )
+    processing_estimate = estimate_job_disk_bytes(
+        source_size_bytes=source_size,
+        duration_sec=3600,
+        include_source_staging=False,
+    )
+
+    assert intake_estimate - processing_estimate == source_size
+
+
 @pytest.mark.parametrize(
     ("source_size_bytes", "duration_sec"),
     [(0, 60.0), (True, 60.0), (1024, 0.0), (1024, float("nan"))],
@@ -141,4 +156,13 @@ def test_invalid_disk_estimate_input_is_rejected(source_size_bytes, duration_sec
         estimate_job_disk_bytes(
             source_size_bytes=source_size_bytes,
             duration_sec=duration_sec,
+        )
+
+
+def test_disk_estimate_rejects_non_boolean_staging_flag() -> None:
+    with pytest.raises(InvalidJobRequest):
+        estimate_job_disk_bytes(
+            source_size_bytes=1024,
+            duration_sec=60,
+            include_source_staging=1,
         )

@@ -15,6 +15,7 @@ from typing import Any
 from uuid import uuid4
 
 from speech_capture_worker.domain import (
+    ACTIVE_PROCESSING_STATES,
     RECOVERY_TARGETS,
     SAFE_IDENTIFIER_PATTERN,
     CheckpointRecord,
@@ -37,6 +38,7 @@ from speech_capture_worker.errors import (
     InvalidJobRequest,
     JobNotFound,
     RevisionConflict,
+    SchedulerBusy,
     UploadChecksumMismatch,
     UploadIncomplete,
     UploadNotFound,
@@ -44,11 +46,12 @@ from speech_capture_worker.errors import (
     UploadPartConflict,
     UploadStateConflict,
     UploadStorageError,
+    VerifiedUploadRequired,
     WorkerCoreError,
 )
 from speech_capture_worker.media_probe import MediaProbeResult, probe_audio_source
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 DEFAULT_UPLOAD_CHUNK_SIZE_BYTES = 8 * 1024 * 1024
 MAX_UPLOAD_CHUNK_SIZE_BYTES = 64 * 1024 * 1024
 MAX_UPLOAD_PARTS = 10_000
@@ -140,6 +143,8 @@ class JobStore:
             "content_type_override": request.content_type_override,
             "options": request.options,
         }
+        if request.source_upload_id is not None:
+            request_payload["source_upload_id"] = request.source_upload_id
         canonical_request = _canonical_json(request_payload)
         request_fingerprint = hashlib.sha256(canonical_request.encode("utf-8")).hexdigest()
         options_json = _canonical_json(request.options)
@@ -161,6 +166,9 @@ class JobStore:
                     )
                 return self._row_to_job(prior), False
 
+            if request.source_upload_id is not None:
+                self._require_complete_upload_for_request(request)
+
             job_id = f"job_{uuid4().hex}"
             now = _utc_now()
             self._connection.execute(
@@ -168,6 +176,7 @@ class JobStore:
                 INSERT INTO jobs (
                     job_id,
                     vault_id,
+                    source_upload_id,
                     source_display_name,
                     source_sha256,
                     source_size_bytes,
@@ -184,11 +193,12 @@ class JobStore:
                     created_at,
                     updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, ?, ?)
                 """,
                 (
                     job_id,
                     request.vault_id,
+                    request.source_upload_id,
                     request.source_display_name,
                     request.source_sha256,
                     request.source_size_bytes,
@@ -210,11 +220,69 @@ class JobStore:
                 from_state=None,
                 to_state=JobState.CREATED,
                 reason_code=None,
-                payload={"model_profile": request.model_profile.value},
+                payload={
+                    key: value
+                    for key, value in {
+                        "model_profile": request.model_profile.value,
+                        "source_upload_id": request.source_upload_id,
+                    }.items()
+                    if value is not None
+                },
                 created_at=now,
             )
-            row = self._fetch_job_row(job_id)
-            return self._row_to_job(row), True
+            job = self._row_to_job(self._fetch_job_row(job_id))
+            if request.source_upload_id is not None:
+                job = self._transition_in_transaction(
+                    current=job,
+                    target_state=JobState.UPLOADING,
+                    reason_code="verified_upload_attached",
+                    error_code=None,
+                    error_message=None,
+                    event_type="job.source_attached",
+                )
+                job = self._transition_in_transaction(
+                    current=job,
+                    target_state=JobState.VERIFYING,
+                    reason_code="source_verification_reused",
+                    error_code=None,
+                    error_message=None,
+                    event_type="job.source_verified",
+                )
+                job = self._transition_in_transaction(
+                    current=job,
+                    target_state=JobState.QUEUED,
+                    reason_code="verified_source_ready",
+                    error_code=None,
+                    error_message=None,
+                    event_type="job.queued",
+                )
+            return job, True
+
+    def create_job_from_upload(
+        self,
+        upload_id: str,
+        *,
+        idempotency_key: str,
+        model_profile: ModelProfile = ModelProfile.ACCURACY,
+        language_hint: str | None = None,
+        content_type_override: str | None = None,
+        options: dict[str, Any] | None = None,
+    ) -> tuple[JobRecord, bool]:
+        """Create a queued job whose immutable source is one complete upload."""
+
+        upload = self.get_upload(upload_id)
+        request = JobCreateRequest(
+            vault_id=upload.vault_id,
+            source_upload_id=upload.upload_id,
+            source_display_name=upload.source_display_name,
+            source_sha256=upload.source_sha256,
+            source_size_bytes=upload.source_size_bytes,
+            model_profile=model_profile,
+            language_hint=language_hint,
+            content_type_override=content_type_override,
+            options=options if options is not None else {},
+        )
+        return self.create_job(request, idempotency_key=idempotency_key)
 
     def get_job(self, job_id: str) -> JobRecord:
         with self._lock:
@@ -252,6 +320,87 @@ class JobStore:
                     (limit,),
                 ).fetchall()
             return [self._row_to_job(row) for row in rows]
+
+    def get_active_processing_job(self) -> JobRecord | None:
+        with self._lock:
+            placeholders = ", ".join("?" for _ in ACTIVE_PROCESSING_STATES)
+            row = self._connection.execute(
+                f"""
+                SELECT *
+                FROM jobs
+                WHERE state IN ({placeholders})
+                ORDER BY updated_at ASC, job_id ASC
+                LIMIT 1
+                """,
+                tuple(state.value for state in ACTIVE_PROCESSING_STATES),
+            ).fetchone()
+            return self._row_to_job(row) if row is not None else None
+
+    def get_next_schedulable_job(self) -> JobRecord | None:
+        """Return the oldest queued job whose Worker source remains verified."""
+
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT jobs.*
+                FROM jobs
+                JOIN uploads ON uploads.upload_id = jobs.source_upload_id
+                WHERE jobs.state = ? AND uploads.state = ?
+                ORDER BY jobs.created_at ASC, jobs.job_id ASC
+                LIMIT 1
+                """,
+                (JobState.QUEUED.value, UploadState.COMPLETE.value),
+            ).fetchone()
+            return self._row_to_job(row) if row is not None else None
+
+    def claim_job_for_processing(
+        self,
+        job_id: str,
+        *,
+        expected_revision: int,
+    ) -> JobRecord:
+        """Atomically enforce one active heavy-processing job."""
+
+        with self._transaction():
+            current = self._row_to_job(self._fetch_job_row(job_id))
+            if current.revision != expected_revision:
+                raise RevisionConflict(
+                    "The job changed after the scheduler's snapshot.",
+                    details={
+                        "job_id": job_id,
+                        "expected_revision": expected_revision,
+                        "current_revision": current.revision,
+                    },
+                )
+            if current.state in ACTIVE_PROCESSING_STATES:
+                raise SchedulerBusy(
+                    "The job has already been claimed for heavy processing.",
+                    details={"active_job_id": current.job_id},
+                )
+            if current.state is not JobState.QUEUED:
+                raise InvalidJobRequest("Only a queued job can be claimed for processing.")
+            self._require_job_verified_source(current)
+            active = self._fetch_active_processing_row(excluding_job_id=job_id)
+            if active is not None:
+                raise SchedulerBusy(
+                    "Another heavy processing job is already active.",
+                    details={"active_job_id": str(active["job_id"])},
+                )
+            return self._transition_in_transaction(
+                current=current,
+                target_state=JobState.PREPROCESSING,
+                reason_code="scheduler_claimed",
+                error_code=None,
+                error_message=None,
+                event_type="job.processing_claimed",
+            )
+
+    def get_job_verified_source_path(self, job_id: str) -> Path:
+        with self._lock:
+            job = self._row_to_job(self._fetch_job_row(job_id))
+            self._require_job_verified_source(job)
+            assert job.source_upload_id is not None
+            return self.get_verified_source_path(job.source_upload_id)
 
     def transition_job(
         self,
@@ -302,6 +451,13 @@ class JobStore:
                         "current_revision": current.revision,
                     },
                 )
+            if target_state in ACTIVE_PROCESSING_STATES:
+                active = self._fetch_active_processing_row(excluding_job_id=job_id)
+                if active is not None:
+                    raise SchedulerBusy(
+                        "Another heavy processing job is already active.",
+                        details={"active_job_id": str(active["job_id"])},
+                    )
             ensure_transition_allowed(current.state, target_state)
             return self._transition_in_transaction(
                 current=current,
@@ -865,6 +1021,11 @@ class JobStore:
                     "The verified Worker source is unavailable.",
                     details={"upload_id": upload_id},
                 )
+            if source_path.stat().st_size != upload.source_size_bytes:
+                raise UploadStorageError(
+                    "The verified Worker source size no longer matches its manifest.",
+                    details={"upload_id": upload_id},
+                )
             return source_path
 
     def quick_check(self) -> bool:
@@ -1005,6 +1166,27 @@ class JobStore:
                     if self._connection.in_transaction:
                         self._connection.execute("ROLLBACK")
                     raise
+                current = 2
+            if current == 2:
+                try:
+                    self._connection.executescript(
+                        """
+                    BEGIN IMMEDIATE;
+
+                    ALTER TABLE jobs
+                    ADD COLUMN source_upload_id TEXT REFERENCES uploads(upload_id);
+
+                    CREATE INDEX jobs_source_upload_idx
+                    ON jobs (source_upload_id);
+
+                    PRAGMA user_version = 3;
+                    COMMIT;
+                    """
+                    )
+                except BaseException:
+                    if self._connection.in_transaction:
+                        self._connection.execute("ROLLBACK")
+                    raise
 
     @contextmanager
     def _transaction(self) -> Iterator[None]:
@@ -1026,6 +1208,78 @@ class JobStore:
         if row is None:
             raise JobNotFound("The requested job does not exist.", details={"job_id": job_id})
         return row
+
+    def _fetch_active_processing_row(
+        self,
+        *,
+        excluding_job_id: str,
+    ) -> sqlite3.Row | None:
+        placeholders = ", ".join("?" for _ in ACTIVE_PROCESSING_STATES)
+        return self._connection.execute(
+            f"""
+            SELECT *
+            FROM jobs
+            WHERE state IN ({placeholders}) AND job_id != ?
+            ORDER BY updated_at ASC, job_id ASC
+            LIMIT 1
+            """,
+            (*[state.value for state in ACTIVE_PROCESSING_STATES], excluding_job_id),
+        ).fetchone()
+
+    def _require_complete_upload_for_request(self, request: JobCreateRequest) -> None:
+        assert request.source_upload_id is not None
+        upload = self._row_to_upload(self._fetch_upload_row(request.source_upload_id))
+        if upload.state is not UploadState.COMPLETE:
+            raise VerifiedUploadRequired(
+                "A job can enter the processing queue only from a complete verified upload.",
+                details={
+                    "upload_id": upload.upload_id,
+                    "upload_state": upload.state.value,
+                },
+            )
+        mismatched_fields = [
+            name
+            for name, job_value, upload_value in (
+                ("vault_id", request.vault_id, upload.vault_id),
+                (
+                    "source_display_name",
+                    request.source_display_name,
+                    upload.source_display_name,
+                ),
+                ("source_sha256", request.source_sha256, upload.source_sha256),
+                (
+                    "source_size_bytes",
+                    request.source_size_bytes,
+                    upload.source_size_bytes,
+                ),
+            )
+            if job_value != upload_value
+        ]
+        if mismatched_fields:
+            raise InvalidJobRequest(
+                "Job source metadata must match its verified upload.",
+                details={"mismatched_fields": mismatched_fields},
+            )
+        self.get_verified_source_path(upload.upload_id)
+
+    def _require_job_verified_source(self, job: JobRecord) -> None:
+        if job.source_upload_id is None:
+            raise VerifiedUploadRequired(
+                "The job is not bound to a verified Worker upload.",
+                details={"job_id": job.job_id},
+            )
+        request = JobCreateRequest(
+            vault_id=job.vault_id,
+            source_upload_id=job.source_upload_id,
+            source_display_name=job.source_display_name,
+            source_sha256=job.source_sha256,
+            source_size_bytes=job.source_size_bytes,
+            model_profile=job.model_profile,
+            language_hint=job.language_hint,
+            content_type_override=job.content_type_override,
+            options=job.options,
+        )
+        self._require_complete_upload_for_request(request)
 
     def _fetch_upload_row(self, upload_id: str) -> sqlite3.Row:
         _validate_upload_id(upload_id)
@@ -1293,6 +1547,9 @@ class JobStore:
         return JobRecord(
             job_id=str(row["job_id"]),
             vault_id=str(row["vault_id"]),
+            source_upload_id=(
+                str(row["source_upload_id"]) if row["source_upload_id"] is not None else None
+            ),
             source_display_name=str(row["source_display_name"]),
             source_sha256=str(row["source_sha256"]),
             source_size_bytes=int(row["source_size_bytes"]),

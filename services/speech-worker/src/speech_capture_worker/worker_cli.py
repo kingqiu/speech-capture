@@ -21,6 +21,7 @@ from speech_capture_worker.resources import (
     check_resource_preflight,
     estimate_job_disk_bytes,
 )
+from speech_capture_worker.scheduler import JobScheduler, SchedulerOutcome
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -57,6 +58,21 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     create.add_argument("--language-hint")
     create.add_argument("--content-type")
+
+    create_from_upload = subparsers.add_parser(
+        "create-job-from-upload",
+        help="Create a queued job from a complete verified upload.",
+    )
+    _add_data_dir(create_from_upload)
+    create_from_upload.add_argument("upload_id")
+    create_from_upload.add_argument("--idempotency-key", required=True)
+    create_from_upload.add_argument(
+        "--profile",
+        choices=[profile.value for profile in ModelProfile],
+        default=ModelProfile.ACCURACY.value,
+    )
+    create_from_upload.add_argument("--language-hint")
+    create_from_upload.add_argument("--content-type")
 
     create_upload = subparsers.add_parser(
         "create-upload",
@@ -132,6 +148,12 @@ def _build_parser() -> argparse.ArgumentParser:
     integrity = subparsers.add_parser("integrity", help="Run SQLite quick integrity check.")
     _add_data_dir(integrity)
 
+    schedule_once = subparsers.add_parser(
+        "schedule-once",
+        help="Preflight and claim at most one verified queued job.",
+    )
+    _add_data_dir(schedule_once)
+
     preflight = subparsers.add_parser(
         "preflight",
         help="Evaluate current disk and memory before starting model work.",
@@ -185,6 +207,16 @@ def _dispatch(args: argparse.Namespace) -> int:
                 content_type_override=args.content_type,
             )
             job, created = store.create_job(request, idempotency_key=args.idempotency_key)
+            _write_json({"created": created, "job": job.to_dict()})
+            return 0
+        if args.command == "create-job-from-upload":
+            job, created = store.create_job_from_upload(
+                args.upload_id,
+                idempotency_key=args.idempotency_key,
+                model_profile=ModelProfile(args.profile),
+                language_hint=args.language_hint,
+                content_type_override=args.content_type,
+            )
             _write_json({"created": created, "job": job.to_dict()})
             return 0
         if args.command == "create-upload":
@@ -272,6 +304,10 @@ def _dispatch(args: argparse.Namespace) -> int:
             healthy = store.quick_check()
             _write_json({"database_healthy": healthy})
             return 0 if healthy else 2
+        if args.command == "schedule-once":
+            result = JobScheduler(store).run_once()
+            _write_json(result.to_dict())
+            return 2 if result.outcome is SchedulerOutcome.BLOCKED else 0
     parser_error = {"error": {"code": "UNKNOWN_COMMAND", "message": args.command}}
     _write_json(parser_error, stream=sys.stderr)
     return 2

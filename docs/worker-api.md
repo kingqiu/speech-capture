@@ -125,7 +125,22 @@ The implemented core contract further establishes:
 
 Upload states are `uploading`, `verifying`, `complete`, and `failed`. An interrupted `verifying` state recovers to `uploading` while accepted parts remain valid.
 
-## 7. Job snapshot
+## 7. Verified job creation and scheduling
+
+The implemented core job contract requires a complete upload reference before a job can enter the real processing queue.
+
+- The job's Vault ID, filename, byte length, and SHA-256 must match the upload.
+- The private Worker source must still exist with the expected length.
+- Creation records the complete intake path through ordered job revisions and finishes at `queued`.
+- An idempotent retry returns the same job and does not duplicate intake events.
+- Unbound developer jobs are excluded from scheduling.
+- The Worker permits one active heavy-processing job by default.
+- Every scheduler pass runs a fresh resource preflight and persists its evidence.
+- Blocking resource pressure safely pauses the queued job; warnings remain visible and allow processing.
+
+This is currently a core and CLI contract. The corresponding HTTP request and response schemas will be added with FastAPI.
+
+## 8. Job snapshot
 
 A job snapshot is bounded and contains:
 
@@ -143,7 +158,7 @@ A job snapshot is bounded and contains:
 
 Large artifacts are downloaded separately.
 
-## 8. Event stream
+## 9. Event stream
 
 Each event has:
 
@@ -171,7 +186,7 @@ job.failed
 
 Clients reconnect with the last acknowledged sequence number. If history has been compacted, the Worker returns a fresh snapshot and cursor.
 
-## 9. Error model
+## 10. Error model
 
 Errors contain:
 
@@ -199,7 +214,7 @@ PUBLICATION_CONFLICT
 
 Error payloads never include secrets or transcript content.
 
-## 10. Compatibility
+## 11. Compatibility
 
 The plugin and Worker exchange:
 
@@ -210,7 +225,7 @@ The plugin and Worker exchange:
 
 A compatible older feature set may continue. An incompatible client is blocked before upload with a clear upgrade instruction.
 
-## 11. Provider independence
+## 12. Provider independence
 
 No endpoint assumes Google Drive or another sync provider.
 

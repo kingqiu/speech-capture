@@ -148,6 +148,17 @@ RECOVERY_TARGETS: dict[JobState, JobState] = {
     JobState.PUBLISHING: JobState.PROCESSED,
 }
 
+ACTIVE_PROCESSING_STATES = frozenset(
+    {
+        JobState.PREPROCESSING,
+        JobState.TRANSCRIBING,
+        JobState.ALIGNING,
+        JobState.DIARIZING,
+        JobState.STRUCTURING,
+        JobState.QUALITY_CHECK,
+    }
+)
+
 
 @dataclass(frozen=True)
 class JobCreateRequest:
@@ -159,6 +170,7 @@ class JobCreateRequest:
     language_hint: str | None = None
     content_type_override: str | None = None
     options: dict[str, Any] = field(default_factory=dict)
+    source_upload_id: str | None = None
 
     def validate(self) -> None:
         _validate_identifier("vault_id", self.vault_id)
@@ -179,6 +191,8 @@ class JobCreateRequest:
             )
         if self.content_type_override is not None:
             _validate_identifier("content_type_override", self.content_type_override)
+        if self.source_upload_id is not None:
+            _validate_upload_id(self.source_upload_id)
 
 
 @dataclass(frozen=True)
@@ -204,6 +218,7 @@ class UploadCreateRequest:
 class JobRecord:
     job_id: str
     vault_id: str
+    source_upload_id: str | None
     source_display_name: str
     source_sha256: str
     source_size_bytes: int
@@ -351,3 +366,8 @@ def _validate_source_size(value: int) -> None:
         raise InvalidJobRequest(
             "source_size_bytes must be between 1 and the supported storage limit."
         )
+
+
+def _validate_upload_id(value: str) -> None:
+    if not SAFE_IDENTIFIER_PATTERN.fullmatch(value) or not value.startswith("upl_"):
+        raise InvalidJobRequest("source_upload_id contains unsupported characters.")

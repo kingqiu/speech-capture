@@ -1,6 +1,6 @@
 # Speech Capture Worker
 
-Status: local model spike, persistent Worker core, and durable media intake. There is no network Worker service yet.
+Status: local model spike, persistent Worker core, durable media intake, and one-active-job scheduling. There is no network Worker service yet.
 
 The Worker performs durable local processing outside Obsidian. It will own:
 
@@ -27,6 +27,8 @@ The package now contains:
 - SQLite job, event, checkpoint, upload-manifest, and part-receipt storage;
 - resumable checksum-bound upload parts;
 - atomic whole-source assembly and FFprobe validation;
+- verified upload-to-job binding;
+- one-active-job scheduling with persisted resource preflight;
 - idempotent creation, revision guards, and restart recovery;
 - disk and memory preflight.
 
@@ -52,6 +54,14 @@ uv run speech-capture-worker create-upload \
   --source-size-bytes 536870912 \
   --media-type audio/mp4 \
   --idempotency-key upload-test-001
+
+uv run speech-capture-worker create-job-from-upload \
+  --data-dir runtime/dev-worker \
+  upl_example \
+  --idempotency-key job-test-001
+
+uv run speech-capture-worker schedule-once \
+  --data-dir runtime/dev-worker
 ```
 
 `runtime/` is ignored by Git. The CLI requires an explicit data directory and does not create a global service installation.

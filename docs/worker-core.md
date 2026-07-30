@@ -16,6 +16,8 @@ The Worker core now has an executable local foundation for:
 - resumable checksum-bound upload parts;
 - atomic whole-source assembly and SHA-256 verification;
 - FFprobe audio-stream and duration validation;
+- verified-upload job binding;
+- one-active-job scheduling with resource evidence;
 - stable machine-readable errors;
 - a developer CLI.
 
@@ -36,10 +38,13 @@ This is not yet the network Worker service. It does not run the ASR pipeline as 
 11. An accepted upload part cannot change checksum unless corruption recovery first invalidates its receipt.
 12. A source becomes complete only after part, byte-length, whole-file checksum, and media checks pass.
 13. Worker records and CLI responses never expose the absolute source-storage path.
+14. A schedulable job references one complete verified upload with identical source metadata.
+15. At most one heavy processing job is active on a Worker.
+16. Every scheduler start decision persists the resource report used to make it.
 
 ## 3. SQLite layout
 
-Schema version two contains five tables:
+Schema version three contains five tables:
 
 ### 3.1 `jobs`
 
@@ -47,6 +52,7 @@ Stores:
 
 - Worker job ID;
 - Vault identity;
+- optional verified source-upload reference;
 - source display name, size, and SHA-256;
 - current state and revision;
 - selected model profile;
@@ -56,7 +62,9 @@ Stores:
 - latest safe error;
 - created and updated timestamps.
 
-It does not store a source absolute path, device credential, pairing token, or cloud key.
+The production scheduling path accepts only jobs with a complete source-upload reference. Direct unbound jobs remain available to state-machine development tools but are never selected by the scheduler.
+
+The table does not store a source absolute path, device credential, pairing token, or cloud key.
 
 ### 3.2 `job_events`
 
@@ -177,7 +185,7 @@ SET revision = revision + 1, ...
 WHERE job_id = ? AND revision = expected_revision
 ```
 
-A stale caller receives `JOB_REVISION_CONFLICT` and must fetch a new snapshot. Concurrent creation and transition behavior is covered by tests using separate SQLite connections.
+A stale caller receives `JOB_REVISION_CONFLICT` and must fetch a new snapshot. Concurrent creation and transition behavior is covered by tests using separate SQLite connections. Heavy-stage transitions also check for another active job inside the same immediate transaction.
 
 ## 7. Restart recovery
 
@@ -203,7 +211,7 @@ Recovery:
 - records reason `worker_restart`;
 - leaves all checkpoints intact.
 
-The future scheduler will inspect checkpoints and select the exact work unit to retry.
+The scheduler inspects the recovered queue and takes a fresh resource snapshot before reclaiming work.
 
 ## 8. Resource preflight
 
@@ -224,7 +232,7 @@ current free - estimated operation bytes < reserve
 
 A warning is returned when projected free space is within 5 GiB of the reserve.
 
-The first job estimate includes:
+The intake estimate includes:
 
 - source staging copy;
 - decoded 16 kHz mono PCM;
@@ -232,6 +240,8 @@ The first job estimate includes:
 - the larger of 256 MiB or 10% of source size for artifacts.
 
 This estimate will be calibrated with real long recordings.
+
+The scheduler does not count the already verified Worker source as a second staging copy. It estimates only additional normalized audio, working copies, and artifact headroom.
 
 ### 8.2 Memory
 
@@ -281,13 +291,54 @@ Completion first verifies that every database receipt exists. The Worker then:
 5. atomically replaces the final Worker-owned source;
 6. marks the manifest `complete`.
 
-A corrupt persisted part has its receipt removed and returns the manifest to `uploading`, allowing only that part to be sent again. A whole-source checksum or media failure preserves all parts and records a stable safe error. No transcription state can use this source yet; verified-upload-to-job binding is the next boundary.
+A corrupt persisted part has its receipt removed and returns the manifest to `uploading`, allowing only that part to be sent again. A whole-source checksum or media failure preserves all parts and records a stable safe error.
 
 ### 9.3 Restart recovery
 
 If the Worker stops during assembly or media probing, startup recovery moves `verifying` back to `uploading`, preserves every accepted part, removes only Worker-owned incomplete assembly files, and allows completion to be retried.
 
-## 10. Developer CLI
+## 10. Verified job binding and scheduling
+
+### 10.1 Atomic source binding
+
+Creating a production job from an upload requires:
+
+- upload state `complete`;
+- matching Vault ID, display name, byte length, and whole-file SHA-256;
+- an existing Worker-owned source with the expected byte length.
+
+The job stores the upload ID as a foreign key. One transaction creates the job and records the already completed intake path:
+
+```text
+revision 0  created
+revision 1  uploading  — verified upload attached
+revision 2  verifying  — prior verification reused
+revision 3  queued     — source ready
+```
+
+Repeating the same idempotent request returns the original queued or later-state job without duplicating these events.
+
+### 10.2 One-active-job scheduler
+
+One scheduler pass:
+
+1. returns `busy` when a heavy stage is already active;
+2. selects the oldest queued job with a complete upload;
+3. estimates additional processing disk without counting the staged source twice;
+4. evaluates current disk, installed memory, memory pressure, and swap;
+5. persists the complete resource report as a private scheduler checkpoint;
+6. pauses a blocked job with `RESOURCE_PREFLIGHT_BLOCKED`;
+7. atomically claims a safe job by moving it to `preprocessing`.
+
+The heavy active set is `preprocessing`, `transcribing`, `aligning`, `diarizing`, `structuring`, and `quality_check`. The invariant is enforced inside SQLite transactions, including manual state transitions, so two scheduler connections cannot activate two jobs.
+
+Warnings remain visible in the checkpoint but do not block a claim. If the verified source disappears or its byte length changes, the queued job becomes `failed` with a stable storage error instead of repeatedly attempting model work.
+
+### 10.3 Restart behavior
+
+An interrupted active job recovers to `queued`. Its resource checkpoint survives. A later scheduler pass takes a fresh resource snapshot before reclaiming it, so an old ready result cannot override current disk or memory pressure.
+
+## 11. Developer CLI
 
 From `services/speech-worker/`:
 
@@ -317,13 +368,21 @@ uv run speech-capture-worker create-upload \
   --source-size-bytes 536870912 \
   --media-type audio/mp4 \
   --idempotency-key upload-test-001
+
+uv run speech-capture-worker create-job-from-upload \
+  --data-dir runtime/dev-worker \
+  upl_example \
+  --idempotency-key job-test-001
+
+uv run speech-capture-worker schedule-once \
+  --data-dir runtime/dev-worker
 ```
 
 Additional development commands store upload parts, report missing parts, complete and media-verify uploads, list jobs, apply guarded transitions, read events, run recovery, and check database integrity.
 
 The CLI is an engineering tool. The Obsidian plugin will eventually call the versioned Worker API rather than shell commands.
 
-## 11. Test evidence
+## 12. Test evidence
 
 The Worker package currently tests:
 
@@ -343,8 +402,8 @@ The Worker package currently tests:
 - disk ready, warning, and blocked states;
 - memory and swap warning and blocked states;
 - model-profile memory minimums;
-- CLI initialization, idempotency, listing, and stable errors.
-- schema-one to schema-two migration;
+- CLI initialization, idempotency, listing, and stable errors;
+- schema-one through schema-three migration;
 - idempotent upload creation and manifest conflicts;
 - out-of-order part receipt and exact resume status;
 - part checksum, size, number, and replacement conflicts;
@@ -355,19 +414,28 @@ The Worker package currently tests:
 - concurrent identical upload creation;
 - upload storage permissions and symbolic-link escape rejection;
 - redaction of FFprobe paths and diagnostic text;
-- end-to-end synthetic M4A intake through the real local FFprobe binary.
+- end-to-end synthetic M4A intake through the real local FFprobe binary;
+- incomplete-upload scheduling rejection;
+- atomic verified-source job history and metadata matching;
+- exclusion of unbound developer jobs;
+- ready, warning, and blocked scheduler decisions;
+- resource-checkpoint persistence;
+- missing verified-source failure;
+- one-winner scheduling across two SQLite connections;
+- restart recovery and safe scheduler reclaim.
 
 A separate CLI integration run advanced a job to `transcribing`, closed the store, recovered it to `queued`, and verified all seven events and database integrity.
 
 An additional CLI integration generated a one-second synthetic M4A, received it as an upload part, assembled it, verified its checksum, and accepted one audio stream with a one-second duration.
 
-## 12. Next implementation boundary
+The scheduler integration continued that source into a bound revision-three queued job, persisted a ready resource report, and atomically claimed it into `preprocessing`.
+
+## 13. Next implementation boundary
 
 The next layer will add:
 
-1. bind only verified complete uploads to jobs;
-2. a one-active-job scheduler;
-3. ASR chunk execution using the existing probe integration;
-4. progress snapshots and bounded event cursors;
-5. safe pause at chunk boundaries;
-6. FastAPI only after the core behavior is stable under integration tests.
+1. a deterministic normalized-audio and ASR chunk plan;
+2. restart-safe ASR chunk execution using the existing probe integration;
+3. progress snapshots and bounded event cursors;
+4. safe pause at chunk boundaries;
+5. FastAPI only after the core behavior is stable under integration tests.

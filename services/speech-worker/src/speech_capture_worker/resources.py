@@ -219,7 +219,12 @@ def require_resource_preflight(report: ResourceReport) -> None:
         )
 
 
-def estimate_job_disk_bytes(*, source_size_bytes: int, duration_sec: float) -> int:
+def estimate_job_disk_bytes(
+    *,
+    source_size_bytes: int,
+    duration_sec: float,
+    include_source_staging: bool = True,
+) -> int:
     """Estimate source staging, PCM, working copies, and artifact headroom."""
 
     if (
@@ -230,11 +235,14 @@ def estimate_job_disk_bytes(*, source_size_bytes: int, duration_sec: float) -> i
         raise InvalidJobRequest("source_size_bytes must be greater than zero.")
     if not math.isfinite(duration_sec) or duration_sec <= 0:
         raise InvalidJobRequest("duration_sec must be a positive finite number.")
+    if not isinstance(include_source_staging, bool):
+        raise InvalidJobRequest("include_source_staging must be a boolean.")
 
     pcm_bytes = math.ceil(duration_sec * 16_000 * 2)
     working_audio_bytes = pcm_bytes * 3
     artifact_headroom_bytes = max(256 * MIB, math.ceil(source_size_bytes * 0.10))
-    return source_size_bytes + working_audio_bytes + artifact_headroom_bytes
+    source_staging_bytes = source_size_bytes if include_source_staging else 0
+    return source_staging_bytes + working_audio_bytes + artifact_headroom_bytes
 
 
 def snapshot_disk(path: Path) -> DiskSnapshot:
