@@ -1,6 +1,6 @@
 # Speech Capture Worker
 
-Status: local model spike, persistent Worker core, durable media intake, one-active-job scheduling, and progressive transcript persistence. There is no network Worker service yet.
+Status: local model spike, persistent Worker core, durable media intake, one-active-job scheduling, progressive transcript persistence, deterministic normalization, and restart-safe local ASR chunk execution. There is no network Worker service yet.
 
 The Worker performs durable local processing outside Obsidian. It will own:
 
@@ -32,6 +32,9 @@ The package now contains:
 - monotonic progress, stable transcript outcomes, and a revision-guarded provisional tail;
 - text-preserving alignment and speaker-attribution revisions;
 - bounded reconnect snapshots and content-free update cursors;
+- private deterministic 16 kHz PCM normalization and complete frame-based chunk plans;
+- immutable checksummed raw ASR attempts and idempotent replay;
+- real MLX Qwen3-ASR chunk execution with validation, retry, and safe boundary pause;
 - idempotent creation, revision guards, and restart recovery;
 - disk and memory preflight.
 
@@ -74,6 +77,14 @@ uv run speech-capture-worker updates \
   --data-dir runtime/dev-worker \
   job_example \
   --after-sequence 0
+
+uv run speech-capture-worker prepare-audio \
+  --data-dir runtime/dev-worker \
+  job_example
+
+uv run speech-capture-worker run-asr-next \
+  --data-dir runtime/dev-worker \
+  job_example
 ```
 
 `runtime/` is ignored by Git. The CLI requires an explicit data directory and does not create a global service installation.
@@ -84,7 +95,7 @@ See [Persistent Worker core](../../docs/worker-core.md) for state, schema, recov
 
 ## ASR probe
 
-The first executable is a local-only probe for measuring the ASR integration before it becomes a durable Worker job.
+The local-only probe remains the benchmarking and quality-measurement tool. Durable Worker execution now reuses the validated MLX model boundary while adding normalized chunk plans, immutable attempts, retries, progress, and restart replay.
 
 From this directory:
 

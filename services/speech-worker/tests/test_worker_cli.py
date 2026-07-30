@@ -1,8 +1,14 @@
 import hashlib
+import io
 import json
+import shutil
+import wave
 
-from speech_capture_worker.domain import JobCreateRequest
+import pytest
+
+from speech_capture_worker.domain import JobCreateRequest, UploadCreateRequest
 from speech_capture_worker.job_store import JobStore
+from speech_capture_worker.media_probe import MediaProbeResult
 from speech_capture_worker.worker_cli import main
 
 
@@ -229,3 +235,80 @@ def test_cli_snapshot_and_updates_expose_reconnect_contract(tmp_path, capsys) ->
     assert snapshot["latest_event_sequence"] == updates["updates"][-1]["sequence"]
     assert updates["updates"][0]["event_type"] == "job.created"
     assert updates["has_more"] is False
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")
+def test_cli_prepares_private_normalized_audio_plan(tmp_path, capsys) -> None:
+    output = io.BytesIO()
+    with wave.open(output, "wb") as audio:
+        audio.setnchannels(1)
+        audio.setsampwidth(2)
+        audio.setframerate(16_000)
+        audio.writeframes(b"\x00\x00" * 16_000)
+    content = output.getvalue()
+    checksum = hashlib.sha256(content).hexdigest()
+    data_path = tmp_path / "runtime"
+
+    def probe(_):
+        return MediaProbeResult(
+            duration_seconds=1,
+            audio_stream_count=1,
+            format_name="wav",
+        )
+
+    with JobStore(data_path / "worker.sqlite3", source_probe=probe) as store:
+        upload, _ = store.create_upload(
+            UploadCreateRequest(
+                vault_id="vault_primary",
+                source_display_name="one-second.wav",
+                source_sha256=checksum,
+                source_size_bytes=len(content),
+                media_type="audio/wav",
+            ),
+            idempotency_key="cli-prepare-upload",
+        )
+        store.put_upload_part(
+            upload.upload_id,
+            part_number=1,
+            content=content,
+            part_sha256=checksum,
+        )
+        store.complete_upload(upload.upload_id)
+        queued, _ = store.create_job_from_upload(
+            upload.upload_id,
+            idempotency_key="cli-prepare-job",
+        )
+        job = store.claim_job_for_processing(
+            queued.job_id,
+            expected_revision=queued.revision,
+        )
+
+    assert (
+        main(
+            [
+                "prepare-audio",
+                "--data-dir",
+                str(data_path),
+                job.job_id,
+            ]
+        )
+        == 0
+    )
+    prepared = json.loads(capsys.readouterr().out)
+    assert (
+        main(
+            [
+                "list-asr-attempts",
+                "--data-dir",
+                str(data_path),
+                job.job_id,
+            ]
+        )
+        == 0
+    )
+    attempts = json.loads(capsys.readouterr().out)
+
+    assert prepared["changed"] is True
+    assert prepared["plan"]["duration_ms"] == 1000
+    assert prepared["plan"]["relative_path"].startswith("jobs/")
+    assert attempts == {"attempts": []}

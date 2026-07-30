@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import sqlite3
 import threading
@@ -14,6 +15,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from speech_capture_worker.asr_domain import AsrAttemptRecord, AsrAttemptState
 from speech_capture_worker.domain import (
     ACTIVE_PROCESSING_STATES,
     RECOVERY_TARGETS,
@@ -34,6 +36,7 @@ from speech_capture_worker.domain import (
     validate_safe_message,
 )
 from speech_capture_worker.errors import (
+    AsrAttemptConflict,
     IdempotencyConflict,
     InvalidJobRequest,
     JobNotFound,
@@ -71,7 +74,7 @@ from speech_capture_worker.transcript import (
     validate_transcript_text,
 )
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 DEFAULT_UPLOAD_CHUNK_SIZE_BYTES = 8 * 1024 * 1024
 MAX_UPLOAD_CHUNK_SIZE_BYTES = 64 * 1024 * 1024
 MAX_UPLOAD_PARTS = 10_000
@@ -100,6 +103,7 @@ class JobStore:
         self.data_directory = self.database_path.parent
         self.uploads_directory = self.data_directory / "uploads"
         self.sources_directory = self.data_directory / "sources"
+        self.jobs_directory = self.data_directory / "jobs"
         self.upload_chunk_size_bytes = upload_chunk_size_bytes
         self._source_probe = source_probe
         parent_existed = self.database_path.parent.exists()
@@ -111,6 +115,7 @@ class JobStore:
                 pass
         _ensure_private_directory(self.uploads_directory, root=self.data_directory)
         _ensure_private_directory(self.sources_directory, root=self.data_directory)
+        _ensure_private_directory(self.jobs_directory, root=self.data_directory)
 
         self._lock = threading.RLock()
         self._connection = sqlite3.connect(
@@ -422,6 +427,23 @@ class JobStore:
             self._require_job_verified_source(job)
             assert job.source_upload_id is not None
             return self.get_verified_source_path(job.source_upload_id)
+
+    def get_job_stage_directory(self, job_id: str, *, stage: str) -> Path:
+        """Return one private Worker-owned stage directory for internal artifacts."""
+
+        _validate_checkpoint_identifier("stage", stage)
+        with self._lock:
+            self._fetch_job_row(job_id)
+            job_directory = self.jobs_directory / job_id
+            _ensure_private_directory(job_directory, root=self.jobs_directory)
+            stage_directory = job_directory / stage
+            _ensure_private_directory(stage_directory, root=job_directory)
+            return stage_directory
+
+    def get_job_duration_ms(self, job_id: str) -> int:
+        with self._lock:
+            job = self._row_to_job(self._fetch_job_row(job_id))
+            return self._job_duration_ms(job)
 
     def transition_job(
         self,
@@ -1413,6 +1435,356 @@ class JobStore:
                 ).fetchall()
             return [self._row_to_checkpoint(row) for row in rows]
 
+    def commit_asr_attempt(
+        self,
+        job_id: str,
+        *,
+        chunk_index: int,
+        attempt_number: int,
+        attempt_key: str,
+        state: AsrAttemptState,
+        model_id: str,
+        start_frame: int,
+        end_frame: int,
+        start_ms: int,
+        end_ms: int,
+        raw_payload: dict[str, Any],
+        language: str | None = None,
+        finish_reason: str | None = None,
+        truncated: bool = False,
+        elapsed_seconds: float = 0,
+        error_code: str | None = None,
+    ) -> tuple[AsrAttemptRecord, bool]:
+        """Commit one immutable private raw ASR attempt and safe metadata."""
+
+        if (
+            not isinstance(chunk_index, int)
+            or isinstance(chunk_index, bool)
+            or chunk_index < 0
+        ):
+            raise InvalidJobRequest("chunk_index must be zero or greater.")
+        if (
+            not isinstance(attempt_number, int)
+            or isinstance(attempt_number, bool)
+            or attempt_number < 1
+        ):
+            raise InvalidJobRequest("attempt_number must be one or greater.")
+        _validate_checkpoint_identifier("attempt_key", attempt_key)
+        if not isinstance(state, AsrAttemptState):
+            raise InvalidJobRequest("ASR attempt state is not supported.")
+        if (
+            not isinstance(model_id, str)
+            or not model_id
+            or len(model_id) > 200
+            or any(not character.isprintable() for character in model_id)
+        ):
+            raise InvalidJobRequest("model_id must contain 1 to 200 printable characters.")
+        if (
+            not isinstance(start_frame, int)
+            or isinstance(start_frame, bool)
+            or not isinstance(end_frame, int)
+            or isinstance(end_frame, bool)
+            or start_frame < 0
+            or end_frame <= start_frame
+        ):
+            raise InvalidJobRequest("ASR attempt frame range is invalid.")
+        if (
+            not isinstance(start_ms, int)
+            or isinstance(start_ms, bool)
+            or not isinstance(end_ms, int)
+            or isinstance(end_ms, bool)
+            or start_ms < 0
+            or end_ms <= start_ms
+        ):
+            raise InvalidJobRequest("ASR attempt time range is invalid.")
+        validate_language(language)
+        if finish_reason is not None and (
+            not finish_reason
+            or len(finish_reason) > 100
+            or any(not character.isprintable() for character in finish_reason)
+        ):
+            raise InvalidJobRequest(
+                "finish_reason must contain 1 to 100 printable characters."
+            )
+        if not isinstance(truncated, bool):
+            raise InvalidJobRequest("truncated must be a boolean.")
+        if (
+            not isinstance(elapsed_seconds, (int, float))
+            or isinstance(elapsed_seconds, bool)
+            or not math.isfinite(float(elapsed_seconds))
+            or elapsed_seconds < 0
+        ):
+            raise InvalidJobRequest(
+                "elapsed_seconds must be a finite value of zero or greater."
+            )
+        validate_reason_code(error_code)
+        if state is AsrAttemptState.SUCCEEDED and error_code is not None:
+            raise InvalidJobRequest("A succeeded ASR attempt cannot contain error_code.")
+        if state is not AsrAttemptState.SUCCEEDED and error_code is None:
+            raise InvalidJobRequest("A rejected or failed ASR attempt requires error_code.")
+
+        raw_json = _canonical_json(raw_payload)
+        raw_bytes = raw_json.encode("utf-8")
+        raw_sha256 = hashlib.sha256(raw_bytes).hexdigest()
+        request_fingerprint = hashlib.sha256(
+            _canonical_json(
+                {
+                    "chunk_index": chunk_index,
+                    "attempt_number": attempt_number,
+                    "attempt_key": attempt_key,
+                    "state": state.value,
+                    "model_id": model_id,
+                    "start_frame": start_frame,
+                    "end_frame": end_frame,
+                    "start_ms": start_ms,
+                    "end_ms": end_ms,
+                    "language": language,
+                    "finish_reason": finish_reason,
+                    "truncated": truncated,
+                    "elapsed_seconds": float(elapsed_seconds),
+                    "raw_sha256": raw_sha256,
+                    "error_code": error_code,
+                }
+            ).encode("utf-8")
+        ).hexdigest()
+
+        with self._transaction():
+            job = self._row_to_job(self._fetch_job_row(job_id))
+            if job.state is not JobState.TRANSCRIBING:
+                raise InvalidJobRequest(
+                    "ASR attempts can be committed only while transcribing."
+                )
+            prior = self._connection.execute(
+                """
+                SELECT *
+                FROM asr_attempts
+                WHERE job_id = ? AND attempt_key = ?
+                """,
+                (job_id, attempt_key),
+            ).fetchone()
+            if prior is not None:
+                if str(prior["request_fingerprint"]) != request_fingerprint:
+                    raise AsrAttemptConflict(
+                        "The attempt key is already bound to different ASR evidence.",
+                        details={
+                            "job_id": job_id,
+                            "chunk_index": chunk_index,
+                            "attempt_number": attempt_number,
+                        },
+                    )
+                return self._row_to_asr_attempt(prior), False
+            same_number = self._connection.execute(
+                """
+                SELECT attempt_key
+                FROM asr_attempts
+                WHERE job_id = ? AND chunk_index = ? AND attempt_number = ?
+                """,
+                (job_id, chunk_index, attempt_number),
+            ).fetchone()
+            if same_number is not None:
+                raise AsrAttemptConflict(
+                    "The ASR attempt number already exists for this chunk.",
+                    details={
+                        "job_id": job_id,
+                        "chunk_index": chunk_index,
+                        "attempt_number": attempt_number,
+                    },
+                )
+            expected_attempt_number = int(
+                self._connection.execute(
+                    """
+                    SELECT COALESCE(MAX(attempt_number), 0) + 1
+                    FROM asr_attempts
+                    WHERE job_id = ? AND chunk_index = ?
+                    """,
+                    (job_id, chunk_index),
+                ).fetchone()[0]
+            )
+            if attempt_number != expected_attempt_number:
+                raise AsrAttemptConflict(
+                    "ASR attempt numbers must be committed without gaps.",
+                    details={
+                        "chunk_index": chunk_index,
+                        "expected_attempt_number": expected_attempt_number,
+                    },
+                )
+
+            raw_directory = self.get_job_stage_directory(job_id, stage="asr_raw")
+            raw_path = raw_directory / (
+                f"chunk-{chunk_index:08d}-attempt-{attempt_number:04d}.json"
+            )
+            if raw_path.is_symlink():
+                raise UploadStorageError(
+                    "Private ASR evidence storage must not contain symbolic links."
+                )
+            if raw_path.exists():
+                try:
+                    existing_content = raw_path.read_bytes()
+                except OSError as exc:
+                    raise UploadStorageError(
+                        "Existing private ASR evidence could not be verified."
+                    ) from exc
+                existing_sha256 = hashlib.sha256(existing_content).hexdigest()
+                if existing_sha256 != raw_sha256:
+                    raise AsrAttemptConflict(
+                        "Existing raw ASR evidence differs from this attempt.",
+                        details={
+                            "chunk_index": chunk_index,
+                            "attempt_number": attempt_number,
+                        },
+                    )
+            else:
+                _atomic_write_bytes(raw_path, raw_bytes)
+            raw_relative_path = raw_path.relative_to(self.data_directory).as_posix()
+            now = _utc_now()
+            self._connection.execute(
+                """
+                INSERT INTO asr_attempts (
+                    job_id,
+                    chunk_index,
+                    attempt_number,
+                    attempt_key,
+                    request_fingerprint,
+                    state,
+                    model_id,
+                    start_frame,
+                    end_frame,
+                    start_ms,
+                    end_ms,
+                    language,
+                    finish_reason,
+                    truncated,
+                    elapsed_seconds,
+                    raw_relative_path,
+                    raw_sha256,
+                    error_code,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    job_id,
+                    chunk_index,
+                    attempt_number,
+                    attempt_key,
+                    request_fingerprint,
+                    state.value,
+                    model_id,
+                    start_frame,
+                    end_frame,
+                    start_ms,
+                    end_ms,
+                    language,
+                    finish_reason,
+                    int(truncated),
+                    float(elapsed_seconds),
+                    raw_relative_path,
+                    raw_sha256,
+                    error_code,
+                    now,
+                ),
+            )
+            self._insert_update(
+                job_id=job_id,
+                job_revision=job.revision,
+                event_type="asr.attempt_recorded",
+                payload={
+                    "chunk_index": chunk_index,
+                    "attempt_number": attempt_number,
+                    "state": state.value,
+                    "start_ms": start_ms,
+                    "end_ms": end_ms,
+                    "language": language,
+                    "finish_reason": finish_reason,
+                    "truncated": truncated,
+                    "elapsed_seconds": float(elapsed_seconds),
+                    "error_code": error_code,
+                },
+                created_at=now,
+            )
+            row = self._connection.execute(
+                """
+                SELECT *
+                FROM asr_attempts
+                WHERE job_id = ? AND chunk_index = ? AND attempt_number = ?
+                """,
+                (job_id, chunk_index, attempt_number),
+            ).fetchone()
+            assert row is not None
+            return self._row_to_asr_attempt(row), True
+
+    def list_asr_attempts(
+        self,
+        job_id: str,
+        *,
+        chunk_index: int | None = None,
+    ) -> list[AsrAttemptRecord]:
+        if chunk_index is not None and (
+            not isinstance(chunk_index, int)
+            or isinstance(chunk_index, bool)
+            or chunk_index < 0
+        ):
+            raise InvalidJobRequest("chunk_index must be zero or greater.")
+        with self._lock:
+            self._fetch_job_row(job_id)
+            if chunk_index is None:
+                rows = self._connection.execute(
+                    """
+                    SELECT *
+                    FROM asr_attempts
+                    WHERE job_id = ?
+                    ORDER BY chunk_index ASC, attempt_number ASC
+                    """,
+                    (job_id,),
+                ).fetchall()
+            else:
+                rows = self._connection.execute(
+                    """
+                    SELECT *
+                    FROM asr_attempts
+                    WHERE job_id = ? AND chunk_index = ?
+                    ORDER BY attempt_number ASC
+                    """,
+                    (job_id, chunk_index),
+                ).fetchall()
+            return [self._row_to_asr_attempt(row) for row in rows]
+
+    def get_asr_attempt_payload(
+        self,
+        job_id: str,
+        *,
+        chunk_index: int,
+        attempt_number: int,
+    ) -> dict[str, Any]:
+        with self._lock:
+            self._fetch_job_row(job_id)
+            row = self._connection.execute(
+                """
+                SELECT *
+                FROM asr_attempts
+                WHERE job_id = ? AND chunk_index = ? AND attempt_number = ?
+                """,
+                (job_id, chunk_index, attempt_number),
+            ).fetchone()
+            if row is None:
+                raise InvalidJobRequest("The requested ASR attempt does not exist.")
+            attempt = self._row_to_asr_attempt(row)
+            path = (self.data_directory / attempt.raw_relative_path).resolve()
+            root = self.jobs_directory.resolve()
+            if not path.is_relative_to(root) or path.is_symlink() or not path.is_file():
+                raise UploadStorageError("Private raw ASR evidence is unavailable.")
+            try:
+                content = path.read_bytes()
+            except OSError as exc:
+                raise UploadStorageError(
+                    "Private raw ASR evidence could not be read."
+                ) from exc
+            if hashlib.sha256(content).hexdigest() != attempt.raw_sha256:
+                raise UploadStorageError(
+                    "Private raw ASR evidence failed checksum verification."
+                )
+            return _json_object(content.decode("utf-8"))
+
     def create_upload(
         self,
         request: UploadCreateRequest,
@@ -2062,6 +2434,50 @@ class JobStore:
                     ORDER BY sequence ASC;
 
                     PRAGMA user_version = 4;
+                    COMMIT;
+                    """
+                    )
+                except BaseException:
+                    if self._connection.in_transaction:
+                        self._connection.execute("ROLLBACK")
+                    raise
+                current = 4
+            if current == 4:
+                try:
+                    self._connection.executescript(
+                        """
+                    BEGIN IMMEDIATE;
+
+                    CREATE TABLE asr_attempts (
+                        job_id TEXT NOT NULL
+                            REFERENCES jobs(job_id) ON DELETE CASCADE,
+                        chunk_index INTEGER NOT NULL CHECK (chunk_index >= 0),
+                        attempt_number INTEGER NOT NULL CHECK (attempt_number > 0),
+                        attempt_key TEXT NOT NULL,
+                        request_fingerprint TEXT NOT NULL,
+                        state TEXT NOT NULL,
+                        model_id TEXT NOT NULL,
+                        start_frame INTEGER NOT NULL CHECK (start_frame >= 0),
+                        end_frame INTEGER NOT NULL CHECK (end_frame > start_frame),
+                        start_ms INTEGER NOT NULL CHECK (start_ms >= 0),
+                        end_ms INTEGER NOT NULL CHECK (end_ms > start_ms),
+                        language TEXT,
+                        finish_reason TEXT,
+                        truncated INTEGER NOT NULL CHECK (truncated IN (0, 1)),
+                        elapsed_seconds REAL NOT NULL CHECK (elapsed_seconds >= 0),
+                        raw_relative_path TEXT NOT NULL,
+                        raw_sha256 TEXT NOT NULL,
+                        error_code TEXT,
+                        created_at TEXT NOT NULL,
+                        PRIMARY KEY (job_id, chunk_index, attempt_number),
+                        UNIQUE (job_id, attempt_key),
+                        UNIQUE (raw_relative_path)
+                    );
+
+                    CREATE INDEX asr_attempts_job_state_idx
+                    ON asr_attempts (job_id, state, chunk_index, attempt_number);
+
+                    PRAGMA user_version = 5;
                     COMMIT;
                     """
                     )
@@ -2722,6 +3138,31 @@ class JobStore:
             job_revision=int(row["job_revision"]),
             event_type=str(row["event_type"]),
             payload=_json_object(row["payload_json"]),
+            created_at=str(row["created_at"]),
+        )
+
+    @staticmethod
+    def _row_to_asr_attempt(row: sqlite3.Row) -> AsrAttemptRecord:
+        return AsrAttemptRecord(
+            job_id=str(row["job_id"]),
+            chunk_index=int(row["chunk_index"]),
+            attempt_number=int(row["attempt_number"]),
+            attempt_key=str(row["attempt_key"]),
+            state=AsrAttemptState(row["state"]),
+            model_id=str(row["model_id"]),
+            start_frame=int(row["start_frame"]),
+            end_frame=int(row["end_frame"]),
+            start_ms=int(row["start_ms"]),
+            end_ms=int(row["end_ms"]),
+            language=str(row["language"]) if row["language"] is not None else None,
+            finish_reason=(
+                str(row["finish_reason"]) if row["finish_reason"] is not None else None
+            ),
+            truncated=bool(row["truncated"]),
+            elapsed_seconds=float(row["elapsed_seconds"]),
+            raw_relative_path=str(row["raw_relative_path"]),
+            raw_sha256=str(row["raw_sha256"]),
+            error_code=str(row["error_code"]) if row["error_code"] is not None else None,
             created_at=str(row["created_at"]),
         )
 

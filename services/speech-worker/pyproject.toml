@@ -12,6 +12,7 @@ license = "PolyForm-Noncommercial-1.0.0"
 authors = [{name = "Speech Capture contributors"}]
 dependencies = [
   "mlx-qwen3-asr[aligner]==0.3.5",
+  "numpy>=1.26,<3",
   "psutil>=7.0,<8",
 ]
 

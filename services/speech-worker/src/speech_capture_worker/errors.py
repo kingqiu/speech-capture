@@ -97,3 +97,23 @@ class TranscriptConflict(WorkerCoreError):
 
 class TranscriptRevisionConflict(WorkerCoreError):
     code = "TRANSCRIPT_REVISION_CONFLICT"
+
+
+class AudioNormalizationUnavailable(WorkerCoreError):
+    code = "AUDIO_NORMALIZATION_UNAVAILABLE"
+
+
+class AudioNormalizationFailed(WorkerCoreError):
+    code = "AUDIO_NORMALIZATION_FAILED"
+
+
+class NormalizedAudioInvalid(WorkerCoreError):
+    code = "NORMALIZED_AUDIO_INVALID"
+
+
+class AsrAttemptConflict(WorkerCoreError):
+    code = "ASR_ATTEMPT_CONFLICT"
+
+
+class AsrExecutionFailed(WorkerCoreError):
+    code = "ASR_EXECUTION_FAILED"

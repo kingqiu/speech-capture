@@ -2424,6 +2424,8 @@ version = "0.1.0a0"
 source = { editable = "." }
 dependencies = [
     { name = "mlx-qwen3-asr", extra = ["aligner"] },
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
+    { name = "numpy", version = "2.5.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "psutil" },
 ]
 
@@ -2439,6 +2441,7 @@ diarization = [
 [package.metadata]
 requires-dist = [
     { name = "mlx-qwen3-asr", extras = ["aligner"], specifier = "==0.3.5" },
+    { name = "numpy", specifier = ">=1.26,<3" },
     { name = "psutil", specifier = ">=7.0,<8" },
     { name = "pyannote-audio", marker = "extra == 'diarization'", specifier = ">=4.0.4,<5" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },

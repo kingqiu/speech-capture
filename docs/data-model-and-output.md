@@ -75,6 +75,8 @@ Changing a confirmed recording date may move the package, but it does not change
 - It includes model, prompt, vocabulary, decoding, and source-range provenance.
 - It may be large and is not optimized for direct reading.
 
+The Worker core already enforces this attempt-level boundary before final package rendering: each normalized-audio chunk attempt has an immutable private JSON file, SHA-256, model and range metadata, and a one-based attempt number. Visible stable segments are materialized only after the corresponding raw file is durable. The publication layer will assemble those private attempt files into the versioned `transcript.raw.json` artifact without rewriting prior attempts.
+
 ### 4.2 Evidence transcript
 
 `transcript.md` is the readable, correctable record.

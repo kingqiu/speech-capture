@@ -46,6 +46,9 @@ Scenarios include:
 - checksum mismatch;
 - media validation failure;
 - process restart during every major stage;
+- normalization-file corruption and deterministic rebuild;
+- crash after raw ASR commit but before transcript materialization;
+- retry of rejected and failed ASR chunks;
 - model crash and timeout;
 - partial diarization availability;
 - pause, resume, cancel, and retry;
@@ -109,6 +112,8 @@ For each validated source:
 - ASR output ending early is detected even if the model reports success;
 - unresolved intervals cause `partial`, not `complete`;
 - raw ASR output exists before cleanup or summarization.
+- normalized frame chunks are contiguous, non-overlapping, and end at the exact final frame;
+- container-duration rounding cannot make visible progress exceed the verified source duration.
 
 The core automated assertion is:
 

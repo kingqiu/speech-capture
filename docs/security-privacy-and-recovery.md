@@ -80,6 +80,8 @@ They must not contain transcript text, source bytes, prompts containing transcri
 
 The reconnect event feed follows the same boundary: it carries segment IDs, time ranges, outcomes, generations, speaker state, and text length, but transcript text is read only through the authorized bounded snapshot.
 
+Normalized PCM and raw model-attempt JSON stay under the private Worker job directory with restrictive permissions, Worker-relative database paths, atomic writes, and SHA-256 verification. Routine attempt metadata exposes no transcript text or absolute path.
+
 Diagnostic export is user initiated, previewable, redacted, and saved locally. Sending it anywhere is a separate user action.
 
 ## 8. Retention

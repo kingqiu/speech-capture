@@ -22,10 +22,14 @@ The Worker core now has an executable local foundation for:
 - stable transcript outcomes and one revision-guarded provisional tail;
 - alignment and speaker-attribution revisions that preserve stable text;
 - bounded reconnect snapshots and content-free update cursors;
+- deterministic private 16 kHz mono PCM normalization;
+- complete frame-based, energy-aware ASR chunk plans;
+- immutable raw ASR attempts with checksummed private files;
+- one-chunk-at-a-time local MLX execution, retry, replay, and safe resource pause;
 - stable machine-readable errors;
 - a developer CLI.
 
-This is not yet the network Worker service. It does not run the ASR model as a queued job, expose FastAPI, authenticate devices, structure notes, or publish to a Vault.
+This is not yet the network Worker service. It can execute or replay one local ASR chunk through backend tools, but it does not yet run a continuous background job loop, expose FastAPI, authenticate devices, diarize speakers, structure notes, or publish to a Vault.
 
 ## 2. Core invariants
 
@@ -50,10 +54,15 @@ This is not yet the network Worker service. It does not run the ASR model as a q
 19. Stable transcript text is not rewritten by later timing or speaker attribution.
 20. Routine state and reconnect events never contain transcript text.
 21. A snapshot is bounded, internally consistent, and carries the event cursor needed to reconnect.
+22. Normalized audio is 16 kHz mono 16-bit PCM inside private Worker storage.
+23. The persisted chunk plan accounts for every normalized frame exactly once.
+24. A raw ASR attempt is written and checksummed before its text becomes a stable visible segment.
+25. Retrying a completed attempt replays its raw evidence instead of invoking the model again.
+26. Severe resource pressure pauses before the next chunk; it never discards prior raw attempts or segments.
 
 ## 3. SQLite layout
 
-Schema version four contains nine tables:
+Schema version five contains ten tables:
 
 ### 3.1 `jobs`
 
@@ -162,6 +171,20 @@ Stores the latest monotonic active-job progress:
 
 Provides the bounded reconnect cursor used by future HTTP clients. It includes state, progress, segment-availability, provisional, timing, and speaker events. Payloads contain safe metadata such as time ranges, segment IDs, state, and text length, but never transcript text.
 
+### 3.10 `asr_attempts`
+
+Stores safe metadata for every immutable model attempt:
+
+- zero-based normalized-audio chunk index and one-based attempt number;
+- caller-owned attempt key and complete request fingerprint;
+- `succeeded`, `rejected`, or `failed` state;
+- model ID, frame range, and time range;
+- language, finish reason, truncation flag, and elapsed time;
+- Worker-relative raw JSON location and SHA-256;
+- stable rejection or execution error code.
+
+The raw model payload lives in a private `0600` file, not in routine events. Attempt numbers cannot have gaps, and an attempt key cannot silently change evidence.
+
 ## 4. Durability configuration
 
 The current store uses:
@@ -187,6 +210,8 @@ Upload parts and assembled sources use:
 - atomic replace;
 - generated upload IDs and part numbers rather than user-supplied path components;
 - symbolic-link and resolved-path boundary checks.
+
+Normalized audio and raw ASR attempts use the same private-directory, restrictive-permission, same-directory atomic-write, checksum, and path-boundary rules.
 
 ## 5. State machine
 
@@ -417,7 +442,57 @@ Stable segments paginate independently from the event feed. A reconnecting clien
 
 `job_updates` tells a client what changed but not what was said. For example, `transcript.segment_committed` carries the segment ID, time range, outcome, and text length. The client then refreshes the bounded snapshot to read authorized transcript content. This keeps routine event handling and diagnostics free of transcript text.
 
-## 12. Developer CLI
+## 12. Normalization and durable ASR execution
+
+### 12.1 Deterministic normalized audio
+
+`preprocessing` converts the verified Worker source to:
+
+- 16 kHz;
+- mono;
+- signed 16-bit little-endian PCM;
+- metadata-free WAV;
+- one Worker-owned atomic file with a persisted SHA-256.
+
+The normalized duration must remain within the larger of 250 ms or 1% of the media-verified container duration. The original source remains unchanged.
+
+### 12.2 Complete frame-based chunk plan
+
+The initial policy uses a 30-second maximum chunk, five-second minimum tail, three-second backward boundary search, and 100 ms energy windows. The quietest candidate near the limit is selected without exceeding the maximum.
+
+Chunk boundaries are stored as exact PCM frame offsets plus display milliseconds. Validation requires:
+
+- zero-based ordered chunk indices;
+- positive durations;
+- no overlap or gap;
+- no frame beyond the normalized file;
+- final coverage ending at the exact final frame.
+
+This plan is independent of later model-library chunking changes and can be replayed after restart.
+
+### 12.3 Raw evidence before visible text
+
+For each planned chunk, the Worker:
+
+1. runs a fresh resource boundary check;
+2. safely pauses before model work if blocked;
+3. reads only the planned PCM frame range;
+4. invokes the configured MLX Qwen3-ASR profile with forced alignment;
+5. atomically stores the complete raw result;
+6. records immutable checksummed attempt metadata;
+7. rejects empty, truncated, discontinuous, or invalid-timestamp output;
+8. commits aligned stable text segments only after raw evidence is durable;
+9. updates progress and marks the chunk materialized.
+
+A restart after raw-attempt commit but before segment materialization replays the raw file. It does not call the model again. A restart after some stable segments is also idempotent because their commit keys are deterministic.
+
+### 12.4 Retry and partial outcome
+
+Rejected output and model exceptions retain separate raw attempt records. The default limit is three attempts. Exhaustion commits the exact chunk range as failed and moves the job to `partial` with `ASR_CHUNK_RETRIES_EXHAUSTED`; earlier text remains readable.
+
+When container and normalized PCM duration differ by codec rounding, visible segment endings and progress are clamped to the verified container duration. Exact normalized frame coverage remains preserved in the private plan and raw attempts.
+
+## 13. Developer CLI
 
 From `services/speech-worker/`:
 
@@ -464,13 +539,25 @@ uv run speech-capture-worker updates \
   --data-dir runtime/dev-worker \
   job_example \
   --after-sequence 0
+
+uv run speech-capture-worker prepare-audio \
+  --data-dir runtime/dev-worker \
+  job_example
+
+uv run speech-capture-worker run-asr-next \
+  --data-dir runtime/dev-worker \
+  job_example
+
+uv run speech-capture-worker list-asr-attempts \
+  --data-dir runtime/dev-worker \
+  job_example
 ```
 
 Additional development commands store upload parts, report missing parts, complete and media-verify uploads, list jobs, apply guarded transitions, record progress, revise a provisional tail, commit stable timeline outcomes, update alignment or speaker metadata, read cursors, run recovery, and check database integrity.
 
 The CLI is an engineering tool. The Obsidian plugin will eventually call the versioned Worker API rather than shell commands.
 
-## 13. Test evidence
+## 14. Test evidence
 
 The Worker package currently tests:
 
@@ -491,7 +578,7 @@ The Worker package currently tests:
 - memory and swap warning and blocked states;
 - model-profile memory minimums;
 - CLI initialization, idempotency, listing, and stable errors;
-- schema-one through schema-four migration and state-event backfill;
+- schema-one through schema-five migration and state-event backfill;
 - idempotent upload creation and manifest conflicts;
 - out-of-order part receipt and exact resume status;
 - part checksum, size, number, and replacement conflicts;
@@ -521,6 +608,15 @@ The Worker package currently tests:
 - transcript-text exclusion from routine update payloads;
 - progressive preview preservation through restart recovery;
 - CLI snapshot and update-feed reconstruction.
+- deterministic PCM normalization and normalized-file recovery;
+- exact frame coverage and low-energy chunk-boundary selection;
+- raw-attempt idempotency, immutability, permissions, checksum verification, and concurrent commit;
+- succeeded-attempt replay without a second model call;
+- rejected-result retry and raw-evidence retention;
+- retry exhaustion with an explicit failed range and `partial` state;
+- safe resource pause before the next model call;
+- container-versus-PCM duration clamping;
+- real local MLX Qwen3-ASR execution on synthetic Chinese speech through aligned stable text.
 
 A separate CLI integration run advanced a job to `transcribing`, closed the store, recovered it to `queued`, and verified all seven events and database integrity.
 
@@ -528,12 +624,13 @@ An additional CLI integration generated a one-second synthetic M4A, received it 
 
 The scheduler integration continued that source into a bound revision-three queued job, persisted a ready resource report, and atomically claimed it into `preprocessing`.
 
-## 14. Next implementation boundary
+## 15. Next implementation boundary
 
 The next layer will add:
 
-1. a deterministic normalized-audio and ASR chunk plan;
-2. restart-safe ASR chunk execution using the existing probe integration;
-3. safe pause at chunk boundaries under sustained resource pressure;
-4. immutable raw ASR attempt storage and full timeline accounting;
-5. FastAPI only after the core behavior is stable under integration tests.
+1. validate and finalize alignment across every stable segment;
+2. classify silence and non-speech gaps for full timeline accounting;
+3. integrate pyannote diarization and anonymous speaker attribution;
+4. run a continuous restart-safe stage loop rather than one backend command per chunk;
+5. add content detection, hierarchical extraction, and evidence validation;
+6. add FastAPI only after the core behavior is stable under integration tests.

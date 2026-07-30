@@ -140,6 +140,20 @@ The implemented core job contract requires a complete upload reference before a 
 
 This is currently a core and CLI contract. The corresponding HTTP request and response schemas will be added with FastAPI.
 
+### 7.1 Durable local ASR boundary
+
+The implemented core can now continue a claimed `preprocessing` job through deterministic audio preparation and one restart-safe ASR chunk per call.
+
+- The verified source is normalized privately to 16 kHz mono 16-bit PCM.
+- A versioned energy-aware plan accounts for every normalized frame exactly once.
+- Every model attempt writes immutable checksummed raw JSON before visible transcript segments.
+- Empty, truncated, discontinuous, or invalid-timestamp results are retained as rejected attempts and retried.
+- A succeeded raw attempt can be replayed after restart without invoking the model again.
+- Resource pressure is checked before every new model call and can safely pause the job.
+- Retry exhaustion records the exact failed range and produces `partial`, never a false complete state.
+
+Raw payload locations and content are not part of routine job or event responses. Future artifact authorization will govern raw evidence download.
+
 ## 8. Job snapshot
 
 The implemented core snapshot is an internally consistent, bounded read containing:
@@ -210,11 +224,17 @@ Examples:
 ```text
 UPLOAD_CHECKSUM_MISMATCH
 SOURCE_UNDECODABLE
+AUDIO_NORMALIZATION_UNAVAILABLE
+AUDIO_NORMALIZATION_FAILED
+NORMALIZED_AUDIO_INVALID
 DISK_RESERVE_TOO_LOW
 MEMORY_PRESSURE_PAUSED
 MODEL_NOT_READY
 DIARIZATION_AUTH_REQUIRED
 ASR_TRUNCATED
+ASR_ATTEMPT_CONFLICT
+ASR_RESULT_REJECTED
+ASR_CHUNK_RETRIES_EXHAUSTED
 TRANSCRIPT_COMMIT_CONFLICT
 TRANSCRIPT_REVISION_CONFLICT
 WORKER_VERSION_INCOMPATIBLE

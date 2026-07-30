@@ -9,6 +9,8 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
+from speech_capture_worker.asr_execution import AsrChunkExecutor, MlxQwenAsrEngine
+from speech_capture_worker.audio_preprocessing import AudioPreprocessor
 from speech_capture_worker.domain import (
     JobCreateRequest,
     JobState,
@@ -264,6 +266,29 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Preflight and claim at most one verified queued job.",
     )
     _add_data_dir(schedule_once)
+
+    prepare_audio = subparsers.add_parser(
+        "prepare-audio",
+        help="Normalize verified audio and persist its deterministic chunk plan.",
+    )
+    _add_data_dir(prepare_audio)
+    prepare_audio.add_argument("job_id")
+
+    run_asr_next = subparsers.add_parser(
+        "run-asr-next",
+        help="Execute or replay the next durable local ASR chunk.",
+    )
+    _add_data_dir(run_asr_next)
+    run_asr_next.add_argument("job_id")
+    run_asr_next.add_argument("--max-attempts", type=int, default=3)
+
+    list_asr_attempts = subparsers.add_parser(
+        "list-asr-attempts",
+        help="List safe raw-attempt metadata without transcript content.",
+    )
+    _add_data_dir(list_asr_attempts)
+    list_asr_attempts.add_argument("job_id")
+    list_asr_attempts.add_argument("--chunk-index", type=int)
 
     preflight = subparsers.add_parser(
         "preflight",
@@ -526,6 +551,31 @@ def _dispatch(args: argparse.Namespace) -> int:
             result = JobScheduler(store).run_once()
             _write_json(result.to_dict())
             return 2 if result.outcome is SchedulerOutcome.BLOCKED else 0
+        if args.command == "prepare-audio":
+            plan, changed = AudioPreprocessor(store).prepare(args.job_id)
+            _write_json({"changed": changed, "plan": plan.to_dict()})
+            return 0
+        if args.command == "run-asr-next":
+            job = store.get_job(args.job_id)
+            result = AsrChunkExecutor(
+                store,
+                MlxQwenAsrEngine(model_profile=job.model_profile),
+                max_attempts=args.max_attempts,
+            ).run_next(args.job_id)
+            _write_json(result.to_dict())
+            return (
+                2
+                if result.outcome.value
+                in {"retryable_failure", "safe_paused", "partial"}
+                else 0
+            )
+        if args.command == "list-asr-attempts":
+            attempts = store.list_asr_attempts(
+                args.job_id,
+                chunk_index=args.chunk_index,
+            )
+            _write_json({"attempts": [attempt.to_dict() for attempt in attempts]})
+            return 0
     parser_error = {"error": {"code": "UNKNOWN_COMMAND", "message": args.command}}
     _write_json(parser_error, stream=sys.stderr)
     return 2
