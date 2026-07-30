@@ -2,7 +2,7 @@
 
 Speech Capture is a local-first Obsidian system for turning large audio files into complete transcripts, readable structured notes, and evidence-linked records that future agents can consume safely.
 
-> **Project status:** design baseline. There is no installable release yet.
+> **Project status:** backend personal alpha. Durable intake, queueing, resource preflight, and progressive transcript persistence are implemented; there is no installable release or approved frontend yet.
 
 ## Product goals
 

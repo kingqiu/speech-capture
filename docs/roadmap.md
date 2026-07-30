@@ -4,7 +4,7 @@ The roadmap is ordered by risk. Dates are intentionally omitted until the model 
 
 ## Phase 0 — Design baseline
 
-Status: current.
+Status: complete.
 
 - product requirements;
 - architecture and trust boundaries;
@@ -16,6 +16,8 @@ Status: current.
 Exit condition: the accepted product decisions are internally consistent and versioned.
 
 ## Phase 1 — Local model spike
+
+Status: in progress. The MLX Qwen3-ASR profiles and timestamp path are validated; diarization, local summarization, and representative real-audio acceptance remain.
 
 Goal: prove the two most uncertain foundations before building a polished plugin.
 
@@ -33,6 +35,8 @@ Exit condition: at least one representative long recording is completely account
 ## Phase 2 — Backend personal alpha
 
 Goal: complete the durable local processing contract before frontend implementation.
+
+Status: in progress. Durable storage, resumable verified intake, one-active-job scheduling, resource preflight, and the progressive snapshot/event contract are implemented.
 
 - versioned protocol and generated types;
 - durable Worker database and artifact store;

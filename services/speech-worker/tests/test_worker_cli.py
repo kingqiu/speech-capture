@@ -1,6 +1,8 @@
 import hashlib
 import json
 
+from speech_capture_worker.domain import JobCreateRequest
+from speech_capture_worker.job_store import JobStore
 from speech_capture_worker.worker_cli import main
 
 
@@ -179,3 +181,51 @@ def test_cli_upload_checksum_error_is_stable(tmp_path, capsys) -> None:
 
     assert result == 2
     assert error["error"]["code"] == "UPLOAD_PART_CHECKSUM_MISMATCH"
+
+
+def test_cli_snapshot_and_updates_expose_reconnect_contract(tmp_path, capsys) -> None:
+    data_path = tmp_path / "runtime"
+    data_path.mkdir()
+    with JobStore(data_path / "worker.sqlite3") as store:
+        job, _ = store.create_job(
+            JobCreateRequest(
+                vault_id="vault_primary",
+                source_display_name="meeting.m4a",
+                source_sha256="a" * 64,
+                source_size_bytes=1024,
+            ),
+            idempotency_key="submit-snapshot",
+        )
+
+    assert (
+        main(
+            [
+                "snapshot",
+                "--data-dir",
+                str(data_path),
+                job.job_id,
+            ]
+        )
+        == 0
+    )
+    snapshot = json.loads(capsys.readouterr().out)["snapshot"]
+    assert (
+        main(
+            [
+                "updates",
+                "--data-dir",
+                str(data_path),
+                job.job_id,
+                "--limit",
+                "10",
+            ]
+        )
+        == 0
+    )
+    updates = json.loads(capsys.readouterr().out)
+
+    assert snapshot["stable_segments"] == []
+    assert snapshot["provisional"] is None
+    assert snapshot["latest_event_sequence"] == updates["updates"][-1]["sequence"]
+    assert updates["updates"][0]["event_type"] == "job.created"
+    assert updates["has_more"] is False

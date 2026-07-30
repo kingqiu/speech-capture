@@ -22,6 +22,12 @@ from speech_capture_worker.resources import (
     estimate_job_disk_bytes,
 )
 from speech_capture_worker.scheduler import JobScheduler, SchedulerOutcome
+from speech_capture_worker.transcript import (
+    DiarizationStatus,
+    SpeakerLabelStatus,
+    TranscriptOutcome,
+    TranscriptTimingStatus,
+)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -138,6 +144,111 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_data_dir(events)
     events.add_argument("job_id")
     events.add_argument("--after-sequence", type=int, default=0)
+
+    updates = subparsers.add_parser(
+        "updates",
+        help="Read the bounded reconnect event feed.",
+    )
+    _add_data_dir(updates)
+    updates.add_argument("job_id")
+    updates.add_argument("--after-sequence", type=int, default=0)
+    updates.add_argument("--limit", type=int, default=200)
+
+    snapshot = subparsers.add_parser(
+        "snapshot",
+        help="Read a bounded progressive transcript snapshot.",
+    )
+    _add_data_dir(snapshot)
+    snapshot.add_argument("job_id")
+    snapshot.add_argument("--after-segment-sequence", type=int, default=0)
+    snapshot.add_argument("--segment-limit", type=int, default=100)
+
+    progress = subparsers.add_parser(
+        "record-progress",
+        help="Persist monotonic active-job progress.",
+    )
+    _add_data_dir(progress)
+    progress.add_argument("job_id")
+    progress.add_argument("--processed-ms", type=int, required=True)
+    progress.add_argument("--stage-progress", type=float, required=True)
+    progress.add_argument("--elapsed-seconds", type=float, required=True)
+    progress.add_argument("--estimated-remaining-seconds", type=float)
+    progress.add_argument(
+        "--diarization-status",
+        choices=[status.value for status in DiarizationStatus],
+        default=DiarizationStatus.NOT_STARTED.value,
+    )
+
+    provisional = subparsers.add_parser(
+        "put-provisional",
+        help="Create or revise the unstable transcript tail.",
+    )
+    _add_data_dir(provisional)
+    provisional.add_argument("job_id")
+    provisional.add_argument("--expected-generation", type=int, required=True)
+    provisional.add_argument("--start-ms", type=int, required=True)
+    provisional.add_argument("--end-ms", type=int, required=True)
+    provisional.add_argument("--text", required=True)
+    provisional.add_argument("--language")
+
+    clear_provisional = subparsers.add_parser(
+        "clear-provisional",
+        help="Clear the unstable transcript tail.",
+    )
+    _add_data_dir(clear_provisional)
+    clear_provisional.add_argument("job_id")
+    clear_provisional.add_argument("--expected-generation", type=int, required=True)
+
+    commit_segment = subparsers.add_parser(
+        "commit-segment",
+        help="Commit one stable, idempotent transcript timeline outcome.",
+    )
+    _add_data_dir(commit_segment)
+    commit_segment.add_argument("job_id")
+    commit_segment.add_argument("--commit-key", required=True)
+    commit_segment.add_argument("--start-ms", type=int, required=True)
+    commit_segment.add_argument("--end-ms", type=int, required=True)
+    commit_segment.add_argument(
+        "--outcome",
+        choices=[outcome.value for outcome in TranscriptOutcome],
+        required=True,
+    )
+    commit_segment.add_argument("--text")
+    commit_segment.add_argument("--language")
+    commit_segment.add_argument("--confidence", type=float)
+    commit_segment.add_argument(
+        "--timing-status",
+        choices=[status.value for status in TranscriptTimingStatus],
+        default=TranscriptTimingStatus.ESTIMATED.value,
+    )
+    commit_segment.add_argument("--speaker-id")
+    commit_segment.add_argument(
+        "--speaker-label-status",
+        choices=[status.value for status in SpeakerLabelStatus],
+    )
+    commit_segment.add_argument("--error-code")
+
+    update_segment = subparsers.add_parser(
+        "update-segment-metadata",
+        help="Revise alignment or speaker attribution without rewriting text.",
+    )
+    _add_data_dir(update_segment)
+    update_segment.add_argument("job_id")
+    update_segment.add_argument("segment_id")
+    update_segment.add_argument("--expected-revision", type=int, required=True)
+    update_segment.add_argument("--start-ms", type=int)
+    update_segment.add_argument("--end-ms", type=int)
+    update_segment.add_argument(
+        "--timing-status",
+        choices=[status.value for status in TranscriptTimingStatus],
+    )
+    speaker = update_segment.add_mutually_exclusive_group()
+    speaker.add_argument("--speaker-id")
+    speaker.add_argument("--clear-speaker", action="store_true")
+    update_segment.add_argument(
+        "--speaker-label-status",
+        choices=[status.value for status in SpeakerLabelStatus],
+    )
 
     recover = subparsers.add_parser(
         "recover",
@@ -295,6 +406,113 @@ def _dispatch(args: argparse.Namespace) -> int:
         if args.command == "events":
             events = store.list_events(args.job_id, after_sequence=args.after_sequence)
             _write_json({"events": [event.to_dict() for event in events]})
+            return 0
+        if args.command == "updates":
+            updates, has_more = store.list_job_updates(
+                args.job_id,
+                after_sequence=args.after_sequence,
+                limit=args.limit,
+            )
+            _write_json(
+                {
+                    "updates": [update.to_dict() for update in updates],
+                    "has_more": has_more,
+                    "next_after_sequence": (
+                        updates[-1].sequence if updates else args.after_sequence
+                    ),
+                }
+            )
+            return 0
+        if args.command == "snapshot":
+            snapshot = store.get_job_snapshot(
+                args.job_id,
+                after_segment_sequence=args.after_segment_sequence,
+                segment_limit=args.segment_limit,
+            )
+            _write_json({"snapshot": snapshot.to_dict()})
+            return 0
+        if args.command == "record-progress":
+            progress, changed = store.put_job_progress(
+                args.job_id,
+                processed_ms=args.processed_ms,
+                stage_progress=args.stage_progress,
+                elapsed_seconds=args.elapsed_seconds,
+                estimated_remaining_seconds=args.estimated_remaining_seconds,
+                diarization_status=DiarizationStatus(args.diarization_status),
+            )
+            _write_json({"changed": changed, "progress": progress.to_dict()})
+            return 0
+        if args.command == "put-provisional":
+            provisional, changed = store.put_provisional_transcript(
+                args.job_id,
+                expected_generation=args.expected_generation,
+                start_ms=args.start_ms,
+                end_ms=args.end_ms,
+                text=args.text,
+                language=args.language,
+            )
+            _write_json({"changed": changed, "provisional": provisional.to_dict()})
+            return 0
+        if args.command == "clear-provisional":
+            cleared = store.clear_provisional_transcript(
+                args.job_id,
+                expected_generation=args.expected_generation,
+            )
+            _write_json({"cleared": cleared})
+            return 0
+        if args.command == "commit-segment":
+            outcome = TranscriptOutcome(args.outcome)
+            speaker_status = (
+                SpeakerLabelStatus(args.speaker_label_status)
+                if args.speaker_label_status is not None
+                else (
+                    SpeakerLabelStatus.PENDING
+                    if outcome is TranscriptOutcome.TRANSCRIBED
+                    else SpeakerLabelStatus.UNAVAILABLE
+                )
+            )
+            segment, created = store.commit_transcript_segment(
+                args.job_id,
+                commit_key=args.commit_key,
+                start_ms=args.start_ms,
+                end_ms=args.end_ms,
+                outcome=outcome,
+                text=args.text,
+                language=args.language,
+                confidence=args.confidence,
+                timing_status=TranscriptTimingStatus(args.timing_status),
+                speaker_id=args.speaker_id,
+                speaker_label_status=speaker_status,
+                error_code=args.error_code,
+            )
+            _write_json({"created": created, "segment": segment.to_dict()})
+            return 0
+        if args.command == "update-segment-metadata":
+            metadata: dict[str, Any] = {
+                "expected_revision": args.expected_revision,
+                "start_ms": args.start_ms,
+                "end_ms": args.end_ms,
+                "timing_status": (
+                    TranscriptTimingStatus(args.timing_status)
+                    if args.timing_status is not None
+                    else None
+                ),
+                "speaker_label_status": (
+                    SpeakerLabelStatus(args.speaker_label_status)
+                    if args.speaker_label_status is not None
+                    else None
+                ),
+            }
+            if args.speaker_id is not None:
+                metadata["speaker_id"] = args.speaker_id
+            elif args.clear_speaker:
+                metadata["speaker_id"] = None
+            segment = store.update_transcript_segment_metadata(
+                args.job_id,
+                args.segment_id,
+                **metadata,
+            )
+            _write_json({"segment": segment.to_dict()})
             return 0
         if args.command == "recover":
             recovered = store.recover_interrupted_jobs()

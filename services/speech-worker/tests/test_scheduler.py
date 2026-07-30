@@ -320,6 +320,7 @@ def test_warning_preflight_remains_visible_and_allows_claim(tmp_path) -> None:
             queued.job_id,
             stage="scheduler",
         )[0]
+        snapshot = store.get_job_snapshot(queued.job_id)
 
     assert result.outcome is SchedulerOutcome.CLAIMED
     assert result.job is not None
@@ -327,6 +328,8 @@ def test_warning_preflight_remains_visible_and_allows_claim(tmp_path) -> None:
     assert result.resource_report is not None
     assert result.resource_report.status is ResourceStatus.WARNING
     assert checkpoint.payload["status"] == "warning"
+    assert snapshot.resource_report is not None
+    assert snapshot.resource_report["issues"][0]["code"] == "MEMORY_PRESSURE_WARNING"
 
 
 def test_missing_verified_source_becomes_a_durable_failed_job(tmp_path) -> None:

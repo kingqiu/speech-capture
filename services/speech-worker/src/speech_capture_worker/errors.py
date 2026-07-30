@@ -89,3 +89,11 @@ class VerifiedUploadRequired(WorkerCoreError):
 
 class SchedulerBusy(WorkerCoreError):
     code = "WORKER_PROCESSING_BUSY"
+
+
+class TranscriptConflict(WorkerCoreError):
+    code = "TRANSCRIPT_COMMIT_CONFLICT"
+
+
+class TranscriptRevisionConflict(WorkerCoreError):
+    code = "TRANSCRIPT_REVISION_CONFLICT"

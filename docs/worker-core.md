@@ -18,10 +18,14 @@ The Worker core now has an executable local foundation for:
 - FFprobe audio-stream and duration validation;
 - verified-upload job binding;
 - one-active-job scheduling with resource evidence;
+- monotonic processing progress;
+- stable transcript outcomes and one revision-guarded provisional tail;
+- alignment and speaker-attribution revisions that preserve stable text;
+- bounded reconnect snapshots and content-free update cursors;
 - stable machine-readable errors;
 - a developer CLI.
 
-This is not yet the network Worker service. It does not run the ASR pipeline as a queued job, expose FastAPI, authenticate devices, or publish to a Vault.
+This is not yet the network Worker service. It does not run the ASR model as a queued job, expose FastAPI, authenticate devices, structure notes, or publish to a Vault.
 
 ## 2. Core invariants
 
@@ -41,10 +45,15 @@ This is not yet the network Worker service. It does not run the ASR pipeline as 
 14. A schedulable job references one complete verified upload with identical source metadata.
 15. At most one heavy processing job is active on a Worker.
 16. Every scheduler start decision persists the resource report used to make it.
+17. Stable transcript outcomes commit in source-timeline order and cannot overlap.
+18. Retrying an identical transcript commit key is idempotent; changing its content is a conflict.
+19. Stable transcript text is not rewritten by later timing or speaker attribution.
+20. Routine state and reconnect events never contain transcript text.
+21. A snapshot is bounded, internally consistent, and carries the event cursor needed to reconnect.
 
 ## 3. SQLite layout
 
-Schema version three contains five tables:
+Schema version four contains nine tables:
 
 ### 3.1 `jobs`
 
@@ -117,6 +126,41 @@ Stores one durable receipt per 1-based part number:
 - creation and update timestamps.
 
 Binary part data lives under the private Worker application-data directory. Database receipts contain no audio bytes.
+
+### 3.6 `transcript_segments`
+
+Stores one durable timeline outcome per committed range:
+
+- monotonically assigned segment sequence and stable segment ID;
+- idempotent commit key and immutable request fingerprint;
+- non-overlapping start and end time;
+- `transcribed`, `inaudible`, `non_speech`, or `failed` outcome;
+- text only for `transcribed`;
+- language and confidence when available;
+- estimated or aligned timing state;
+- pending, anonymous, confirmed, or unavailable speaker state;
+- a revision number for timing and speaker metadata.
+
+Text is stable after commit. Alignment and speaker attribution may revise metadata, but never rewrite the committed text.
+
+### 3.7 `provisional_transcripts`
+
+Stores at most one explicitly unstable tail per job. Every revision uses an optimistic generation guard. Committing an overlapping stable segment removes the tail atomically.
+
+### 3.8 `job_progress`
+
+Stores the latest monotonic active-job progress:
+
+- processing stage;
+- processed and total media milliseconds;
+- stage progress;
+- elapsed and optional estimated remaining time;
+- diarization state;
+- generation and payload hash for idempotency.
+
+### 3.9 `job_updates`
+
+Provides the bounded reconnect cursor used by future HTTP clients. It includes state, progress, segment-availability, provisional, timing, and speaker events. Payloads contain safe metadata such as time ranges, segment IDs, state, and text length, but never transcript text.
 
 ## 4. Durability configuration
 
@@ -338,7 +382,42 @@ Warnings remain visible in the checkpoint but do not block a claim. If the verif
 
 An interrupted active job recovers to `queued`. Its resource checkpoint survives. A later scheduler pass takes a fresh resource snapshot before reclaiming it, so an old ready result cannot override current disk or memory pressure.
 
-## 11. Developer CLI
+## 11. Progressive transcript and reconnect contract
+
+### 11.1 Stable timeline outcomes
+
+A Worker pipeline commits stable timeline outcomes only during `transcribing`. Commits:
+
+- are ordered by source time;
+- are non-overlapping and bounded by verified media duration;
+- use a caller-owned commit key so retry after interruption cannot duplicate a segment;
+- distinguish transcript text from inaudible, non-speech, and failed ranges;
+- preserve a stable segment ID for later evidence links.
+
+The job cannot advance successfully from `transcribing` to `aligning` while an unresolved provisional tail remains. Later metadata revisions align timestamps during `aligning` and add, confirm, or remove speaker attribution during `diarizing`. They use a segment revision guard and preserve the original stable text.
+
+### 11.2 Provisional tail
+
+Only `transcribing` may expose an unstable tail. There is at most one tail, its writes use an expected generation, and it cannot overlap stable content. The client must present it as provisional. It remains durable across Worker restart but is never confused with a committed segment.
+
+### 11.3 Progress and snapshot
+
+Progress cannot move backward within a processing stage. Processed media time and elapsed time are monotonic across the job. The bounded snapshot contains:
+
+- current job state and revision;
+- latest progress and diarization status;
+- a page of stable segments;
+- the provisional tail;
+- latest scheduler resource report;
+- latest event sequence.
+
+Stable segments paginate independently from the event feed. A reconnecting client reads a consistent snapshot, renders its page, continues segment pagination if needed, and then requests updates after `latest_event_sequence`.
+
+### 11.4 Update privacy
+
+`job_updates` tells a client what changed but not what was said. For example, `transcript.segment_committed` carries the segment ID, time range, outcome, and text length. The client then refreshes the bounded snapshot to read authorized transcript content. This keeps routine event handling and diagnostics free of transcript text.
+
+## 12. Developer CLI
 
 From `services/speech-worker/`:
 
@@ -376,13 +455,22 @@ uv run speech-capture-worker create-job-from-upload \
 
 uv run speech-capture-worker schedule-once \
   --data-dir runtime/dev-worker
+
+uv run speech-capture-worker snapshot \
+  --data-dir runtime/dev-worker \
+  job_example
+
+uv run speech-capture-worker updates \
+  --data-dir runtime/dev-worker \
+  job_example \
+  --after-sequence 0
 ```
 
-Additional development commands store upload parts, report missing parts, complete and media-verify uploads, list jobs, apply guarded transitions, read events, run recovery, and check database integrity.
+Additional development commands store upload parts, report missing parts, complete and media-verify uploads, list jobs, apply guarded transitions, record progress, revise a provisional tail, commit stable timeline outcomes, update alignment or speaker metadata, read cursors, run recovery, and check database integrity.
 
 The CLI is an engineering tool. The Obsidian plugin will eventually call the versioned Worker API rather than shell commands.
 
-## 12. Test evidence
+## 13. Test evidence
 
 The Worker package currently tests:
 
@@ -403,7 +491,7 @@ The Worker package currently tests:
 - memory and swap warning and blocked states;
 - model-profile memory minimums;
 - CLI initialization, idempotency, listing, and stable errors;
-- schema-one through schema-three migration;
+- schema-one through schema-four migration and state-event backfill;
 - idempotent upload creation and manifest conflicts;
 - out-of-order part receipt and exact resume status;
 - part checksum, size, number, and replacement conflicts;
@@ -423,6 +511,16 @@ The Worker package currently tests:
 - missing verified-source failure;
 - one-winner scheduling across two SQLite connections;
 - restart recovery and safe scheduler reclaim.
+- idempotent stable-segment commits and commit-key conflicts;
+- non-overlapping, media-bounded, timeline-ordered outcomes;
+- explicit non-speech and failed-range persistence;
+- provisional generation conflicts and stable-commit clearing;
+- text-preserving alignment and speaker revisions;
+- monotonic progress and reopen persistence;
+- bounded segment pagination and reconnect event cursors;
+- transcript-text exclusion from routine update payloads;
+- progressive preview preservation through restart recovery;
+- CLI snapshot and update-feed reconstruction.
 
 A separate CLI integration run advanced a job to `transcribing`, closed the store, recovered it to `queued`, and verified all seven events and database integrity.
 
@@ -430,12 +528,12 @@ An additional CLI integration generated a one-second synthetic M4A, received it 
 
 The scheduler integration continued that source into a bound revision-three queued job, persisted a ready resource report, and atomically claimed it into `preprocessing`.
 
-## 13. Next implementation boundary
+## 14. Next implementation boundary
 
 The next layer will add:
 
 1. a deterministic normalized-audio and ASR chunk plan;
 2. restart-safe ASR chunk execution using the existing probe integration;
-3. progress snapshots and bounded event cursors;
-4. safe pause at chunk boundaries;
+3. safe pause at chunk boundaries under sustained resource pressure;
+4. immutable raw ASR attempt storage and full timeline accounting;
 5. FastAPI only after the core behavior is stable under integration tests.

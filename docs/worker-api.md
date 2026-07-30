@@ -142,7 +142,7 @@ This is currently a core and CLI contract. The corresponding HTTP request and re
 
 ## 8. Job snapshot
 
-A job snapshot is bounded and contains:
+The implemented core snapshot is an internally consistent, bounded read containing:
 
 - identity and current revision;
 - stage and status;
@@ -157,6 +157,10 @@ A job snapshot is bounded and contains:
 - processed and publication state.
 
 Large artifacts are downloaded separately.
+
+Stable segments use independent `after_segment_sequence` and `segment_limit` pagination. The current core limit is 500 segments per snapshot page. The response returns `next_after_segment_sequence`, `has_more_segments`, and `latest_event_sequence`.
+
+Committed timeline outcomes are `transcribed`, `inaudible`, `non_speech`, or `failed`. Only `transcribed` carries text. Segment text stays stable while alignment and speaker metadata use guarded revisions.
 
 ## 9. Event stream
 
@@ -186,6 +190,10 @@ job.failed
 
 Clients reconnect with the last acknowledged sequence number. If history has been compacted, the Worker returns a fresh snapshot and cursor.
 
+The implemented SQLite update feed is bounded to at most 1,000 events per request and returns whether more events remain. State transitions and progressive updates share one monotonically increasing cursor.
+
+Routine update payloads do not contain transcript text. Segment and provisional events carry IDs, time ranges, generations, outcome, and text length; an authorized client reads actual text from the snapshot. This preserves reconnect behavior without leaking spoken content into routine event handling or diagnostics.
+
 ## 10. Error model
 
 Errors contain:
@@ -207,6 +215,8 @@ MEMORY_PRESSURE_PAUSED
 MODEL_NOT_READY
 DIARIZATION_AUTH_REQUIRED
 ASR_TRUNCATED
+TRANSCRIPT_COMMIT_CONFLICT
+TRANSCRIPT_REVISION_CONFLICT
 WORKER_VERSION_INCOMPATIBLE
 PUBLICATION_TARGET_UNAVAILABLE
 PUBLICATION_CONFLICT

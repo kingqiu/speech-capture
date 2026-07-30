@@ -78,6 +78,8 @@ Local routine logs may contain:
 
 They must not contain transcript text, source bytes, prompts containing transcript material, credentials, full local paths, or original filenames when a pseudonym is sufficient.
 
+The reconnect event feed follows the same boundary: it carries segment IDs, time ranges, outcomes, generations, speaker state, and text length, but transcript text is read only through the authorized bounded snapshot.
+
 Diagnostic export is user initiated, previewable, redacted, and saved locally. Sending it anywhere is a separate user action.
 
 ## 8. Retention

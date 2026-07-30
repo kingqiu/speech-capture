@@ -39,6 +39,8 @@ from speech_capture_worker.errors import (
     JobNotFound,
     RevisionConflict,
     SchedulerBusy,
+    TranscriptConflict,
+    TranscriptRevisionConflict,
     UploadChecksumMismatch,
     UploadIncomplete,
     UploadNotFound,
@@ -50,12 +52,31 @@ from speech_capture_worker.errors import (
     WorkerCoreError,
 )
 from speech_capture_worker.media_probe import MediaProbeResult, probe_audio_source
+from speech_capture_worker.transcript import (
+    DiarizationStatus,
+    JobProgress,
+    JobSnapshot,
+    JobUpdate,
+    ProvisionalTranscript,
+    SpeakerLabelStatus,
+    TranscriptOutcome,
+    TranscriptSegment,
+    TranscriptTimingStatus,
+    validate_commit_key,
+    validate_confidence,
+    validate_language,
+    validate_progress_number,
+    validate_speaker_id,
+    validate_time_range,
+    validate_transcript_text,
+)
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 DEFAULT_UPLOAD_CHUNK_SIZE_BYTES = 8 * 1024 * 1024
 MAX_UPLOAD_CHUNK_SIZE_BYTES = 64 * 1024 * 1024
 MAX_UPLOAD_PARTS = 10_000
 COPY_BUFFER_BYTES = 1024 * 1024
+_UNSET = object()
 
 
 class JobStore:
@@ -459,6 +480,18 @@ class JobStore:
                         details={"active_job_id": str(active["job_id"])},
                     )
             ensure_transition_allowed(current.state, target_state)
+            if (
+                current.state is JobState.TRANSCRIBING
+                and target_state is JobState.ALIGNING
+                and self._connection.execute(
+                    "SELECT 1 FROM provisional_transcripts WHERE job_id = ?",
+                    (job_id,),
+                ).fetchone()
+                is not None
+            ):
+                raise InvalidJobRequest(
+                    "The provisional transcript must be committed or cleared before alignment."
+                )
             return self._transition_in_transaction(
                 current=current,
                 target_state=target_state,
@@ -513,6 +546,749 @@ class JobStore:
                 (job_id, after_sequence),
             ).fetchall()
             return [self._row_to_event(row) for row in rows]
+
+    def list_job_updates(
+        self,
+        job_id: str,
+        *,
+        after_sequence: int = 0,
+        limit: int = 200,
+    ) -> tuple[list[JobUpdate], bool]:
+        """Read a bounded reconnect feed without transcript text in event payloads."""
+
+        if after_sequence < 0:
+            raise InvalidJobRequest("after_sequence must be zero or greater.")
+        if limit < 1 or limit > 1000:
+            raise InvalidJobRequest("limit must be between 1 and 1000.")
+        with self._lock:
+            self._fetch_job_row(job_id)
+            rows = self._connection.execute(
+                """
+                SELECT *
+                FROM job_updates
+                WHERE job_id = ? AND sequence > ?
+                ORDER BY sequence ASC
+                LIMIT ?
+                """,
+                (job_id, after_sequence, limit + 1),
+            ).fetchall()
+            return (
+                [self._row_to_job_update(row) for row in rows[:limit]],
+                len(rows) > limit,
+            )
+
+    def put_job_progress(
+        self,
+        job_id: str,
+        *,
+        processed_ms: int,
+        stage_progress: float,
+        elapsed_seconds: float,
+        estimated_remaining_seconds: float | None = None,
+        diarization_status: DiarizationStatus = DiarizationStatus.NOT_STARTED,
+    ) -> tuple[JobProgress, bool]:
+        """Persist one monotonic progress snapshot and emit a content-free update."""
+
+        if (
+            not isinstance(processed_ms, int)
+            or isinstance(processed_ms, bool)
+            or processed_ms < 0
+        ):
+            raise InvalidJobRequest("processed_ms must be zero or greater.")
+        validate_progress_number(
+            "stage_progress",
+            stage_progress,
+            minimum=0,
+            maximum=1,
+        )
+        validate_progress_number("elapsed_seconds", elapsed_seconds, minimum=0)
+        if estimated_remaining_seconds is not None:
+            validate_progress_number(
+                "estimated_remaining_seconds",
+                estimated_remaining_seconds,
+                minimum=0,
+            )
+        if not isinstance(diarization_status, DiarizationStatus):
+            raise InvalidJobRequest("diarization_status is not supported.")
+
+        with self._transaction():
+            job = self._row_to_job(self._fetch_job_row(job_id))
+            if job.state not in ACTIVE_PROCESSING_STATES:
+                raise InvalidJobRequest(
+                    "Progress can be recorded only while the job is actively processing."
+                )
+            duration_ms = self._job_duration_ms(job)
+            if processed_ms > duration_ms:
+                raise InvalidJobRequest("processed_ms cannot exceed the source duration.")
+            payload = {
+                "stage": job.state.value,
+                "processed_ms": processed_ms,
+                "duration_ms": duration_ms,
+                "stage_progress": float(stage_progress),
+                "elapsed_seconds": float(elapsed_seconds),
+                "estimated_remaining_seconds": (
+                    float(estimated_remaining_seconds)
+                    if estimated_remaining_seconds is not None
+                    else None
+                ),
+                "diarization_status": diarization_status.value,
+            }
+            payload_json = _canonical_json(payload)
+            payload_sha256 = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
+            prior = self._connection.execute(
+                "SELECT * FROM job_progress WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            if prior is not None and prior["payload_sha256"] == payload_sha256:
+                return self._row_to_job_progress(prior), False
+            if prior is not None:
+                if processed_ms < int(prior["processed_ms"]):
+                    raise InvalidJobRequest("processed_ms cannot move backwards.")
+                if (
+                    str(prior["stage"]) == job.state.value
+                    and float(stage_progress) < float(prior["stage_progress"])
+                ):
+                    raise InvalidJobRequest(
+                        "stage_progress cannot move backwards within the same stage."
+                    )
+                if float(elapsed_seconds) < float(prior["elapsed_seconds"]):
+                    raise InvalidJobRequest("elapsed_seconds cannot move backwards.")
+                generation = int(prior["generation"]) + 1
+            else:
+                generation = 1
+            now = _utc_now()
+            self._connection.execute(
+                """
+                INSERT INTO job_progress (
+                    job_id,
+                    generation,
+                    stage,
+                    processed_ms,
+                    duration_ms,
+                    stage_progress,
+                    elapsed_seconds,
+                    estimated_remaining_seconds,
+                    diarization_status,
+                    payload_sha256,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(job_id) DO UPDATE SET
+                    generation = excluded.generation,
+                    stage = excluded.stage,
+                    processed_ms = excluded.processed_ms,
+                    duration_ms = excluded.duration_ms,
+                    stage_progress = excluded.stage_progress,
+                    elapsed_seconds = excluded.elapsed_seconds,
+                    estimated_remaining_seconds = excluded.estimated_remaining_seconds,
+                    diarization_status = excluded.diarization_status,
+                    payload_sha256 = excluded.payload_sha256,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    job_id,
+                    generation,
+                    job.state.value,
+                    processed_ms,
+                    duration_ms,
+                    float(stage_progress),
+                    float(elapsed_seconds),
+                    (
+                        float(estimated_remaining_seconds)
+                        if estimated_remaining_seconds is not None
+                        else None
+                    ),
+                    diarization_status.value,
+                    payload_sha256,
+                    now,
+                ),
+            )
+            self._insert_update(
+                job_id=job_id,
+                job_revision=job.revision,
+                event_type="job.progress",
+                payload=payload,
+                created_at=now,
+            )
+            row = self._connection.execute(
+                "SELECT * FROM job_progress WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            assert row is not None
+            return self._row_to_job_progress(row), True
+
+    def put_provisional_transcript(
+        self,
+        job_id: str,
+        *,
+        expected_generation: int,
+        start_ms: int,
+        end_ms: int,
+        text: str,
+        language: str | None = None,
+    ) -> tuple[ProvisionalTranscript, bool]:
+        """Create or revise the one explicitly unstable transcript tail."""
+
+        if (
+            not isinstance(expected_generation, int)
+            or isinstance(expected_generation, bool)
+            or expected_generation < 0
+        ):
+            raise InvalidJobRequest("expected_generation must be zero or greater.")
+        validate_transcript_text(text)
+        validate_language(language)
+        with self._transaction():
+            job = self._row_to_job(self._fetch_job_row(job_id))
+            if job.state is not JobState.TRANSCRIBING:
+                raise InvalidJobRequest(
+                    "A provisional transcript can be written only while transcribing."
+                )
+            duration_ms = self._job_duration_ms(job)
+            validate_time_range(start_ms, end_ms, duration_ms=duration_ms)
+            latest_stable_end = self._latest_stable_segment_end_ms(job_id)
+            if start_ms < latest_stable_end:
+                raise InvalidJobRequest(
+                    "A provisional transcript cannot overlap a committed segment."
+                )
+            payload = {
+                "start_ms": start_ms,
+                "end_ms": end_ms,
+                "text": text,
+                "language": language,
+            }
+            payload_json = _canonical_json(payload)
+            payload_sha256 = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
+            prior = self._connection.execute(
+                "SELECT * FROM provisional_transcripts WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            if prior is not None and prior["payload_sha256"] == payload_sha256:
+                return self._row_to_provisional(prior), False
+            current_generation = int(prior["generation"]) if prior is not None else 0
+            if current_generation != expected_generation:
+                raise TranscriptRevisionConflict(
+                    "The provisional transcript changed after the caller's snapshot.",
+                    details={
+                        "job_id": job_id,
+                        "expected_generation": expected_generation,
+                        "current_generation": current_generation,
+                    },
+                )
+            generation = current_generation + 1
+            now = _utc_now()
+            self._connection.execute(
+                """
+                INSERT INTO provisional_transcripts (
+                    job_id,
+                    generation,
+                    start_ms,
+                    end_ms,
+                    text,
+                    language,
+                    payload_sha256,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(job_id) DO UPDATE SET
+                    generation = excluded.generation,
+                    start_ms = excluded.start_ms,
+                    end_ms = excluded.end_ms,
+                    text = excluded.text,
+                    language = excluded.language,
+                    payload_sha256 = excluded.payload_sha256,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    job_id,
+                    generation,
+                    start_ms,
+                    end_ms,
+                    text,
+                    language,
+                    payload_sha256,
+                    now,
+                ),
+            )
+            self._insert_update(
+                job_id=job_id,
+                job_revision=job.revision,
+                event_type="transcript.provisional_revised",
+                payload={
+                    "generation": generation,
+                    "start_ms": start_ms,
+                    "end_ms": end_ms,
+                    "text_length": len(text),
+                },
+                created_at=now,
+            )
+            row = self._connection.execute(
+                "SELECT * FROM provisional_transcripts WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            assert row is not None
+            return self._row_to_provisional(row), True
+
+    def clear_provisional_transcript(
+        self,
+        job_id: str,
+        *,
+        expected_generation: int,
+    ) -> bool:
+        """Clear the unstable tail with an optimistic generation guard."""
+
+        if (
+            not isinstance(expected_generation, int)
+            or isinstance(expected_generation, bool)
+            or expected_generation < 0
+        ):
+            raise InvalidJobRequest("expected_generation must be zero or greater.")
+        with self._transaction():
+            job = self._row_to_job(self._fetch_job_row(job_id))
+            prior = self._connection.execute(
+                "SELECT * FROM provisional_transcripts WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            if prior is None:
+                return False
+            current_generation = int(prior["generation"])
+            if current_generation != expected_generation:
+                raise TranscriptRevisionConflict(
+                    "The provisional transcript changed after the caller's snapshot.",
+                    details={
+                        "job_id": job_id,
+                        "expected_generation": expected_generation,
+                        "current_generation": current_generation,
+                    },
+                )
+            self._connection.execute(
+                "DELETE FROM provisional_transcripts WHERE job_id = ?",
+                (job_id,),
+            )
+            self._insert_update(
+                job_id=job_id,
+                job_revision=job.revision,
+                event_type="transcript.provisional_cleared",
+                payload={"generation": current_generation},
+                created_at=_utc_now(),
+            )
+            return True
+
+    def commit_transcript_segment(
+        self,
+        job_id: str,
+        *,
+        commit_key: str,
+        start_ms: int,
+        end_ms: int,
+        outcome: TranscriptOutcome,
+        text: str | None = None,
+        language: str | None = None,
+        confidence: float | None = None,
+        timing_status: TranscriptTimingStatus = TranscriptTimingStatus.ESTIMATED,
+        speaker_id: str | None = None,
+        speaker_label_status: SpeakerLabelStatus = SpeakerLabelStatus.PENDING,
+        error_code: str | None = None,
+    ) -> tuple[TranscriptSegment, bool]:
+        """Commit one non-overlapping stable timeline outcome idempotently."""
+
+        validate_commit_key(commit_key)
+        validate_language(language)
+        validate_confidence(confidence)
+        validate_speaker_id(speaker_id)
+        validate_reason_code(error_code)
+        if not isinstance(outcome, TranscriptOutcome):
+            raise InvalidJobRequest("outcome is not supported.")
+        if not isinstance(timing_status, TranscriptTimingStatus):
+            raise InvalidJobRequest("timing_status is not supported.")
+        if not isinstance(speaker_label_status, SpeakerLabelStatus):
+            raise InvalidJobRequest("speaker_label_status is not supported.")
+        self._validate_segment_content(
+            outcome=outcome,
+            text=text,
+            speaker_id=speaker_id,
+            speaker_label_status=speaker_label_status,
+            error_code=error_code,
+        )
+
+        request_payload = {
+            "commit_key": commit_key,
+            "start_ms": start_ms,
+            "end_ms": end_ms,
+            "outcome": outcome.value,
+            "text": text,
+            "language": language,
+            "confidence": float(confidence) if confidence is not None else None,
+            "timing_status": timing_status.value,
+            "speaker_id": speaker_id,
+            "speaker_label_status": speaker_label_status.value,
+            "error_code": error_code,
+        }
+        fingerprint = hashlib.sha256(
+            _canonical_json(request_payload).encode("utf-8")
+        ).hexdigest()
+        with self._transaction():
+            job = self._row_to_job(self._fetch_job_row(job_id))
+            if job.state is not JobState.TRANSCRIBING:
+                raise InvalidJobRequest(
+                    "Stable transcript outcomes can be committed only while transcribing."
+                )
+            duration_ms = self._job_duration_ms(job)
+            validate_time_range(start_ms, end_ms, duration_ms=duration_ms)
+            prior = self._connection.execute(
+                """
+                SELECT *
+                FROM transcript_segments
+                WHERE job_id = ? AND commit_key = ?
+                """,
+                (job_id, commit_key),
+            ).fetchone()
+            if prior is not None:
+                if str(prior["request_fingerprint"]) != fingerprint:
+                    raise TranscriptConflict(
+                        "The commit key is already bound to a different transcript segment.",
+                        details={"job_id": job_id, "commit_key": commit_key},
+                    )
+                return self._row_to_transcript_segment(prior), False
+            latest_stable_end = self._latest_stable_segment_end_ms(job_id)
+            if start_ms < latest_stable_end:
+                raise TranscriptConflict(
+                    "Stable transcript segments must be committed in timeline order.",
+                    details={"latest_stable_end_ms": latest_stable_end},
+                )
+            overlap = self._connection.execute(
+                """
+                SELECT segment_id
+                FROM transcript_segments
+                WHERE job_id = ? AND start_ms < ? AND end_ms > ?
+                LIMIT 1
+                """,
+                (job_id, end_ms, start_ms),
+            ).fetchone()
+            if overlap is not None:
+                raise TranscriptConflict(
+                    "A stable transcript segment cannot overlap an existing segment.",
+                    details={"conflicting_segment_id": str(overlap["segment_id"])},
+                )
+            sequence = int(
+                self._connection.execute(
+                    """
+                    SELECT COALESCE(MAX(segment_sequence), 0) + 1
+                    FROM transcript_segments
+                    WHERE job_id = ?
+                    """,
+                    (job_id,),
+                ).fetchone()[0]
+            )
+            segment_id = f"seg_{sequence:08d}"
+            now = _utc_now()
+            self._connection.execute(
+                """
+                INSERT INTO transcript_segments (
+                    job_id,
+                    segment_sequence,
+                    segment_id,
+                    commit_key,
+                    request_fingerprint,
+                    revision,
+                    start_ms,
+                    end_ms,
+                    outcome,
+                    text,
+                    language,
+                    confidence,
+                    timing_status,
+                    speaker_id,
+                    speaker_label_status,
+                    error_code,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    job_id,
+                    sequence,
+                    segment_id,
+                    commit_key,
+                    fingerprint,
+                    start_ms,
+                    end_ms,
+                    outcome.value,
+                    text,
+                    language,
+                    float(confidence) if confidence is not None else None,
+                    timing_status.value,
+                    speaker_id,
+                    speaker_label_status.value,
+                    error_code,
+                    now,
+                    now,
+                ),
+            )
+            provisional = self._connection.execute(
+                "SELECT * FROM provisional_transcripts WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            if provisional is not None and int(provisional["start_ms"]) < end_ms:
+                self._connection.execute(
+                    "DELETE FROM provisional_transcripts WHERE job_id = ?",
+                    (job_id,),
+                )
+            self._insert_update(
+                job_id=job_id,
+                job_revision=job.revision,
+                event_type="transcript.segment_committed",
+                payload={
+                    "segment_sequence": sequence,
+                    "segment_id": segment_id,
+                    "revision": 1,
+                    "start_ms": start_ms,
+                    "end_ms": end_ms,
+                    "outcome": outcome.value,
+                    "text_length": len(text) if text is not None else 0,
+                    "speaker_label_status": speaker_label_status.value,
+                },
+                created_at=now,
+            )
+            row = self._fetch_transcript_segment_row(job_id, segment_id)
+            return self._row_to_transcript_segment(row), True
+
+    def update_transcript_segment_metadata(
+        self,
+        job_id: str,
+        segment_id: str,
+        *,
+        expected_revision: int,
+        start_ms: int | None = None,
+        end_ms: int | None = None,
+        timing_status: TranscriptTimingStatus | None = None,
+        speaker_id: str | None | object = _UNSET,
+        speaker_label_status: SpeakerLabelStatus | None = None,
+    ) -> TranscriptSegment:
+        """Revise alignment or speaker attribution without rewriting stable text."""
+
+        if expected_revision < 1:
+            raise InvalidJobRequest("expected_revision must be one or greater.")
+        if (
+            start_ms is None
+            and end_ms is None
+            and timing_status is None
+            and speaker_id is _UNSET
+            and speaker_label_status is None
+        ):
+            raise InvalidJobRequest("At least one segment metadata field must be supplied.")
+        if speaker_id is not _UNSET:
+            if speaker_id is not None and not isinstance(speaker_id, str):
+                raise InvalidJobRequest("speaker_id contains unsupported characters.")
+            validate_speaker_id(speaker_id)
+        if timing_status is not None and not isinstance(timing_status, TranscriptTimingStatus):
+            raise InvalidJobRequest("timing_status is not supported.")
+        if speaker_label_status is not None and not isinstance(
+            speaker_label_status, SpeakerLabelStatus
+        ):
+            raise InvalidJobRequest("speaker_label_status is not supported.")
+
+        with self._transaction():
+            job = self._row_to_job(self._fetch_job_row(job_id))
+            current = self._row_to_transcript_segment(
+                self._fetch_transcript_segment_row(job_id, segment_id)
+            )
+            if current.revision != expected_revision:
+                raise TranscriptRevisionConflict(
+                    "The transcript segment changed after the caller's snapshot.",
+                    details={
+                        "segment_id": segment_id,
+                        "expected_revision": expected_revision,
+                        "current_revision": current.revision,
+                    },
+                )
+            revised_start = current.start_ms if start_ms is None else start_ms
+            revised_end = current.end_ms if end_ms is None else end_ms
+            revised_timing = timing_status or current.timing_status
+            revised_speaker = current.speaker_id if speaker_id is _UNSET else speaker_id
+            revised_speaker_status = speaker_label_status or current.speaker_label_status
+            duration_ms = self._job_duration_ms(job)
+            validate_time_range(revised_start, revised_end, duration_ms=duration_ms)
+            self._validate_segment_content(
+                outcome=current.outcome,
+                text=current.text,
+                speaker_id=revised_speaker,
+                speaker_label_status=revised_speaker_status,
+                error_code=current.error_code,
+            )
+            neighbor = self._connection.execute(
+                """
+                SELECT segment_id
+                FROM transcript_segments
+                WHERE
+                    job_id = ?
+                    AND segment_id != ?
+                    AND start_ms < ?
+                    AND end_ms > ?
+                LIMIT 1
+                """,
+                (job_id, segment_id, revised_end, revised_start),
+            ).fetchone()
+            if neighbor is not None:
+                raise TranscriptConflict(
+                    "Revised transcript timing would overlap another stable segment.",
+                    details={"conflicting_segment_id": str(neighbor["segment_id"])},
+                )
+            timing_changed = (
+                revised_start != current.start_ms
+                or revised_end != current.end_ms
+                or revised_timing is not current.timing_status
+            )
+            speaker_changed = (
+                revised_speaker != current.speaker_id
+                or revised_speaker_status is not current.speaker_label_status
+            )
+            if not timing_changed and not speaker_changed:
+                return current
+            if timing_changed and job.state is not JobState.ALIGNING:
+                raise InvalidJobRequest(
+                    "Transcript timing metadata can be revised only while aligning."
+                )
+            if speaker_changed and job.state is not JobState.DIARIZING:
+                raise InvalidJobRequest(
+                    "Speaker attribution can be revised only while diarizing."
+                )
+            revision = current.revision + 1
+            now = _utc_now()
+            self._connection.execute(
+                """
+                UPDATE transcript_segments
+                SET
+                    revision = ?,
+                    start_ms = ?,
+                    end_ms = ?,
+                    timing_status = ?,
+                    speaker_id = ?,
+                    speaker_label_status = ?,
+                    updated_at = ?
+                WHERE job_id = ? AND segment_id = ? AND revision = ?
+                """,
+                (
+                    revision,
+                    revised_start,
+                    revised_end,
+                    revised_timing.value,
+                    revised_speaker,
+                    revised_speaker_status.value,
+                    now,
+                    job_id,
+                    segment_id,
+                    current.revision,
+                ),
+            )
+            if speaker_changed and not timing_changed:
+                event_type = "speaker.attribution_updated"
+            elif timing_changed and not speaker_changed:
+                event_type = "transcript.segment_timing_updated"
+            else:
+                event_type = "transcript.segment_metadata_updated"
+            self._insert_update(
+                job_id=job_id,
+                job_revision=job.revision,
+                event_type=event_type,
+                payload={
+                    "segment_id": segment_id,
+                    "segment_sequence": current.segment_sequence,
+                    "revision": revision,
+                    "start_ms": revised_start,
+                    "end_ms": revised_end,
+                    "timing_status": revised_timing.value,
+                    "speaker_id": revised_speaker,
+                    "speaker_label_status": revised_speaker_status.value,
+                },
+                created_at=now,
+            )
+            return self._row_to_transcript_segment(
+                self._fetch_transcript_segment_row(job_id, segment_id)
+            )
+
+    def get_job_snapshot(
+        self,
+        job_id: str,
+        *,
+        after_segment_sequence: int = 0,
+        segment_limit: int = 100,
+    ) -> JobSnapshot:
+        """Read one internally consistent, bounded reconnect snapshot."""
+
+        if after_segment_sequence < 0:
+            raise InvalidJobRequest("after_segment_sequence must be zero or greater.")
+        if segment_limit < 1 or segment_limit > 500:
+            raise InvalidJobRequest("segment_limit must be between 1 and 500.")
+        with self._read_transaction():
+            job = self._row_to_job(self._fetch_job_row(job_id))
+            progress_row = self._connection.execute(
+                "SELECT * FROM job_progress WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            segment_rows = self._connection.execute(
+                """
+                SELECT *
+                FROM transcript_segments
+                WHERE job_id = ? AND segment_sequence > ?
+                ORDER BY segment_sequence ASC
+                LIMIT ?
+                """,
+                (job_id, after_segment_sequence, segment_limit + 1),
+            ).fetchall()
+            selected_rows = segment_rows[:segment_limit]
+            segments = [self._row_to_transcript_segment(row) for row in selected_rows]
+            provisional_row = self._connection.execute(
+                "SELECT * FROM provisional_transcripts WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            resource_row = self._connection.execute(
+                """
+                SELECT payload_json
+                FROM job_checkpoints
+                WHERE
+                    job_id = ?
+                    AND stage = 'scheduler'
+                    AND checkpoint_key = 'resource_preflight'
+                """,
+                (job_id,),
+            ).fetchone()
+            latest_sequence = int(
+                self._connection.execute(
+                    """
+                    SELECT COALESCE(MAX(sequence), 0)
+                    FROM job_updates
+                    WHERE job_id = ?
+                    """,
+                    (job_id,),
+                ).fetchone()[0]
+            )
+            return JobSnapshot(
+                job=job,
+                progress=(
+                    self._row_to_job_progress(progress_row)
+                    if progress_row is not None
+                    else None
+                ),
+                stable_segments=segments,
+                provisional=(
+                    self._row_to_provisional(provisional_row)
+                    if provisional_row is not None
+                    else None
+                ),
+                resource_report=(
+                    _json_object(resource_row["payload_json"])
+                    if resource_row is not None
+                    else None
+                ),
+                latest_event_sequence=latest_sequence,
+                next_after_segment_sequence=(
+                    segments[-1].segment_sequence
+                    if segments
+                    else after_segment_sequence
+                ),
+                has_more_segments=len(segment_rows) > segment_limit,
+            )
 
     def put_checkpoint(
         self,
@@ -1187,11 +1963,129 @@ class JobStore:
                     if self._connection.in_transaction:
                         self._connection.execute("ROLLBACK")
                     raise
+                current = 3
+            if current == 3:
+                try:
+                    self._connection.executescript(
+                        """
+                    BEGIN IMMEDIATE;
+
+                    CREATE TABLE transcript_segments (
+                        job_id TEXT NOT NULL
+                            REFERENCES jobs(job_id) ON DELETE CASCADE,
+                        segment_sequence INTEGER NOT NULL CHECK (segment_sequence > 0),
+                        segment_id TEXT NOT NULL,
+                        commit_key TEXT NOT NULL,
+                        request_fingerprint TEXT NOT NULL,
+                        revision INTEGER NOT NULL CHECK (revision > 0),
+                        start_ms INTEGER NOT NULL CHECK (start_ms >= 0),
+                        end_ms INTEGER NOT NULL CHECK (end_ms > start_ms),
+                        outcome TEXT NOT NULL,
+                        text TEXT,
+                        language TEXT,
+                        confidence REAL CHECK (
+                            confidence IS NULL OR (confidence >= 0 AND confidence <= 1)
+                        ),
+                        timing_status TEXT NOT NULL,
+                        speaker_id TEXT,
+                        speaker_label_status TEXT NOT NULL,
+                        error_code TEXT,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        PRIMARY KEY (job_id, segment_id),
+                        UNIQUE (job_id, segment_sequence),
+                        UNIQUE (job_id, commit_key)
+                    );
+
+                    CREATE INDEX transcript_segments_job_time_idx
+                    ON transcript_segments (job_id, start_ms, end_ms);
+
+                    CREATE TABLE provisional_transcripts (
+                        job_id TEXT PRIMARY KEY
+                            REFERENCES jobs(job_id) ON DELETE CASCADE,
+                        generation INTEGER NOT NULL CHECK (generation > 0),
+                        start_ms INTEGER NOT NULL CHECK (start_ms >= 0),
+                        end_ms INTEGER NOT NULL CHECK (end_ms > start_ms),
+                        text TEXT NOT NULL,
+                        language TEXT,
+                        payload_sha256 TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    );
+
+                    CREATE TABLE job_progress (
+                        job_id TEXT PRIMARY KEY
+                            REFERENCES jobs(job_id) ON DELETE CASCADE,
+                        generation INTEGER NOT NULL CHECK (generation > 0),
+                        stage TEXT NOT NULL,
+                        processed_ms INTEGER NOT NULL CHECK (processed_ms >= 0),
+                        duration_ms INTEGER NOT NULL CHECK (duration_ms > 0),
+                        stage_progress REAL NOT NULL CHECK (
+                            stage_progress >= 0 AND stage_progress <= 1
+                        ),
+                        elapsed_seconds REAL NOT NULL CHECK (elapsed_seconds >= 0),
+                        estimated_remaining_seconds REAL CHECK (
+                            estimated_remaining_seconds IS NULL
+                            OR estimated_remaining_seconds >= 0
+                        ),
+                        diarization_status TEXT NOT NULL,
+                        payload_sha256 TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    );
+
+                    CREATE TABLE job_updates (
+                        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                        job_id TEXT NOT NULL
+                            REFERENCES jobs(job_id) ON DELETE CASCADE,
+                        job_revision INTEGER NOT NULL CHECK (job_revision >= 0),
+                        event_type TEXT NOT NULL,
+                        payload_json TEXT NOT NULL,
+                        created_at TEXT NOT NULL
+                    );
+
+                    CREATE INDEX job_updates_job_sequence_idx
+                    ON job_updates (job_id, sequence);
+
+                    INSERT INTO job_updates (
+                        job_id,
+                        job_revision,
+                        event_type,
+                        payload_json,
+                        created_at
+                    )
+                    SELECT
+                        job_id,
+                        revision,
+                        event_type,
+                        payload_json,
+                        created_at
+                    FROM job_events
+                    ORDER BY sequence ASC;
+
+                    PRAGMA user_version = 4;
+                    COMMIT;
+                    """
+                    )
+                except BaseException:
+                    if self._connection.in_transaction:
+                        self._connection.execute("ROLLBACK")
+                    raise
 
     @contextmanager
     def _transaction(self) -> Iterator[None]:
         with self._lock:
             self._connection.execute("BEGIN IMMEDIATE")
+            try:
+                yield
+            except BaseException:
+                self._connection.execute("ROLLBACK")
+                raise
+            else:
+                self._connection.execute("COMMIT")
+
+    @contextmanager
+    def _read_transaction(self) -> Iterator[None]:
+        with self._lock:
+            self._connection.execute("BEGIN")
             try:
                 yield
             except BaseException:
@@ -1280,6 +2174,94 @@ class JobStore:
             options=job.options,
         )
         self._require_complete_upload_for_request(request)
+
+    def _job_duration_ms(self, job: JobRecord) -> int:
+        if job.source_upload_id is None:
+            raise VerifiedUploadRequired(
+                "Progressive transcript data requires a verified Worker upload.",
+                details={"job_id": job.job_id},
+            )
+        upload = self._row_to_upload(self._fetch_upload_row(job.source_upload_id))
+        if upload.state is not UploadState.COMPLETE or upload.duration_seconds is None:
+            raise VerifiedUploadRequired(
+                "Progressive transcript data requires a complete media-verified upload.",
+                details={"upload_id": upload.upload_id},
+            )
+        return max(1, round(upload.duration_seconds * 1000))
+
+    def _latest_stable_segment_end_ms(self, job_id: str) -> int:
+        row = self._connection.execute(
+            """
+            SELECT COALESCE(MAX(end_ms), 0)
+            FROM transcript_segments
+            WHERE job_id = ?
+            """,
+            (job_id,),
+        ).fetchone()
+        return int(row[0])
+
+    def _fetch_transcript_segment_row(
+        self,
+        job_id: str,
+        segment_id: str,
+    ) -> sqlite3.Row:
+        if not SAFE_IDENTIFIER_PATTERN.fullmatch(segment_id) or not segment_id.startswith("seg_"):
+            raise InvalidJobRequest("segment_id contains unsupported characters.")
+        row = self._connection.execute(
+            """
+            SELECT *
+            FROM transcript_segments
+            WHERE job_id = ? AND segment_id = ?
+            """,
+            (job_id, segment_id),
+        ).fetchone()
+        if row is None:
+            raise InvalidJobRequest(
+                "The requested transcript segment does not exist.",
+                details={"job_id": job_id, "segment_id": segment_id},
+            )
+        return row
+
+    @staticmethod
+    def _validate_segment_content(
+        *,
+        outcome: TranscriptOutcome,
+        text: str | None,
+        speaker_id: str | None,
+        speaker_label_status: SpeakerLabelStatus,
+        error_code: str | None,
+    ) -> None:
+        if outcome is TranscriptOutcome.TRANSCRIBED:
+            if text is None:
+                raise InvalidJobRequest("A transcribed segment requires text.")
+            validate_transcript_text(text)
+            if speaker_id is None and speaker_label_status in {
+                SpeakerLabelStatus.ANONYMOUS,
+                SpeakerLabelStatus.CONFIRMED,
+            }:
+                raise InvalidJobRequest(
+                    "An anonymous or confirmed speaker status requires speaker_id."
+                )
+            if speaker_id is not None and speaker_label_status in {
+                SpeakerLabelStatus.PENDING,
+                SpeakerLabelStatus.UNAVAILABLE,
+            }:
+                raise InvalidJobRequest(
+                    "A speaker_id requires anonymous or confirmed speaker status."
+                )
+        else:
+            if text is not None:
+                raise InvalidJobRequest(
+                    "Only a transcribed timeline outcome may contain transcript text."
+                )
+            if speaker_id is not None or speaker_label_status is not SpeakerLabelStatus.UNAVAILABLE:
+                raise InvalidJobRequest(
+                    "Non-transcribed timeline outcomes cannot carry speaker attribution."
+                )
+        if outcome is TranscriptOutcome.FAILED and error_code is None:
+            raise InvalidJobRequest("A failed timeline outcome requires error_code.")
+        if outcome is not TranscriptOutcome.FAILED and error_code is not None:
+            raise InvalidJobRequest("error_code is allowed only for a failed timeline outcome.")
 
     def _fetch_upload_row(self, upload_id: str) -> sqlite3.Row:
         _validate_upload_id(upload_id)
@@ -1516,6 +2498,12 @@ class JobStore:
         payload: dict[str, Any],
         created_at: str,
     ) -> None:
+        event_payload = {
+            **payload,
+            "from_state": from_state.value if from_state is not None else None,
+            "to_state": to_state.value,
+            "reason_code": reason_code,
+        }
         self._connection.execute(
             """
             INSERT INTO job_events (
@@ -1537,6 +2525,43 @@ class JobStore:
                 from_state.value if from_state is not None else None,
                 to_state.value,
                 reason_code,
+                _canonical_json(payload),
+                created_at,
+            ),
+        )
+        self._insert_update(
+            job_id=job_id,
+            job_revision=revision,
+            event_type=event_type,
+            payload=event_payload,
+            created_at=created_at,
+        )
+
+    def _insert_update(
+        self,
+        *,
+        job_id: str,
+        job_revision: int,
+        event_type: str,
+        payload: dict[str, Any],
+        created_at: str,
+    ) -> None:
+        _validate_event_type(event_type)
+        self._connection.execute(
+            """
+            INSERT INTO job_updates (
+                job_id,
+                job_revision,
+                event_type,
+                payload_json,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                job_id,
+                job_revision,
+                event_type,
                 _canonical_json(payload),
                 created_at,
             ),
@@ -1634,6 +2659,70 @@ class JobStore:
             sha256=str(row["sha256"]),
             created_at=str(row["created_at"]),
             updated_at=str(row["updated_at"]),
+        )
+
+    @staticmethod
+    def _row_to_job_progress(row: sqlite3.Row) -> JobProgress:
+        return JobProgress(
+            job_id=str(row["job_id"]),
+            generation=int(row["generation"]),
+            stage=JobState(row["stage"]),
+            processed_ms=int(row["processed_ms"]),
+            duration_ms=int(row["duration_ms"]),
+            stage_progress=float(row["stage_progress"]),
+            elapsed_seconds=float(row["elapsed_seconds"]),
+            estimated_remaining_seconds=(
+                float(row["estimated_remaining_seconds"])
+                if row["estimated_remaining_seconds"] is not None
+                else None
+            ),
+            diarization_status=DiarizationStatus(row["diarization_status"]),
+            updated_at=str(row["updated_at"]),
+        )
+
+    @staticmethod
+    def _row_to_provisional(row: sqlite3.Row) -> ProvisionalTranscript:
+        return ProvisionalTranscript(
+            job_id=str(row["job_id"]),
+            generation=int(row["generation"]),
+            start_ms=int(row["start_ms"]),
+            end_ms=int(row["end_ms"]),
+            text=str(row["text"]),
+            language=str(row["language"]) if row["language"] is not None else None,
+            updated_at=str(row["updated_at"]),
+        )
+
+    @staticmethod
+    def _row_to_transcript_segment(row: sqlite3.Row) -> TranscriptSegment:
+        return TranscriptSegment(
+            job_id=str(row["job_id"]),
+            segment_sequence=int(row["segment_sequence"]),
+            segment_id=str(row["segment_id"]),
+            commit_key=str(row["commit_key"]),
+            revision=int(row["revision"]),
+            start_ms=int(row["start_ms"]),
+            end_ms=int(row["end_ms"]),
+            outcome=TranscriptOutcome(row["outcome"]),
+            text=str(row["text"]) if row["text"] is not None else None,
+            language=str(row["language"]) if row["language"] is not None else None,
+            confidence=float(row["confidence"]) if row["confidence"] is not None else None,
+            timing_status=TranscriptTimingStatus(row["timing_status"]),
+            speaker_id=str(row["speaker_id"]) if row["speaker_id"] is not None else None,
+            speaker_label_status=SpeakerLabelStatus(row["speaker_label_status"]),
+            error_code=str(row["error_code"]) if row["error_code"] is not None else None,
+            created_at=str(row["created_at"]),
+            updated_at=str(row["updated_at"]),
+        )
+
+    @staticmethod
+    def _row_to_job_update(row: sqlite3.Row) -> JobUpdate:
+        return JobUpdate(
+            sequence=int(row["sequence"]),
+            job_id=str(row["job_id"]),
+            job_revision=int(row["job_revision"]),
+            event_type=str(row["event_type"]),
+            payload=_json_object(row["payload_json"]),
+            created_at=str(row["created_at"]),
         )
 
 
