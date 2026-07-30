@@ -12,6 +12,7 @@ license = "PolyForm-Noncommercial-1.0.0"
 authors = [{name = "Speech Capture contributors"}]
 dependencies = [
   "mlx-qwen3-asr[aligner]==0.3.5",
+  "psutil>=7.0,<8",
 ]
 
 [project.optional-dependencies]
@@ -25,6 +26,7 @@ diarization = [
 
 [project.scripts]
 speech-capture-asr-probe = "speech_capture_worker.asr_probe:main"
+speech-capture-worker = "speech_capture_worker.worker_cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/speech_capture_worker"]

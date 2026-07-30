@@ -1,6 +1,6 @@
 # Speech Capture Worker
 
-Status: Phase 1 model spike. There is no runnable Worker service yet.
+Status: local model spike and persistent Worker core. There is no network Worker service yet.
 
 The Worker performs durable local processing outside Obsidian. It will own:
 
@@ -18,6 +18,29 @@ The Worker performs durable local processing outside Obsidian. It will own:
 The first supported platform is Apple Silicon macOS.
 
 Planned implementation: Python 3.11, FastAPI, SQLite, FFmpeg, MLX, pyannote, Ollama, and `uv`.
+
+## Persistent Worker core
+
+The package now contains a strict job state machine, SQLite job/event/checkpoint storage, idempotent creation, revision guards, restart recovery, and disk/memory preflight.
+
+Developer commands:
+
+```bash
+uv sync --extra dev
+
+uv run speech-capture-worker init \
+  --data-dir runtime/dev-worker
+
+uv run speech-capture-worker preflight \
+  --storage-path runtime/dev-worker \
+  --profile accuracy \
+  --source-size-bytes 536870912 \
+  --duration-sec 3600
+```
+
+`runtime/` is ignored by Git. The CLI requires an explicit data directory and does not create a global service installation.
+
+See [Persistent Worker core](../../docs/worker-core.md) for state, schema, recovery, resource rules, and current boundaries.
 
 ## ASR probe
 

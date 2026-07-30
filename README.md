@@ -49,6 +49,7 @@ The V1 Worker targets Apple Silicon Macs. The plugin protocol is designed so oth
 - [Product requirements](docs/product-requirements.md)
 - [System architecture](docs/architecture.md)
 - [Worker API direction](docs/worker-api.md)
+- [Persistent Worker core](docs/worker-core.md)
 - [Data model and output package](docs/data-model-and-output.md)
 - [Security, privacy, and recovery](docs/security-privacy-and-recovery.md)
 - [Testing strategy](docs/testing-strategy.md)
