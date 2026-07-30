@@ -26,6 +26,8 @@ The Worker core now has an executable local foundation for:
 - complete frame-based, energy-aware ASR chunk plans;
 - immutable raw ASR attempts with checksummed private files;
 - one-chunk-at-a-time local MLX execution, retry, replay, and safe resource pause;
+- durable whole-transcript alignment, evidence, and timeline-readiness reports;
+- a strict completeness gate before speaker diarization;
 - stable machine-readable errors;
 - a developer CLI.
 
@@ -59,6 +61,9 @@ This is not yet the network Worker service. It can execute or replay one local A
 24. A raw ASR attempt is written and checksummed before its text becomes a stable visible segment.
 25. Retrying a completed attempt replays its raw evidence instead of invoking the model again.
 26. Severe resource pressure pauses before the next chunk; it never discards prior raw attempts or segments.
+27. A job cannot enter diarization until every planned chunk has matching durable raw evidence and a materialization checkpoint.
+28. A job cannot enter diarization while transcribed timing is estimated, a source range lacks a stable outcome, or an inaudible or failed range remains.
+29. Alignment checkpoints contain ranges, counts, and stable issue codes, but never transcript text.
 
 ## 3. SQLite layout
 
@@ -492,6 +497,25 @@ Rejected output and model exceptions retain separate raw attempt records. The de
 
 When container and normalized PCM duration differ by codec rounding, visible segment endings and progress are clamped to the verified container duration. Exact normalized frame coverage remains preserved in the private plan and raw attempts.
 
+### 12.5 Whole-transcript alignment and completeness gate
+
+After all ASR chunks are materialized, `finalize-alignment` evaluates the complete
+job rather than trusting the last successful model call. It verifies:
+
+- every normalized-audio chunk has a matching successful immutable attempt;
+- every materialization checkpoint still references existing stable segments;
+- each referenced raw attempt still passes its file checksum;
+- every transcribed stable segment has aligned rather than estimated timing;
+- stable outcomes are non-overlapping and account for the full verified source;
+- no `inaudible` or `failed` outcome is being presented as complete.
+
+The resulting `transcript_alignment_report` checkpoint is deterministic and
+contains only counts, durations, ranges, booleans, and stable issue codes. It
+does not contain transcript text. Uncovered ranges and estimated timing keep the
+job in `aligning`. Only a fully verified report advances the job to `diarizing`.
+Calling the finalizer again after restart returns the same report without a
+second model call or a duplicate state transition.
+
 ## 13. Developer CLI
 
 From `services/speech-worker/`:
@@ -545,6 +569,10 @@ uv run speech-capture-worker prepare-audio \
   job_example
 
 uv run speech-capture-worker run-asr-next \
+  --data-dir runtime/dev-worker \
+  job_example
+
+uv run speech-capture-worker finalize-alignment \
   --data-dir runtime/dev-worker \
   job_example
 
@@ -617,6 +645,11 @@ The Worker package currently tests:
 - safe resource pause before the next model call;
 - container-versus-PCM duration clamping;
 - real local MLX Qwen3-ASR execution on synthetic Chinese speech through aligned stable text.
+- complete aligned transcript advancement to `diarizing`;
+- durable uncovered-range reporting without transcript text;
+- estimated-timing and missing-evidence blocking;
+- alignment-finalization idempotency across Worker restart;
+- machine-readable `finalize-alignment` CLI output.
 
 A separate CLI integration run advanced a job to `transcribing`, closed the store, recovered it to `queued`, and verified all seven events and database integrity.
 
@@ -628,8 +661,8 @@ The scheduler integration continued that source into a bound revision-three queu
 
 The next layer will add:
 
-1. validate and finalize alignment across every stable segment;
-2. classify silence and non-speech gaps for full timeline accounting;
+1. classify silence, non-speech, and unresolved gaps so incomplete alignment reports can reach full timeline accounting safely;
+2. add a controlled forced-alignment fallback for any stable text that still has estimated timing;
 3. integrate pyannote diarization and anonymous speaker attribution;
 4. run a continuous restart-safe stage loop rather than one backend command per chunk;
 5. add content detection, hierarchical extraction, and evidence validation;

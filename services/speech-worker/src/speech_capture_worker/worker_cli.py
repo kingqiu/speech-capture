@@ -9,6 +9,10 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
+from speech_capture_worker.alignment import (
+    AlignmentFinalizationOutcome,
+    TranscriptAlignmentFinalizer,
+)
 from speech_capture_worker.asr_execution import AsrChunkExecutor, MlxQwenAsrEngine
 from speech_capture_worker.audio_preprocessing import AudioPreprocessor
 from speech_capture_worker.domain import (
@@ -281,6 +285,13 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_data_dir(run_asr_next)
     run_asr_next.add_argument("job_id")
     run_asr_next.add_argument("--max-attempts", type=int, default=3)
+
+    finalize_alignment = subparsers.add_parser(
+        "finalize-alignment",
+        help="Verify whole-transcript alignment and timeline readiness.",
+    )
+    _add_data_dir(finalize_alignment)
+    finalize_alignment.add_argument("job_id")
 
     list_asr_attempts = subparsers.add_parser(
         "list-asr-attempts",
@@ -568,6 +579,18 @@ def _dispatch(args: argparse.Namespace) -> int:
                 if result.outcome.value
                 in {"retryable_failure", "safe_paused", "partial"}
                 else 0
+            )
+        if args.command == "finalize-alignment":
+            result = TranscriptAlignmentFinalizer(store).finalize(args.job_id)
+            _write_json(result.to_dict())
+            return (
+                0
+                if result.outcome
+                in {
+                    AlignmentFinalizationOutcome.READY_FOR_DIARIZATION,
+                    AlignmentFinalizationOutcome.ALREADY_FINALIZED,
+                }
+                else 2
             )
         if args.command == "list-asr-attempts":
             attempts = store.list_asr_attempts(

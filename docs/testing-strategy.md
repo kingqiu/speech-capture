@@ -114,6 +114,10 @@ For each validated source:
 - raw ASR output exists before cleanup or summarization.
 - normalized frame chunks are contiguous, non-overlapping, and end at the exact final frame;
 - container-duration rounding cannot make visible progress exceed the verified source duration.
+- every materialized chunk still references matching checksummed raw evidence;
+- estimated transcript timing blocks the alignment exit gate;
+- uncovered ranges are persisted without transcript text and block diarization;
+- a complete report is idempotent across restart and advances exactly once.
 
 The core automated assertion is:
 

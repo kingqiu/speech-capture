@@ -154,6 +154,22 @@ The implemented core can now continue a claimed `preprocessing` job through dete
 
 Raw payload locations and content are not part of routine job or event responses. Future artifact authorization will govern raw evidence download.
 
+### 7.2 Durable alignment exit gate
+
+The implemented core now creates a private whole-transcript alignment report
+before entering diarization. The report independently states whether:
+
+- all planned chunks have matching immutable raw attempts and materialization records;
+- every transcribed segment has aligned timing;
+- stable outcomes account for the full verified source timeline;
+- the transcript contains any `inaudible` or `failed` range;
+- the job is safe to advance to speaker diarization.
+
+The report exposes only safe counts, durations, ranges, and issue codes. It does
+not expose transcript text through routine events or diagnostics. Estimated
+timing, missing evidence, uncovered ranges, and partial outcomes keep the job
+out of diarization.
+
 ## 8. Job snapshot
 
 The implemented core snapshot is an internally consistent, bounded read containing:

@@ -1,6 +1,6 @@
 # Speech Capture Worker
 
-Status: local model spike, persistent Worker core, durable media intake, one-active-job scheduling, progressive transcript persistence, deterministic normalization, and restart-safe local ASR chunk execution. There is no network Worker service yet.
+Status: local model spike, persistent Worker core, durable media intake, one-active-job scheduling, progressive transcript persistence, deterministic normalization, restart-safe local ASR chunk execution, and durable whole-transcript alignment finalization. There is no network Worker service yet.
 
 The Worker performs durable local processing outside Obsidian. It will own:
 
@@ -35,6 +35,8 @@ The package now contains:
 - private deterministic 16 kHz PCM normalization and complete frame-based chunk plans;
 - immutable checksummed raw ASR attempts and idempotent replay;
 - real MLX Qwen3-ASR chunk execution with validation, retry, and safe boundary pause;
+- a private alignment report that separately proves raw evidence, aligned timing,
+  complete timeline accounting, and transcript completeness before diarization;
 - idempotent creation, revision guards, and restart recovery;
 - disk and memory preflight.
 
@@ -83,6 +85,10 @@ uv run speech-capture-worker prepare-audio \
   job_example
 
 uv run speech-capture-worker run-asr-next \
+  --data-dir runtime/dev-worker \
+  job_example
+
+uv run speech-capture-worker finalize-alignment \
   --data-dir runtime/dev-worker \
   job_example
 ```

@@ -36,7 +36,7 @@ Exit condition: at least one representative long recording is completely account
 
 Goal: complete the durable local processing contract before frontend implementation.
 
-Status: in progress. Durable storage, resumable verified intake, one-active-job scheduling, resource preflight, progressive snapshots, deterministic normalization, immutable raw attempts, and restart-safe local ASR chunk execution are implemented.
+Status: in progress. Durable storage, resumable verified intake, one-active-job scheduling, resource preflight, progressive snapshots, deterministic normalization, immutable raw attempts, restart-safe local ASR chunk execution, and a durable whole-transcript alignment/completeness gate are implemented.
 
 - versioned protocol and generated types;
 - durable Worker database and artifact store;
