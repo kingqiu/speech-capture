@@ -506,6 +506,12 @@ Rejected output and model exceptions retain separate raw attempt records. The de
 
 When container and normalized PCM duration differ by codec rounding, visible segment endings and progress are clamped to the verified container duration. Exact normalized frame coverage remains preserved in the private plan and raw attempts.
 
+`run-asr-all` calls the same single-chunk executor repeatedly until
+transcription completes, a chunk becomes partial, resources block, or an
+optional per-run chunk limit is reached. Each iteration is restart-safe: an
+interrupted batch can be resumed with the same command, and chunks that already
+have raw evidence replay without another model call.
+
 ### 12.5 Whole-transcript alignment and completeness gate
 
 After all ASR chunks are materialized, `finalize-alignment` evaluates the complete
@@ -875,8 +881,10 @@ The scheduler integration continued that source into a bound revision-three queu
 
 The next layer will add:
 
-1. run the revision-pinned VAD candidate against private labeled samples and measure false speech negatives and non-speech false positives before defining any automatic rule;
-2. integrate pyannote diarization and anonymous speaker attribution;
-3. run a continuous restart-safe stage loop rather than one backend command per chunk;
-4. add content detection, hierarchical extraction, and evidence validation;
-5. add FastAPI only after the core behavior is stable under integration tests.
+1. integrate pyannote diarization and anonymous speaker attribution;
+2. add content detection, hierarchical extraction, and evidence validation;
+3. add FastAPI only after the core behavior is stable under integration tests.
+
+Continuous multi-chunk ASR batches are now available through `run-asr-all`; a
+full packaged background stage loop will still be needed for the network
+service.

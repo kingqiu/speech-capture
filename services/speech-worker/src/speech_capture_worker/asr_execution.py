@@ -57,6 +57,7 @@ class AsrRunOutcome(StrEnum):
     SAFE_PAUSED = "safe_paused"
     TRANSCRIPTION_COMPLETED = "transcription_completed"
     PARTIAL = "partial"
+    BATCH_LIMIT_REACHED = "batch_limit_reached"
 
 
 @dataclass(frozen=True)
@@ -77,6 +78,32 @@ class AsrRunResult:
             "issues": [asdict(issue) for issue in self.issues],
             "resource_report": (
                 self.resource_report.to_dict() if self.resource_report is not None else None
+            ),
+        }
+
+
+@dataclass(frozen=True)
+class AsrBatchResult:
+    outcome: AsrRunOutcome
+    job: JobRecord
+    completed_chunks: int
+    total_chunks: int
+    attempts_used: int
+    last_chunk_index: int | None
+    resource_report: ResourceReport | None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "outcome": self.outcome,
+            "job": self.job.to_dict(),
+            "completed_chunks": self.completed_chunks,
+            "total_chunks": self.total_chunks,
+            "attempts_used": self.attempts_used,
+            "last_chunk_index": self.last_chunk_index,
+            "resource_report": (
+                self.resource_report.to_dict()
+                if self.resource_report is not None
+                else None
             ),
         }
 
@@ -241,6 +268,51 @@ class AsrChunkExecutor:
             issues=(),
             resource_report=None,
         )
+
+    def run_all(self, job_id: str, *, max_chunks: int | None = None) -> AsrBatchResult:
+        if max_chunks is not None and (
+            not isinstance(max_chunks, int)
+            or isinstance(max_chunks, bool)
+            or max_chunks < 1
+        ):
+            raise InvalidJobRequest("max_chunks must be a positive integer or None.")
+        completed = 0
+        attempts_used = 0
+        last_chunk_index: int | None = None
+        last_resource: ResourceReport | None = None
+        while True:
+            result = self.run_next(job_id)
+            last_resource = result.resource_report
+            if result.chunk_index is not None:
+                last_chunk_index = result.chunk_index
+            if result.attempt is not None:
+                attempts_used += 1
+            if result.outcome is AsrRunOutcome.CHUNK_COMPLETED:
+                completed += 1
+                if max_chunks is not None and completed >= max_chunks:
+                    plan = self.preprocessor.get_plan(job_id)
+                    return AsrBatchResult(
+                        outcome=AsrRunOutcome.BATCH_LIMIT_REACHED,
+                        job=self.store.get_job(job_id),
+                        completed_chunks=len(self._materialized_chunks(job_id)),
+                        total_chunks=len(plan.chunks),
+                        attempts_used=attempts_used,
+                        last_chunk_index=last_chunk_index,
+                        resource_report=last_resource,
+                    )
+                continue
+            if result.outcome is AsrRunOutcome.RETRYABLE_FAILURE:
+                continue
+            plan = self.preprocessor.get_plan(job_id)
+            return AsrBatchResult(
+                outcome=result.outcome,
+                job=result.job,
+                completed_chunks=len(self._materialized_chunks(job_id)),
+                total_chunks=len(plan.chunks),
+                attempts_used=attempts_used,
+                last_chunk_index=last_chunk_index,
+                resource_report=last_resource,
+            )
 
     def _execute_chunk(
         self,

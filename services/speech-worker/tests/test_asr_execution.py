@@ -13,7 +13,11 @@ from speech_capture_worker.asr_domain import AsrAttemptState
 from speech_capture_worker.asr_execution import AsrChunkExecutor, AsrRunOutcome
 from speech_capture_worker.audio_preprocessing import AudioPreprocessor
 from speech_capture_worker.domain import JobState, ResourceStatus, UploadCreateRequest
-from speech_capture_worker.errors import AsrAttemptConflict, UploadStorageError
+from speech_capture_worker.errors import (
+    AsrAttemptConflict,
+    InvalidJobRequest,
+    UploadStorageError,
+)
 from speech_capture_worker.job_store import JobStore
 from speech_capture_worker.media_probe import MediaProbeResult
 from speech_capture_worker.resources import (
@@ -385,6 +389,186 @@ def test_boundary_resource_block_safely_pauses_before_model_call(tmp_path) -> No
     assert result.job.state is JobState.PAUSED
     assert result.job.last_error_code == "RESOURCE_BOUNDARY_BLOCKED"
     assert engine.calls == 0
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")
+def test_run_all_executes_every_chunk_and_finishes_transcription(tmp_path) -> None:
+    with JobStore(
+        tmp_path / "worker.sqlite3",
+        source_probe=source_probe_for(95),
+    ) as store:
+        job = create_preprocessing_job(
+            store,
+            duration_seconds=95,
+            suffix="batch-complete",
+        )
+        engine = FakeEngine()
+        result = AsrChunkExecutor(
+            store,
+            engine,
+            boundary_preflight=preflight(),
+        ).run_all(job.job_id)
+        snapshot = store.get_job_snapshot(job.job_id)
+
+    assert result.total_chunks > 1
+    assert result.outcome is AsrRunOutcome.TRANSCRIPTION_COMPLETED
+    assert result.job.state is JobState.ALIGNING
+    assert result.completed_chunks == result.total_chunks
+    assert result.attempts_used == result.total_chunks
+    assert engine.calls == result.total_chunks
+    assert snapshot.progress is not None
+    assert snapshot.progress.processed_ms == 95000
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")
+def test_run_all_respects_batch_limit_and_resumes_remaining_chunks(tmp_path) -> None:
+    with JobStore(
+        tmp_path / "worker.sqlite3",
+        source_probe=source_probe_for(95),
+    ) as store:
+        job = create_preprocessing_job(
+            store,
+            duration_seconds=95,
+            suffix="batch-limit",
+        )
+        engine = FakeEngine()
+        executor = AsrChunkExecutor(
+            store,
+            engine,
+            boundary_preflight=preflight(),
+        )
+        first = executor.run_all(job.job_id, max_chunks=2)
+
+        assert first.outcome is AsrRunOutcome.BATCH_LIMIT_REACHED
+        assert first.job.state is JobState.TRANSCRIBING
+        assert first.completed_chunks == 2
+        assert first.total_chunks > 2
+        assert engine.calls == 2
+
+        second = executor.run_all(job.job_id)
+
+        assert second.outcome is AsrRunOutcome.TRANSCRIPTION_COMPLETED
+        assert second.job.state is JobState.ALIGNING
+        assert second.completed_chunks == second.total_chunks == first.total_chunks
+        assert engine.calls == second.total_chunks
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")
+def test_run_all_survives_worker_restart_between_batches(tmp_path) -> None:
+    database = tmp_path / "worker.sqlite3"
+    with JobStore(
+        database,
+        source_probe=source_probe_for(95),
+    ) as store:
+        job = create_preprocessing_job(
+            store,
+            duration_seconds=95,
+            suffix="batch-restart",
+        )
+        first = AsrChunkExecutor(
+            store,
+            FakeEngine(),
+            boundary_preflight=preflight(),
+        ).run_all(job.job_id, max_chunks=1)
+
+        assert first.outcome is AsrRunOutcome.BATCH_LIMIT_REACHED
+        assert first.completed_chunks == 1
+        assert first.total_chunks > 2
+
+    with JobStore(database) as restarted:
+        engine = FakeEngine()
+        second = AsrChunkExecutor(
+            restarted,
+            engine,
+            boundary_preflight=preflight(),
+        ).run_all(job.job_id)
+
+        assert second.outcome is AsrRunOutcome.TRANSCRIPTION_COMPLETED
+        assert second.completed_chunks == second.total_chunks == first.total_chunks
+        assert engine.calls == second.total_chunks - 1
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")
+def test_run_all_safely_pauses_when_resources_block_next_chunk(tmp_path) -> None:
+    class FlippingPreflight:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def __call__(self, *_, **__):
+            self.calls += 1
+            return resource_report(
+                ResourceStatus.READY if self.calls == 1 else ResourceStatus.BLOCKED
+            )
+
+    with JobStore(
+        tmp_path / "worker.sqlite3",
+        source_probe=source_probe_for(95),
+    ) as store:
+        job = create_preprocessing_job(
+            store,
+            duration_seconds=95,
+            suffix="batch-pressure",
+        )
+        engine = FakeEngine()
+        result = AsrChunkExecutor(
+            store,
+            engine,
+            boundary_preflight=FlippingPreflight(),
+        ).run_all(job.job_id)
+
+        assert result.outcome is AsrRunOutcome.SAFE_PAUSED
+        assert result.job.state is JobState.PAUSED
+        assert result.job.last_error_code == "RESOURCE_BOUNDARY_BLOCKED"
+        assert result.completed_chunks == 1
+        assert result.total_chunks > 1
+        assert engine.calls == 1
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")
+def test_run_all_retries_rejected_chunks_before_continuing(tmp_path) -> None:
+    rejected = valid_result(np.zeros(16_000, dtype=np.int16))
+    rejected["truncated"] = True
+    rejected["finish_reason"] = "length"
+    rejected["chunks"][0]["truncated"] = True
+    rejected["chunks"][0]["finish_reason"] = "length"
+    with JobStore(
+        tmp_path / "worker.sqlite3",
+        source_probe=source_probe_for(95),
+    ) as store:
+        job = create_preprocessing_job(
+            store,
+            duration_seconds=95,
+            suffix="batch-retry",
+        )
+        engine = FakeEngine([rejected, *[valid_result] * 8])
+        result = AsrChunkExecutor(
+            store,
+            engine,
+            boundary_preflight=preflight(),
+        ).run_all(job.job_id)
+        attempts = store.list_asr_attempts(job.job_id)
+
+        assert result.outcome is AsrRunOutcome.TRANSCRIPTION_COMPLETED
+        assert result.completed_chunks == result.total_chunks
+        assert result.attempts_used == result.total_chunks + 1
+        assert engine.calls == result.total_chunks + 1
+        assert [attempt.state for attempt in attempts[:2]] == [
+            AsrAttemptState.REJECTED,
+            AsrAttemptState.SUCCEEDED,
+        ]
+
+
+def test_run_all_rejects_invalid_batch_limits(tmp_path) -> None:
+    with JobStore(tmp_path / "worker.sqlite3") as store:
+        executor = AsrChunkExecutor(
+            store,
+            FakeEngine(),
+            boundary_preflight=preflight(),
+        )
+        with pytest.raises(InvalidJobRequest):
+            executor.run_all("any-job", max_chunks=0)
+        with pytest.raises(InvalidJobRequest):
+            executor.run_all("any-job", max_chunks=-1)
 
 
 def test_raw_attempt_is_private_idempotent_immutable_and_checksum_verified(

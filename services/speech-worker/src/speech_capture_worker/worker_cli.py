@@ -303,6 +303,15 @@ def _build_parser() -> argparse.ArgumentParser:
     run_asr_next.add_argument("job_id")
     run_asr_next.add_argument("--max-attempts", type=int, default=3)
 
+    run_asr_all = subparsers.add_parser(
+        "run-asr-all",
+        help="Execute all remaining ASR chunks with safe retries and recovery.",
+    )
+    _add_data_dir(run_asr_all)
+    run_asr_all.add_argument("job_id")
+    run_asr_all.add_argument("--max-attempts", type=int, default=3)
+    run_asr_all.add_argument("--max-chunks", type=int)
+
     finalize_alignment = subparsers.add_parser(
         "finalize-alignment",
         help="Verify whole-transcript alignment and timeline readiness.",
@@ -655,6 +664,20 @@ def _dispatch(args: argparse.Namespace) -> int:
             _write_json(result.to_dict())
             return (
                 2 if result.outcome.value in {"retryable_failure", "safe_paused", "partial"} else 0
+            )
+        if args.command == "run-asr-all":
+            job = store.get_job(args.job_id)
+            result = AsrChunkExecutor(
+                store,
+                MlxQwenAsrEngine(model_profile=job.model_profile),
+                max_attempts=args.max_attempts,
+            ).run_all(args.job_id, max_chunks=args.max_chunks)
+            _write_json(result.to_dict())
+            return (
+                2
+                if result.outcome.value
+                in {"retryable_failure", "safe_paused", "partial"}
+                else 0
             )
         if args.command == "finalize-alignment":
             result = TranscriptAlignmentFinalizer(store).finalize(args.job_id)
