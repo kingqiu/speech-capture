@@ -126,6 +126,12 @@ For each validated source:
 - silence can be backfilled before or between existing text without changing stable segment IDs or cursors;
 - stale alignment evidence, custom thresholds, audible PCM, and overlapping ranges cannot authorize materialization;
 - alignment is refreshed after backfill so the remaining uncovered timeline is durable immediately.
+- a human-reviewed outcome must match one complete current unresolved range;
+- review keys are idempotent and cannot be rebound to another range or outcome;
+- stale review evidence and overlapping stable segments cannot authorize materialization;
+- reviewed `inaudible` accounts for time without claiming a complete transcript;
+- interruption after a reviewed segment commit is repaired without duplicating the segment;
+- routine review checkpoints and CLI output contain no transcript or free-form reviewer text.
 
 The core automated assertion is:
 

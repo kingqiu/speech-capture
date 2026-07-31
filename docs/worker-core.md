@@ -30,6 +30,7 @@ The Worker core now has an executable local foundation for:
 - a strict completeness gate before speaker diarization;
 - conservative, checksummed PCM evidence for uncovered timeline ranges;
 - evidence-bound definite-silence backfill and immediate alignment refresh;
+- version-anchored explicit human review for exact unresolved ranges;
 - stable machine-readable errors;
 - a developer CLI.
 
@@ -69,6 +70,7 @@ This is not yet the network Worker service. It can execute or replay one local A
 30. Gap analysis may prove sufficiently long near-digital silence, but audible or uncertain PCM remains unresolved and cannot be silently labeled non-speech.
 31. Only current gap evidence produced by the fixed conservative policy may authorize an aligned `non_speech` backfill.
 32. Alignment backfill may append a stable segment sequence before or between existing timeline ranges, but it may never rewrite IDs, overlap another segment, or change transcript text.
+33. Human review may account for one complete current unresolved range as `non_speech` or `inaudible`, but a review key can never be rebound and does not prove automatic classification quality.
 
 ## 3. SQLite layout
 
@@ -566,6 +568,28 @@ Retries before alignment refresh reuse the same commit key and evidence
 fingerprint. A crash after segment insertion but before its evidence checkpoint
 or alignment refresh is repaired idempotently by the next invocation.
 
+### 12.8 Explicit reviewed-gap outcomes
+
+`review-gap` provides a separate strong-evidence path when a person has listened
+to one unresolved range. It accepts only:
+
+- one opaque review key;
+- the exact start and end of one complete range in the current alignment report;
+- `non_speech` or `inaudible`.
+
+The Worker persists an `explicit_human_review` checkpoint bound to the current
+alignment generation and payload SHA-256. It stores a stable reason code, not
+reviewer identity or free-form text. A dedicated store transaction revalidates
+the checkpoint and current report, rejects overlaps, appends an aligned
+text-free segment, and writes a separate materialization checkpoint before
+rerunning whole-transcript alignment.
+
+Repeating the same review key and decision returns the original segment.
+Changing the range or outcome is an explicit conflict. A reviewed `inaudible`
+range accounts for source time but keeps `transcript_complete` false. This path
+does not classify audible content automatically and does not treat an empty ASR
+result as review evidence.
+
 ## 13. Developer CLI
 
 From `services/speech-worker/`:
@@ -629,6 +653,14 @@ uv run speech-capture-worker finalize-alignment \
 uv run speech-capture-worker analyze-gaps \
   --data-dir runtime/dev-worker \
   job_example
+
+uv run speech-capture-worker review-gap \
+  --data-dir runtime/dev-worker \
+  job_example \
+  --review-key review-0001 \
+  --start-ms 12500 \
+  --end-ms 13900 \
+  --outcome inaudible
 
 uv run speech-capture-worker materialize-silence \
   --data-dir runtime/dev-worker \
@@ -720,6 +752,10 @@ The Worker package currently tests:
 - immediate whole-transcript alignment refresh;
 - successful advancement to `diarizing` when proven silence is the final gap;
 - machine-readable `materialize-silence` CLI output.
+- exact-range human-review enforcement and stale-report rejection;
+- immutable review-key behavior for range and outcome decisions;
+- reviewed `inaudible` timeline accounting without a false complete result;
+- reviewed-segment interruption repair and machine-readable `review-gap` output.
 
 A separate CLI integration run advanced a job to `transcribing`, closed the store, recovered it to `queued`, and verified all seven events and database integrity.
 
@@ -731,8 +767,8 @@ The scheduler integration continued that source into a bound revision-three queu
 
 The next layer will add:
 
-1. safely classify the remaining audible or uncertain non-speech and inaudible gaps without relying on amplitude alone;
-2. add a controlled forced-alignment fallback for any stable text that still has estimated timing;
+1. add a controlled forced-alignment fallback for any stable text that still has estimated timing;
+2. evaluate and validate an automatic classifier for remaining audible or uncertain non-speech and inaudible gaps without relying on amplitude or empty ASR alone;
 3. integrate pyannote diarization and anonymous speaker attribution;
 4. run a continuous restart-safe stage loop rather than one backend command per chunk;
 5. add content detection, hierarchical extraction, and evidence validation;

@@ -29,6 +29,7 @@ from speech_capture_worker.gap_analysis import (
     DefiniteSilenceMaterializer,
     TranscriptGapAnalyzer,
 )
+from speech_capture_worker.gap_review import ReviewedGapMaterializer
 from speech_capture_worker.job_store import JobStore
 from speech_capture_worker.resources import (
     check_resource_preflight,
@@ -324,6 +325,24 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     _add_data_dir(materialize_silence)
     materialize_silence.add_argument("job_id")
+
+    review_gap = subparsers.add_parser(
+        "review-gap",
+        help="Materialize one exact unresolved range from explicit human review.",
+    )
+    _add_data_dir(review_gap)
+    review_gap.add_argument("job_id")
+    review_gap.add_argument("--review-key", required=True)
+    review_gap.add_argument("--start-ms", type=int, required=True)
+    review_gap.add_argument("--end-ms", type=int, required=True)
+    review_gap.add_argument(
+        "--outcome",
+        choices=[
+            TranscriptOutcome.NON_SPEECH.value,
+            TranscriptOutcome.INAUDIBLE.value,
+        ],
+        required=True,
+    )
 
     list_asr_attempts = subparsers.add_parser(
         "list-asr-attempts",
@@ -632,6 +651,16 @@ def _dispatch(args: argparse.Namespace) -> int:
             return 0
         if args.command == "materialize-silence":
             result = DefiniteSilenceMaterializer(store).materialize(args.job_id)
+            _write_json(result.to_dict())
+            return 0
+        if args.command == "review-gap":
+            result = ReviewedGapMaterializer(store).materialize(
+                args.job_id,
+                review_key=args.review_key,
+                start_ms=args.start_ms,
+                end_ms=args.end_ms,
+                outcome=TranscriptOutcome(args.outcome),
+            )
             _write_json(result.to_dict())
             return 0
         if args.command == "list-asr-attempts":

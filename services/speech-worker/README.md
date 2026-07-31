@@ -1,6 +1,6 @@
 # Speech Capture Worker
 
-Status: local model spike, persistent Worker core, durable media intake, one-active-job scheduling, progressive transcript persistence, deterministic normalization, restart-safe local ASR chunk execution, durable whole-transcript alignment finalization, conservative PCM gap evidence, and evidence-bound definite-silence materialization. There is no network Worker service yet.
+Status: local model spike, persistent Worker core, durable media intake, one-active-job scheduling, progressive transcript persistence, deterministic normalization, restart-safe local ASR chunk execution, durable whole-transcript alignment finalization, conservative PCM gap evidence, evidence-bound definite-silence materialization, and explicit human-reviewed gap outcomes. There is no network Worker service yet.
 
 The Worker performs durable local processing outside Obsidian. It will own:
 
@@ -41,6 +41,8 @@ The package now contains:
   near-digital silence and leaves all audible or uncertain PCM unresolved;
 - evidence-bound backfill of default-policy definite silence as aligned
   `non_speech` timeline outcomes, followed by automatic alignment refresh;
+- exact-range, version-anchored human review of unresolved gaps as aligned
+  `non_speech` or `inaudible` outcomes without storing reviewer text or identity;
 - idempotent creation, revision guards, and restart recovery;
 - disk and memory preflight.
 
@@ -103,6 +105,14 @@ uv run speech-capture-worker analyze-gaps \
 uv run speech-capture-worker materialize-silence \
   --data-dir runtime/dev-worker \
   job_example
+
+uv run speech-capture-worker review-gap \
+  --data-dir runtime/dev-worker \
+  job_example \
+  --review-key review-0001 \
+  --start-ms 12500 \
+  --end-ms 13900 \
+  --outcome non_speech
 ```
 
 `runtime/` is ignored by Git. The CLI requires an explicit data directory and does not create a global service installation.
@@ -116,6 +126,12 @@ advance the job by itself.
 currently proven silence, stores one evidence checkpoint per inserted range,
 and reruns whole-transcript alignment. Custom thresholds remain useful for
 inspection but cannot authorize timeline materialization.
+
+`review-gap` records one explicit human decision for an exact unresolved range.
+The review key is an opaque idempotency key, not a reviewer identity. Only
+`non_speech` and `inaudible` are accepted; the command stores no free-form
+review text, rejects stale alignment reports or partial-range decisions, and
+refreshes alignment after materialization. This is not an automatic classifier.
 
 Upload completion requires FFprobe. The packaged Worker will own that dependency; during development it must be available on `PATH`.
 

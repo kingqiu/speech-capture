@@ -44,6 +44,12 @@ from speech_capture_worker.gap_analysis import (
     TranscriptGapAnalyzer,
     _analyze_wav_ranges,
 )
+from speech_capture_worker.gap_review import (
+    GAP_REVIEW_EVIDENCE_TYPE,
+    GAP_REVIEW_SCHEMA_VERSION,
+    GapReviewResultOutcome,
+    ReviewedGapMaterializer,
+)
 from speech_capture_worker.job_store import JobStore
 from speech_capture_worker.media_probe import MediaProbeResult
 from speech_capture_worker.resources import (
@@ -648,13 +654,12 @@ def test_materializer_repairs_interruption_after_segment_commit(tmp_path) -> Non
     assert repaired.created_segment_count == 0
     assert repaired.materializations[0].segment.segment_id == interrupted_segment.segment_id
     assert any(
-        value.checkpoint_key
-        == "gap_silence_000000000000_000000000250_materialized"
+        value.checkpoint_key == "gap_silence_000000000000_000000000250_materialized"
         for value in checkpoints
     )
-    assert [
-        value.to_dict() for value in repaired.alignment.report.unresolved_ranges
-    ] == [{"start_ms": 750, "end_ms": 1000}]
+    assert [value.to_dict() for value in repaired.alignment.report.unresolved_ranges] == [
+        {"start_ms": 750, "end_ms": 1000}
+    ]
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")
@@ -695,15 +700,9 @@ def test_materialized_silence_can_complete_alignment_exit_gate(tmp_path) -> None
             FakeGapEngine(),
             boundary_preflight=ready_preflight,
         ).run_next(preprocessing.job_id)
-        incomplete = TranscriptAlignmentFinalizer(store).finalize(
-            preprocessing.job_id
-        )
-        completed = DefiniteSilenceMaterializer(store).materialize(
-            preprocessing.job_id
-        )
-        repeated = DefiniteSilenceMaterializer(store).materialize(
-            preprocessing.job_id
-        )
+        incomplete = TranscriptAlignmentFinalizer(store).finalize(preprocessing.job_id)
+        completed = DefiniteSilenceMaterializer(store).materialize(preprocessing.job_id)
+        repeated = DefiniteSilenceMaterializer(store).materialize(preprocessing.job_id)
 
     assert transcribed.job.state is JobState.ALIGNING
     assert incomplete.outcome is AlignmentFinalizationOutcome.TIMELINE_INCOMPLETE
@@ -711,9 +710,7 @@ def test_materialized_silence_can_complete_alignment_exit_gate(tmp_path) -> None
         {"start_ms": 0, "end_ms": 750}
     ]
     assert completed.created_segment_count == 1
-    assert completed.alignment.outcome is (
-        AlignmentFinalizationOutcome.READY_FOR_DIARIZATION
-    )
+    assert completed.alignment.outcome is (AlignmentFinalizationOutcome.READY_FOR_DIARIZATION)
     assert completed.alignment.report.timeline_accounted is True
     assert completed.alignment.report.transcript_complete is True
     assert completed.job.state is JobState.DIARIZING
@@ -751,4 +748,290 @@ def test_cli_materializes_default_policy_silence(tmp_path, capsys) -> None:
     assert payload["alignment"]["report"]["unresolved_ranges"] == [
         {"start_ms": 750, "end_ms": 1000}
     ]
+    assert "private transcript" not in json.dumps(payload)
+
+
+def test_reviewed_non_speech_backfills_exact_current_gap_and_refreshes_alignment(
+    tmp_path,
+) -> None:
+    with JobStore(
+        tmp_path / "worker.sqlite3",
+        source_probe=source_probe,
+    ) as store:
+        job, _ = create_aligning_job(
+            store,
+            ranges=[(750, 1000)],
+            transcribed_ranges=[(0, 750)],
+        )
+        result = ReviewedGapMaterializer(store).materialize(
+            job.job_id,
+            review_key="review-0001",
+            start_ms=750,
+            end_ms=1000,
+            outcome=TranscriptOutcome.NON_SPEECH,
+        )
+        snapshot = store.get_job_snapshot(job.job_id)
+        checkpoints = store.list_checkpoints(job.job_id, stage="aligning")
+
+    assert result.outcome is GapReviewResultOutcome.MATERIALIZED
+    assert result.created is True
+    assert result.segment.outcome is TranscriptOutcome.NON_SPEECH
+    assert result.segment.timing_status is TranscriptTimingStatus.ALIGNED
+    assert result.segment.speaker_label_status is SpeakerLabelStatus.UNAVAILABLE
+    assert result.alignment.report.timeline_accounted is True
+    assert result.alignment.report.transcript_complete is True
+    assert result.alignment.report.unresolved_ranges == ()
+    assert len(snapshot.stable_segments) == 2
+    assert {checkpoint.checkpoint_key for checkpoint in checkpoints} >= {
+        "gap_review_review-0001_evidence",
+        "gap_review_review-0001_materialized",
+    }
+    evidence = next(
+        checkpoint
+        for checkpoint in checkpoints
+        if checkpoint.checkpoint_key == "gap_review_review-0001_evidence"
+    )
+    assert evidence.payload["evidence_type"] == "explicit_human_review"
+    assert evidence.payload["reason_code"] == "HUMAN_CONFIRMED_NON_SPEECH"
+    assert "private transcript" not in json.dumps(evidence.payload)
+
+
+def test_reviewed_inaudible_accounts_for_timeline_but_remains_partial(tmp_path) -> None:
+    with JobStore(
+        tmp_path / "worker.sqlite3",
+        source_probe=source_probe,
+    ) as store:
+        job, _ = create_aligning_job(
+            store,
+            ranges=[(0, 250)],
+            transcribed_ranges=[(250, 1000)],
+        )
+        result = ReviewedGapMaterializer(store).materialize(
+            job.job_id,
+            review_key="review-inaudible",
+            start_ms=0,
+            end_ms=250,
+            outcome=TranscriptOutcome.INAUDIBLE,
+        )
+
+    assert result.segment.outcome is TranscriptOutcome.INAUDIBLE
+    assert result.alignment.report.timeline_accounted is True
+    assert result.alignment.report.transcript_complete is False
+    assert result.alignment.report.ready_for_diarization is False
+    assert result.alignment.report.unresolved_ranges == ()
+    assert result.job.state is JobState.ALIGNING
+    assert any(
+        issue.code == "INAUDIBLE_TRANSCRIPT_RANGE" for issue in result.alignment.report.issues
+    )
+
+
+def test_gap_review_requires_one_complete_current_unresolved_range(tmp_path) -> None:
+    with JobStore(
+        tmp_path / "worker.sqlite3",
+        source_probe=source_probe,
+    ) as store:
+        job, _ = create_aligning_job(
+            store,
+            ranges=[(0, 250), (750, 1000)],
+            transcribed_ranges=[(250, 750)],
+        )
+        with pytest.raises(InvalidJobRequest, match="complete current unresolved range"):
+            ReviewedGapMaterializer(store).materialize(
+                job.job_id,
+                review_key="review-subrange",
+                start_ms=750,
+                end_ms=900,
+                outcome=TranscriptOutcome.NON_SPEECH,
+            )
+        snapshot = store.get_job_snapshot(job.job_id)
+
+    assert snapshot.stable_segments[0].outcome is TranscriptOutcome.TRANSCRIBED
+
+
+def test_gap_review_is_idempotent_and_review_key_cannot_be_rebound(tmp_path) -> None:
+    with JobStore(
+        tmp_path / "worker.sqlite3",
+        source_probe=source_probe,
+    ) as store:
+        job, _ = create_aligning_job(
+            store,
+            ranges=[(750, 1000)],
+            transcribed_ranges=[(0, 750)],
+        )
+        first = ReviewedGapMaterializer(store).materialize(
+            job.job_id,
+            review_key="review-idempotent",
+            start_ms=750,
+            end_ms=1000,
+            outcome=TranscriptOutcome.NON_SPEECH,
+        )
+        second = ReviewedGapMaterializer(store).materialize(
+            job.job_id,
+            review_key="review-idempotent",
+            start_ms=750,
+            end_ms=1000,
+            outcome=TranscriptOutcome.NON_SPEECH,
+        )
+        with pytest.raises(TranscriptConflict, match="different gap decision"):
+            ReviewedGapMaterializer(store).materialize(
+                job.job_id,
+                review_key="review-idempotent",
+                start_ms=750,
+                end_ms=1000,
+                outcome=TranscriptOutcome.INAUDIBLE,
+            )
+        snapshot = store.get_job_snapshot(job.job_id)
+
+    assert first.created is True
+    assert second.outcome is GapReviewResultOutcome.ALREADY_MATERIALIZED
+    assert second.created is False
+    assert second.segment.segment_id == first.segment.segment_id
+    assert len(snapshot.stable_segments) == 2
+
+
+def test_reviewed_gap_rejects_stale_alignment_evidence(tmp_path) -> None:
+    with JobStore(
+        tmp_path / "worker.sqlite3",
+        source_probe=source_probe,
+    ) as store:
+        job, _ = create_aligning_job(
+            store,
+            ranges=[(750, 1000)],
+            transcribed_ranges=[(0, 750)],
+        )
+        alignment = next(
+            checkpoint
+            for checkpoint in store.list_checkpoints(job.job_id, stage="aligning")
+            if checkpoint.checkpoint_key == "transcript_alignment_report"
+        )
+        review, _ = store.put_checkpoint(
+            job.job_id,
+            stage="aligning",
+            checkpoint_key="gap_review_review-stale_evidence",
+            payload={
+                "schema_version": GAP_REVIEW_SCHEMA_VERSION,
+                "evidence_type": GAP_REVIEW_EVIDENCE_TYPE,
+                "review_key": "review-stale",
+                "start_ms": 750,
+                "end_ms": 1000,
+                "outcome": TranscriptOutcome.NON_SPEECH.value,
+                "reason_code": "HUMAN_CONFIRMED_NON_SPEECH",
+                "source_duration_ms": 1000,
+                "alignment_report_schema_version": ALIGNMENT_REPORT_SCHEMA_VERSION,
+                "alignment_report_generation": alignment.generation,
+                "alignment_report_sha256": alignment.payload_sha256,
+            },
+        )
+        put_alignment_report(store, job.job_id, [(700, 1000)])
+        with pytest.raises(InvalidJobRequest, match="changed after gap review"):
+            store.commit_reviewed_gap_segment(
+                job.job_id,
+                review_key="review-stale",
+                start_ms=750,
+                end_ms=1000,
+                outcome=TranscriptOutcome.NON_SPEECH,
+                review_checkpoint_generation=review.generation,
+                review_checkpoint_sha256=review.payload_sha256,
+            )
+
+
+def test_gap_review_repairs_interruption_after_segment_commit(tmp_path) -> None:
+    with JobStore(
+        tmp_path / "worker.sqlite3",
+        source_probe=source_probe,
+    ) as store:
+        job, _ = create_aligning_job(
+            store,
+            ranges=[(750, 1000)],
+            transcribed_ranges=[(0, 750)],
+        )
+        alignment = next(
+            checkpoint
+            for checkpoint in store.list_checkpoints(job.job_id, stage="aligning")
+            if checkpoint.checkpoint_key == "transcript_alignment_report"
+        )
+        review, _ = store.put_checkpoint(
+            job.job_id,
+            stage="aligning",
+            checkpoint_key="gap_review_review-repair_evidence",
+            payload={
+                "schema_version": GAP_REVIEW_SCHEMA_VERSION,
+                "evidence_type": GAP_REVIEW_EVIDENCE_TYPE,
+                "review_key": "review-repair",
+                "start_ms": 750,
+                "end_ms": 1000,
+                "outcome": TranscriptOutcome.NON_SPEECH.value,
+                "reason_code": "HUMAN_CONFIRMED_NON_SPEECH",
+                "source_duration_ms": 1000,
+                "alignment_report_schema_version": ALIGNMENT_REPORT_SCHEMA_VERSION,
+                "alignment_report_generation": alignment.generation,
+                "alignment_report_sha256": alignment.payload_sha256,
+            },
+        )
+        interrupted, created = store.commit_reviewed_gap_segment(
+            job.job_id,
+            review_key="review-repair",
+            start_ms=750,
+            end_ms=1000,
+            outcome=TranscriptOutcome.NON_SPEECH,
+            review_checkpoint_generation=review.generation,
+            review_checkpoint_sha256=review.payload_sha256,
+        )
+        repaired = ReviewedGapMaterializer(store).materialize(
+            job.job_id,
+            review_key="review-repair",
+            start_ms=750,
+            end_ms=1000,
+            outcome=TranscriptOutcome.NON_SPEECH,
+        )
+        checkpoints = store.list_checkpoints(job.job_id, stage="aligning")
+
+    assert created is True
+    assert repaired.created is False
+    assert repaired.segment.segment_id == interrupted.segment_id
+    assert any(
+        checkpoint.checkpoint_key == "gap_review_review-repair_materialized"
+        for checkpoint in checkpoints
+    )
+    assert repaired.alignment.report.unresolved_ranges == ()
+
+
+def test_cli_materializes_explicit_review_without_exposing_text(
+    tmp_path,
+    capsys,
+) -> None:
+    data_path = tmp_path / "runtime"
+    with JobStore(
+        data_path / "worker.sqlite3",
+        source_probe=source_probe,
+    ) as store:
+        job, _ = create_aligning_job(
+            store,
+            ranges=[(750, 1000)],
+            transcribed_ranges=[(0, 750)],
+        )
+
+    exit_code = main(
+        [
+            "review-gap",
+            "--data-dir",
+            str(data_path),
+            job.job_id,
+            "--review-key",
+            "review-cli",
+            "--start-ms",
+            "750",
+            "--end-ms",
+            "1000",
+            "--outcome",
+            "non_speech",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert payload["outcome"] == "materialized"
+    assert payload["created"] is True
+    assert payload["segment"]["outcome"] == "non_speech"
+    assert payload["alignment"]["report"]["unresolved_ranges"] == []
     assert "private transcript" not in json.dumps(payload)

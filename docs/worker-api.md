@@ -204,6 +204,24 @@ report, normalized-audio checksum, and aggregate PCM evidence. Alignment is
 rerun after insertion so remaining unresolved ranges and stage readiness are
 immediately current.
 
+### 7.5 Explicit reviewed-gap materialization
+
+The core developer boundary can record a human-reviewed decision for one exact
+unresolved range as either aligned `non_speech` or aligned `inaudible`.
+
+The request carries an opaque review idempotency key, exact range boundaries,
+and the selected outcome. The Worker does not store reviewer identity or
+free-form notes. Before insertion it verifies that the complete range occurs
+exactly once in the current alignment report and binds the review checkpoint to
+that report's generation and payload SHA-256.
+
+A review key cannot later be rebound to another range or outcome. Per-range
+evidence and materialization checkpoints make retries and interruption repair
+idempotent. Alignment is refreshed immediately. An `inaudible` decision
+accounts for the timeline but keeps transcript completeness false. This
+boundary is explicit human evidence, not automatic audible-content
+classification.
+
 ## 8. Job snapshot
 
 The implemented core snapshot is an internally consistent, bounded read containing:

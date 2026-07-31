@@ -234,9 +234,19 @@ The media timeline is partitioned into explicit ranges:
 - non-audio or silence;
 - undecodable source region.
 
-A job cannot be marked `complete` if any decodable range has no explicit outcome.
+A job cannot be marked `complete` if any decodable range has no explicit outcome,
+or if an explicit outcome is `inaudible` or `failed`.
 
-`complete` means the entire validated timeline is accounted for. `partial` means one or more ranges remain unresolved and the exact ranges and reasons are present in the package.
+`complete` means the entire validated timeline is accounted for without an
+inaudible or failed range. `partial` means one or more ranges remain unresolved,
+inaudible, or failed, with exact ranges and stable reasons present in the
+package.
+
+An exact unresolved range may be accounted for by explicit human review as
+`non_speech` or `inaudible`. That evidence is version-bound and idempotent, and
+contains no reviewer identity or free-form note. A reviewed `inaudible` range
+remains a partial transcript even though the timeline itself is fully
+accounted for.
 
 This rule detects silent truncation even when the ASR process exits successfully.
 

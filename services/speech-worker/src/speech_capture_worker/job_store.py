@@ -1226,6 +1226,172 @@ class JobStore:
             row = self._fetch_transcript_segment_row(job_id, segment_id)
             return self._row_to_transcript_segment(row), True
 
+    def commit_reviewed_gap_segment(
+        self,
+        job_id: str,
+        *,
+        review_key: str,
+        start_ms: int,
+        end_ms: int,
+        outcome: TranscriptOutcome,
+        review_checkpoint_generation: int,
+        review_checkpoint_sha256: str,
+    ) -> tuple[TranscriptSegment, bool]:
+        """Backfill one exact alignment gap from explicit human review."""
+
+        _validate_gap_review_key(review_key)
+        if not isinstance(outcome, TranscriptOutcome) or outcome not in {
+            TranscriptOutcome.NON_SPEECH,
+            TranscriptOutcome.INAUDIBLE,
+        }:
+            raise InvalidJobRequest("A reviewed gap outcome must be non_speech or inaudible.")
+        if (
+            not isinstance(review_checkpoint_generation, int)
+            or isinstance(review_checkpoint_generation, bool)
+            or review_checkpoint_generation < 1
+            or not isinstance(review_checkpoint_sha256, str)
+            or not SHA256_PATTERN.fullmatch(review_checkpoint_sha256)
+        ):
+            raise InvalidJobRequest("Gap-review checkpoint identity is invalid.")
+
+        commit_key = f"gap_review_{review_key}"
+        request_payload = {
+            "commit_key": commit_key,
+            "review_key": review_key,
+            "start_ms": start_ms,
+            "end_ms": end_ms,
+            "outcome": outcome.value,
+            "text": None,
+            "language": None,
+            "confidence": None,
+            "timing_status": TranscriptTimingStatus.ALIGNED.value,
+            "speaker_id": None,
+            "speaker_label_status": SpeakerLabelStatus.UNAVAILABLE.value,
+            "error_code": None,
+            "review_checkpoint_generation": review_checkpoint_generation,
+            "review_checkpoint_sha256": review_checkpoint_sha256,
+        }
+        fingerprint = hashlib.sha256(_canonical_json(request_payload).encode("utf-8")).hexdigest()
+
+        with self._transaction():
+            job = self._row_to_job(self._fetch_job_row(job_id))
+            if job.state is not JobState.ALIGNING:
+                raise InvalidJobRequest("Reviewed gaps can be committed only while aligning.")
+            duration_ms = self._job_duration_ms(job)
+            validate_time_range(start_ms, end_ms, duration_ms=duration_ms)
+            self._require_current_gap_review_evidence(
+                job_id,
+                review_key=review_key,
+                start_ms=start_ms,
+                end_ms=end_ms,
+                outcome=outcome,
+                source_duration_ms=duration_ms,
+                review_checkpoint_generation=review_checkpoint_generation,
+                review_checkpoint_sha256=review_checkpoint_sha256,
+            )
+
+            prior = self._connection.execute(
+                """
+                SELECT *
+                FROM transcript_segments
+                WHERE job_id = ? AND commit_key = ?
+                """,
+                (job_id, commit_key),
+            ).fetchone()
+            if prior is not None:
+                if str(prior["request_fingerprint"]) != fingerprint:
+                    raise TranscriptConflict(
+                        "The review key is already bound to a different gap decision.",
+                        details={"job_id": job_id, "review_key": review_key},
+                    )
+                return self._row_to_transcript_segment(prior), False
+
+            overlap = self._connection.execute(
+                """
+                SELECT segment_id
+                FROM transcript_segments
+                WHERE job_id = ? AND start_ms < ? AND end_ms > ?
+                LIMIT 1
+                """,
+                (job_id, end_ms, start_ms),
+            ).fetchone()
+            if overlap is not None:
+                raise TranscriptConflict(
+                    "A reviewed gap cannot overlap an existing segment.",
+                    details={"conflicting_segment_id": str(overlap["segment_id"])},
+                )
+
+            sequence = int(
+                self._connection.execute(
+                    """
+                    SELECT COALESCE(MAX(segment_sequence), 0) + 1
+                    FROM transcript_segments
+                    WHERE job_id = ?
+                    """,
+                    (job_id,),
+                ).fetchone()[0]
+            )
+            segment_id = f"seg_{sequence:08d}"
+            now = _utc_now()
+            self._connection.execute(
+                """
+                INSERT INTO transcript_segments (
+                    job_id,
+                    segment_sequence,
+                    segment_id,
+                    commit_key,
+                    request_fingerprint,
+                    revision,
+                    start_ms,
+                    end_ms,
+                    outcome,
+                    text,
+                    language,
+                    confidence,
+                    timing_status,
+                    speaker_id,
+                    speaker_label_status,
+                    error_code,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, NULL, NULL, NULL, ?, NULL, ?, NULL, ?, ?)
+                """,
+                (
+                    job_id,
+                    sequence,
+                    segment_id,
+                    commit_key,
+                    fingerprint,
+                    start_ms,
+                    end_ms,
+                    outcome.value,
+                    TranscriptTimingStatus.ALIGNED.value,
+                    SpeakerLabelStatus.UNAVAILABLE.value,
+                    now,
+                    now,
+                ),
+            )
+            self._insert_update(
+                job_id=job_id,
+                job_revision=job.revision,
+                event_type="transcript.segment_committed",
+                payload={
+                    "segment_sequence": sequence,
+                    "segment_id": segment_id,
+                    "revision": 1,
+                    "start_ms": start_ms,
+                    "end_ms": end_ms,
+                    "outcome": outcome.value,
+                    "text_length": 0,
+                    "speaker_label_status": SpeakerLabelStatus.UNAVAILABLE.value,
+                    "evidence_type": "explicit_human_review",
+                },
+                created_at=now,
+            )
+            row = self._fetch_transcript_segment_row(job_id, segment_id)
+            return self._row_to_transcript_segment(row), True
+
     def update_transcript_segment_metadata(
         self,
         job_id: str,
@@ -2910,10 +3076,8 @@ class JobStore:
             or evidence["duration_ms"] != end_ms - start_ms
             or evidence["start_frame"] < 0
             or evidence["end_frame"] <= evidence["start_frame"]
-            or evidence["start_frame"]
-            != round(start_ms * payload["sample_rate"] / 1000)
-            or evidence["end_frame"]
-            != round(end_ms * payload["sample_rate"] / 1000)
+            or evidence["start_frame"] != round(start_ms * payload["sample_rate"] / 1000)
+            or evidence["end_frame"] != round(end_ms * payload["sample_rate"] / 1000)
             or evidence["frame_count"] != evidence["end_frame"] - evidence["start_frame"]
             or evidence["peak_absolute_amplitude"] < 0
             or evidence["peak_absolute_amplitude"] > 8
@@ -2924,6 +3088,117 @@ class JobStore:
             or evidence.get("reason_code") != "PCM_NEAR_DIGITAL_SILENCE"
         ):
             raise InvalidJobRequest("The requested range is not proven definite silence.")
+
+    def _require_current_gap_review_evidence(
+        self,
+        job_id: str,
+        *,
+        review_key: str,
+        start_ms: int,
+        end_ms: int,
+        outcome: TranscriptOutcome,
+        source_duration_ms: int,
+        review_checkpoint_generation: int,
+        review_checkpoint_sha256: str,
+    ) -> None:
+        review_row = self._connection.execute(
+            """
+            SELECT generation, payload_json, payload_sha256
+            FROM job_checkpoints
+            WHERE job_id = ? AND stage = ? AND checkpoint_key = ?
+            """,
+            (job_id, "aligning", f"gap_review_{review_key}_evidence"),
+        ).fetchone()
+        if (
+            review_row is None
+            or int(review_row["generation"]) != review_checkpoint_generation
+            or str(review_row["payload_sha256"]) != review_checkpoint_sha256
+        ):
+            raise InvalidJobRequest(
+                "Reviewed-gap materialization requires the current review evidence."
+            )
+
+        payload = _json_object(review_row["payload_json"])
+        expected_reason_code = (
+            "HUMAN_CONFIRMED_NON_SPEECH"
+            if outcome is TranscriptOutcome.NON_SPEECH
+            else "HUMAN_CONFIRMED_INAUDIBLE"
+        )
+        if (
+            payload.get("schema_version") != "1.0.0"
+            or payload.get("evidence_type") != "explicit_human_review"
+            or payload.get("review_key") != review_key
+            or not isinstance(payload.get("start_ms"), int)
+            or isinstance(payload["start_ms"], bool)
+            or payload.get("start_ms") != start_ms
+            or not isinstance(payload.get("end_ms"), int)
+            or isinstance(payload["end_ms"], bool)
+            or payload.get("end_ms") != end_ms
+            or payload.get("outcome") != outcome.value
+            or payload.get("reason_code") != expected_reason_code
+            or not isinstance(payload.get("source_duration_ms"), int)
+            or isinstance(payload["source_duration_ms"], bool)
+            or payload.get("source_duration_ms") != source_duration_ms
+            or payload.get("alignment_report_schema_version") != "1.0.0"
+            or not isinstance(payload.get("alignment_report_generation"), int)
+            or isinstance(payload["alignment_report_generation"], bool)
+            or payload["alignment_report_generation"] < 1
+            or not isinstance(payload.get("alignment_report_sha256"), str)
+            or not SHA256_PATTERN.fullmatch(payload["alignment_report_sha256"])
+        ):
+            raise InvalidJobRequest("The current gap-review evidence is invalid.")
+
+        alignment_row = self._connection.execute(
+            """
+            SELECT generation, payload_json, payload_sha256
+            FROM job_checkpoints
+            WHERE job_id = ? AND stage = ? AND checkpoint_key = ?
+            """,
+            (job_id, "aligning", "transcript_alignment_report"),
+        ).fetchone()
+        if (
+            alignment_row is None
+            or int(alignment_row["generation"]) != payload["alignment_report_generation"]
+            or str(alignment_row["payload_sha256"]) != payload["alignment_report_sha256"]
+        ):
+            raise InvalidJobRequest("The alignment report changed after gap review.")
+
+        alignment_payload = _json_object(alignment_row["payload_json"])
+        unresolved_ranges = alignment_payload.get("unresolved_ranges")
+        if (
+            alignment_payload.get("schema_version") != "1.0.0"
+            or alignment_payload.get("source_duration_ms") != source_duration_ms
+            or not isinstance(unresolved_ranges, list)
+        ):
+            raise InvalidJobRequest("The current alignment report is invalid.")
+        cursor = 0
+        unresolved_duration_ms = 0
+        for value in unresolved_ranges:
+            if (
+                not isinstance(value, dict)
+                or not isinstance(value.get("start_ms"), int)
+                or isinstance(value["start_ms"], bool)
+                or not isinstance(value.get("end_ms"), int)
+                or isinstance(value["end_ms"], bool)
+                or value["start_ms"] < cursor
+                or value["start_ms"] < 0
+                or value["end_ms"] <= value["start_ms"]
+                or value["end_ms"] > source_duration_ms
+            ):
+                raise InvalidJobRequest("The current alignment report is invalid.")
+            unresolved_duration_ms += value["end_ms"] - value["start_ms"]
+            cursor = value["end_ms"]
+        if unresolved_duration_ms != alignment_payload.get("unresolved_duration_ms"):
+            raise InvalidJobRequest("The current alignment report is invalid.")
+        matching = [
+            value
+            for value in unresolved_ranges
+            if isinstance(value, dict)
+            and value.get("start_ms") == start_ms
+            and value.get("end_ms") == end_ms
+        ]
+        if len(matching) != 1:
+            raise InvalidJobRequest("A review must match one complete current unresolved range.")
 
     def _fetch_upload_row(self, upload_id: str) -> sqlite3.Row:
         _validate_upload_id(upload_id)
@@ -3438,6 +3713,15 @@ def _utc_now() -> str:
 def _validate_checkpoint_identifier(name: str, value: str) -> None:
     if not SAFE_IDENTIFIER_PATTERN.fullmatch(value):
         raise InvalidJobRequest(f"{name} contains unsupported characters.")
+
+
+def _validate_gap_review_key(value: str) -> None:
+    if (
+        not isinstance(value, str)
+        or len(value) > 80
+        or not SAFE_IDENTIFIER_PATTERN.fullmatch(value)
+    ):
+        raise InvalidJobRequest("review_key contains unsupported characters.")
 
 
 def _validate_event_type(value: str) -> None:
