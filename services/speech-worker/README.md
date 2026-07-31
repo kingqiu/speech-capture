@@ -1,6 +1,6 @@
 # Speech Capture Worker
 
-Status: local model spike, persistent Worker core, durable media intake, one-active-job scheduling, progressive transcript persistence, deterministic normalization, restart-safe local ASR chunk execution, durable whole-transcript alignment finalization, conservative PCM gap evidence, evidence-bound definite-silence materialization, and explicit human-reviewed gap outcomes. There is no network Worker service yet.
+Status: local model spike, persistent Worker core, durable media intake, one-active-job scheduling, progressive transcript persistence, deterministic normalization, restart-safe local ASR chunk execution, durable whole-transcript alignment finalization, controlled forced-alignment fallback, conservative PCM gap evidence, evidence-bound definite-silence materialization, and explicit human-reviewed gap outcomes. There is no network Worker service yet.
 
 The Worker performs durable local processing outside Obsidian. It will own:
 
@@ -37,6 +37,8 @@ The package now contains:
 - real MLX Qwen3-ASR chunk execution with validation, retry, and safe boundary pause;
 - a private alignment report that separately proves raw evidence, aligned timing,
   complete timeline accounting, and transcript completeness before diarization;
+- one-estimated-segment-at-a-time forced alignment that preserves stable text
+  and IDs, persists checksummed private word evidence, and refreshes the gate;
 - a private gap-analysis report that classifies only sufficiently long
   near-digital silence and leaves all audible or uncertain PCM unresolved;
 - evidence-bound backfill of default-policy definite silence as aligned
@@ -98,6 +100,10 @@ uv run speech-capture-worker finalize-alignment \
   --data-dir runtime/dev-worker \
   job_example
 
+uv run speech-capture-worker force-align-next \
+  --data-dir runtime/dev-worker \
+  job_example
+
 uv run speech-capture-worker analyze-gaps \
   --data-dir runtime/dev-worker \
   job_example
@@ -121,6 +127,13 @@ uv run speech-capture-worker review-gap \
 in `aligning`. Its evidence is anchored to that report generation and the
 checksummed normalized WAV. It does not infer non-speech from audible PCM or
 advance the job by itself.
+
+`force-align-next` consumes the current alignment report and processes at most
+one stable `estimated` transcript segment. It requires language metadata,
+checks resources before model work, aligns the unchanged text against the exact
+normalized PCM range, stores the raw word result in a private checksummed file,
+then updates only the segment timing metadata. Invalid, incomplete, stale, or
+tampered evidence cannot pass the whole-transcript exit gate.
 
 `materialize-silence` reruns the conservative default policy, commits only
 currently proven silence, stores one evidence checkpoint per inserted range,

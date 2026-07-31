@@ -28,6 +28,7 @@ The Worker core now has an executable local foundation for:
 - one-chunk-at-a-time local MLX execution, retry, replay, and safe resource pause;
 - durable whole-transcript alignment, evidence, and timeline-readiness reports;
 - a strict completeness gate before speaker diarization;
+- checksummed, replayable forced alignment for stable estimated segments;
 - conservative, checksummed PCM evidence for uncovered timeline ranges;
 - evidence-bound definite-silence backfill and immediate alignment refresh;
 - version-anchored explicit human review for exact unresolved ranges;
@@ -71,6 +72,7 @@ This is not yet the network Worker service. It can execute or replay one local A
 31. Only current gap evidence produced by the fixed conservative policy may authorize an aligned `non_speech` backfill.
 32. Alignment backfill may append a stable segment sequence before or between existing timeline ranges, but it may never rewrite IDs, overlap another segment, or change transcript text.
 33. Human review may account for one complete current unresolved range as `non_speech` or `inaudible`, but a review key can never be rebound and does not prove automatic classification quality.
+34. A fallback segment may become `aligned` only while matching private forced-alignment evidence remains intact; the fallback never rewrites stable text or segment identity.
 
 ## 3. SQLite layout
 
@@ -590,6 +592,34 @@ range accounts for source time but keeps `transcript_complete` false. This path
 does not classify audible content automatically and does not treat an empty ASR
 result as review evidence.
 
+### 12.9 Controlled forced-alignment fallback
+
+`force-align-next` starts from the current whole-transcript report and processes
+at most one stable transcribed segment with `estimated` timing. The command:
+
+1. verifies that the segment appears as `UNALIGNED_TRANSCRIBED_SEGMENT`;
+2. requires stable language metadata or a job language hint;
+3. verifies the normalized WAV plan and runs a fresh resource boundary check;
+4. passes only the segment's exact PCM range and unchanged stable text to the
+   pinned `Qwen/Qwen3-ForcedAligner-0.6B`;
+5. rejects missing words, text additions or omissions, non-finite timing,
+   backwards movement, overlap, out-of-bounds timing, and zero-duration outer
+   results;
+6. atomically writes the private word result with `0600` permissions;
+7. persists a safe checkpoint bound to the pre-update alignment report,
+   segment revision and text SHA-256, normalized-audio SHA-256, model, frame
+   range, and raw evidence SHA-256;
+8. updates only start, end, timing status, and segment revision;
+9. reruns whole-transcript alignment immediately.
+
+Segment ID, commit key, text, language, confidence, and speaker metadata remain
+unchanged. If a crash occurs after the evidence checkpoint but before metadata
+revision, the next call replays the private result without loading the model
+again. Finalization rechecks the raw file and its semantic binding. A manually
+changed `aligned` flag without evidence, missing evidence, or later checksum
+failure produces `MISSING_FORCED_ALIGNMENT_EVIDENCE` and cannot pass the
+diarization gate.
+
 ## 13. Developer CLI
 
 From `services/speech-worker/`:
@@ -651,6 +681,10 @@ uv run speech-capture-worker finalize-alignment \
   job_example
 
 uv run speech-capture-worker analyze-gaps \
+  --data-dir runtime/dev-worker \
+  job_example
+
+uv run speech-capture-worker force-align-next \
   --data-dir runtime/dev-worker \
   job_example
 
@@ -740,6 +774,12 @@ The Worker package currently tests:
 - estimated-timing and missing-evidence blocking;
 - alignment-finalization idempotency across Worker restart;
 - machine-readable `finalize-alignment` CLI output.
+- stable-text-preserving forced alignment of estimated segments;
+- rejection of incomplete, non-monotonic, and out-of-bounds word evidence;
+- resource blocking before forced-aligner model work;
+- private evidence permissions, checksum validation, and restart replay;
+- missing or tampered forced evidence blocking the alignment exit gate;
+- machine-readable `force-align-next` output without transcript text.
 - conservative definite-silence classification and short-gap rejection;
 - audible-PCM preservation as unresolved evidence;
 - alignment-report validation, generation anchoring, and idempotent replay;
@@ -767,9 +807,8 @@ The scheduler integration continued that source into a bound revision-three queu
 
 The next layer will add:
 
-1. add a controlled forced-alignment fallback for any stable text that still has estimated timing;
-2. evaluate and validate an automatic classifier for remaining audible or uncertain non-speech and inaudible gaps without relying on amplitude or empty ASR alone;
-3. integrate pyannote diarization and anonymous speaker attribution;
-4. run a continuous restart-safe stage loop rather than one backend command per chunk;
-5. add content detection, hierarchical extraction, and evidence validation;
-6. add FastAPI only after the core behavior is stable under integration tests.
+1. evaluate and validate an automatic classifier for remaining audible or uncertain non-speech and inaudible gaps without relying on amplitude or empty ASR alone;
+2. integrate pyannote diarization and anonymous speaker attribution;
+3. run a continuous restart-safe stage loop rather than one backend command per chunk;
+4. add content detection, hierarchical extraction, and evidence validation;
+5. add FastAPI only after the core behavior is stable under integration tests.

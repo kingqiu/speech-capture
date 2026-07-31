@@ -14,6 +14,15 @@ from speech_capture_worker.alignment import (
 from speech_capture_worker.asr_execution import AsrChunkExecutor
 from speech_capture_worker.audio_preprocessing import AudioPreprocessor
 from speech_capture_worker.domain import JobState, ResourceStatus, UploadCreateRequest
+from speech_capture_worker.errors import (
+    ForcedAlignmentFailed,
+    InvalidJobRequest,
+    UploadStorageError,
+)
+from speech_capture_worker.forced_alignment import (
+    ForcedAlignmentExecutor,
+    ForcedAlignmentOutcome,
+)
 from speech_capture_worker.job_store import JobStore
 from speech_capture_worker.media_probe import MediaProbeResult
 from speech_capture_worker.resources import (
@@ -144,6 +153,26 @@ class FakeEngine:
         return self.result_factory(audio)
 
 
+class FakeForcedAlignmentEngine:
+    model_id = "fake/local-forced-aligner"
+
+    def __init__(self, words=None):
+        self.words = words or [
+            {"text": "private", "start_time": 0.1, "end_time": 0.25},
+            {"text": "aligned", "start_time": 0.25, "end_time": 0.5},
+            {"text": "transcript", "start_time": 0.5, "end_time": 0.9},
+        ]
+        self.calls = 0
+
+    def align(self, audio, *, sample_rate, text, language):
+        assert sample_rate == 16_000
+        assert len(audio) == 16_000
+        assert text == "private aligned transcript"
+        assert language == "English"
+        self.calls += 1
+        return self.words
+
+
 def run_to_alignment(store: JobStore, job_id: str, result_factory) -> None:
     result = AsrChunkExecutor(
         store,
@@ -204,9 +233,7 @@ def test_complete_aligned_timeline_advances_to_diarization_without_text_leak(
     assert snapshot.progress.stage is JobState.DIARIZING
     assert snapshot.progress.stage_progress == 0
     assert "private aligned transcript" not in json.dumps(checkpoint.payload)
-    assert "private aligned transcript" not in json.dumps(
-        [update.to_dict() for update in updates]
-    )
+    assert "private aligned transcript" not in json.dumps([update.to_dict() for update in updates])
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")
@@ -251,9 +278,7 @@ def test_uncovered_aligned_ranges_are_durable_and_block_diarization(tmp_path) ->
     assert result.report.timeline_accounted is False
     assert result.report.accounted_duration_ms == 500
     assert result.report.unresolved_duration_ms == 500
-    assert [
-        timeline_range.to_dict() for timeline_range in result.report.unresolved_ranges
-    ] == [
+    assert [timeline_range.to_dict() for timeline_range in result.report.unresolved_ranges] == [
         {"start_ms": 0, "end_ms": 250},
         {"start_ms": 750, "end_ms": 1000},
     ]
@@ -287,9 +312,41 @@ def test_estimated_full_range_requires_alignment_before_diarization(tmp_path) ->
     assert result.report.alignment_complete is False
     assert result.report.timeline_accounted is True
     assert result.report.transcript_complete is True
-    assert {issue.code for issue in result.report.issues} == {
-        "UNALIGNED_TRANSCRIBED_SEGMENT"
-    }
+    assert {issue.code for issue in result.report.issues} == {"UNALIGNED_TRANSCRIBED_SEGMENT"}
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")
+def test_aligned_fallback_without_forced_evidence_cannot_pass_exit_gate(
+    tmp_path,
+) -> None:
+    with JobStore(
+        tmp_path / "worker.sqlite3",
+        source_probe=source_probe_for(1),
+    ) as store:
+        job = create_preprocessing_job(
+            store,
+            duration_seconds=1,
+            suffix="missing-forced-evidence",
+        )
+        run_to_alignment(
+            store,
+            job.job_id,
+            lambda audio: result_with_segments(audio, segments=[]),
+        )
+        estimated = store.get_job_snapshot(job.job_id).stable_segments[0]
+        store.update_transcript_segment_metadata(
+            job.job_id,
+            estimated.segment_id,
+            expected_revision=estimated.revision,
+            timing_status=TranscriptTimingStatus.ALIGNED,
+        )
+        result = TranscriptAlignmentFinalizer(store).finalize(job.job_id)
+
+    assert result.outcome is AlignmentFinalizationOutcome.EVIDENCE_INCOMPLETE
+    assert result.job.state is JobState.ALIGNING
+    assert result.report.alignment_complete is True
+    assert result.report.timeline_accounted is True
+    assert {issue.code for issue in result.report.issues} == {"MISSING_FORCED_ALIGNMENT_EVIDENCE"}
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")
@@ -330,9 +387,7 @@ def test_missing_raw_materialization_evidence_blocks_alignment_exit(tmp_path) ->
     assert result.job.state is JobState.ALIGNING
     assert result.report.evidence_complete is False
     assert result.report.timeline_accounted is True
-    assert {issue.code for issue in result.report.issues} == {
-        "MISSING_MATERIALIZED_CHUNK"
-    }
+    assert {issue.code for issue in result.report.issues} == {"MISSING_MATERIALIZED_CHUNK"}
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")
@@ -419,4 +474,405 @@ def test_cli_finalizes_alignment_and_returns_machine_readable_report(
     assert payload["outcome"] == "ready_for_diarization"
     assert payload["job"]["state"] == "diarizing"
     assert payload["report"]["ready_for_diarization"] is True
+    assert "private aligned transcript" not in json.dumps(payload)
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")
+def test_forced_alignment_preserves_text_and_persists_private_evidence(
+    tmp_path,
+) -> None:
+    engine = FakeForcedAlignmentEngine()
+    with JobStore(
+        tmp_path / "worker.sqlite3",
+        source_probe=source_probe_for(1),
+    ) as store:
+        job = create_preprocessing_job(
+            store,
+            duration_seconds=1,
+            suffix="forced-success",
+        )
+        run_to_alignment(
+            store,
+            job.job_id,
+            lambda audio: result_with_segments(audio, segments=[]),
+        )
+        before = store.get_job_snapshot(job.job_id).stable_segments[0]
+        result = ForcedAlignmentExecutor(
+            store,
+            engine,
+            boundary_preflight=ready_preflight,
+        ).run_next(job.job_id)
+        after = store.get_job_snapshot(job.job_id).stable_segments[0]
+        evidence = next(
+            checkpoint
+            for checkpoint in store.list_checkpoints(job.job_id, stage="aligning")
+            if checkpoint.checkpoint_key == f"forced_alignment_{before.segment_id}"
+        )
+        raw_path = store.data_directory / evidence.payload["raw_relative_path"]
+        updates, _ = store.list_job_updates(job.job_id)
+
+    assert engine.calls == 1
+    assert result.outcome is ForcedAlignmentOutcome.ALIGNED
+    assert after.segment_id == before.segment_id
+    assert after.commit_key == before.commit_key
+    assert after.text == before.text
+    assert after.language == before.language
+    assert after.revision == before.revision + 1
+    assert after.start_ms == 100
+    assert after.end_ms == 900
+    assert after.timing_status is TranscriptTimingStatus.ALIGNED
+    assert result.alignment.report.alignment_complete is True
+    assert result.alignment.report.timeline_accounted is False
+    assert [value.to_dict() for value in result.alignment.report.unresolved_ranges] == [
+        {"start_ms": 0, "end_ms": 100},
+        {"start_ms": 900, "end_ms": 1000},
+    ]
+    assert evidence.payload["word_count"] == 3
+    assert (
+        evidence.payload["segment_text_sha256"]
+        == hashlib.sha256(before.text.encode("utf-8")).hexdigest()
+    )
+    assert "private aligned transcript" not in json.dumps(evidence.payload)
+    assert "private aligned transcript" not in json.dumps([update.to_dict() for update in updates])
+    assert raw_path.is_file()
+    assert raw_path.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")
+def test_forced_alignment_can_complete_alignment_exit_gate(tmp_path) -> None:
+    engine = FakeForcedAlignmentEngine(
+        [
+            {"text": "private", "start_time": 0, "end_time": 0.25},
+            {"text": "aligned", "start_time": 0.25, "end_time": 0.5},
+            {"text": "transcript", "start_time": 0.5, "end_time": 1},
+        ]
+    )
+    with JobStore(
+        tmp_path / "worker.sqlite3",
+        source_probe=source_probe_for(1),
+    ) as store:
+        job = create_preprocessing_job(
+            store,
+            duration_seconds=1,
+            suffix="forced-exit",
+        )
+        run_to_alignment(
+            store,
+            job.job_id,
+            lambda audio: result_with_segments(audio, segments=[]),
+        )
+        completed = ForcedAlignmentExecutor(
+            store,
+            engine,
+            boundary_preflight=ready_preflight,
+        ).run_next(job.job_id)
+        repeated = ForcedAlignmentExecutor(
+            store,
+            engine,
+            boundary_preflight=ready_preflight,
+        ).run_next(job.job_id)
+        evidence = next(
+            checkpoint
+            for checkpoint in store.list_checkpoints(job.job_id, stage="aligning")
+            if checkpoint.checkpoint_key.startswith("forced_alignment_seg_")
+        )
+        raw_path = store.data_directory / evidence.payload["raw_relative_path"]
+        raw_path.write_bytes(raw_path.read_bytes() + b"tampered")
+        with pytest.raises(InvalidJobRequest, match="no longer satisfies"):
+            TranscriptAlignmentFinalizer(store).finalize(job.job_id)
+
+    assert engine.calls == 1
+    assert completed.outcome is ForcedAlignmentOutcome.ALIGNED
+    assert completed.job.state is JobState.DIARIZING
+    assert completed.alignment.outcome is (AlignmentFinalizationOutcome.READY_FOR_DIARIZATION)
+    assert completed.alignment.report.ready_for_diarization is True
+    assert repeated.outcome is ForcedAlignmentOutcome.ALREADY_FINALIZED
+    assert repeated.job.state is JobState.DIARIZING
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")
+def test_forced_alignment_replays_durable_evidence_after_interruption(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    engine = FakeForcedAlignmentEngine()
+    with JobStore(
+        tmp_path / "worker.sqlite3",
+        source_probe=source_probe_for(1),
+    ) as store:
+        job = create_preprocessing_job(
+            store,
+            duration_seconds=1,
+            suffix="forced-replay",
+        )
+        run_to_alignment(
+            store,
+            job.job_id,
+            lambda audio: result_with_segments(audio, segments=[]),
+        )
+        original_update = store.update_transcript_segment_metadata
+
+        def interrupt_update(*args, **kwargs):
+            raise RuntimeError("simulated interruption")
+
+        monkeypatch.setattr(store, "update_transcript_segment_metadata", interrupt_update)
+        with pytest.raises(RuntimeError, match="simulated interruption"):
+            ForcedAlignmentExecutor(
+                store,
+                engine,
+                boundary_preflight=ready_preflight,
+            ).run_next(job.job_id)
+        monkeypatch.setattr(
+            store,
+            "update_transcript_segment_metadata",
+            original_update,
+        )
+        replayed = ForcedAlignmentExecutor(
+            store,
+            engine,
+            boundary_preflight=ready_preflight,
+        ).run_next(job.job_id)
+
+    assert engine.calls == 1
+    assert replayed.outcome is ForcedAlignmentOutcome.REPLAYED
+    assert replayed.segment is not None
+    assert replayed.segment.timing_status is TranscriptTimingStatus.ALIGNED
+    assert replayed.segment.start_ms == 100
+    assert replayed.segment.end_ms == 900
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")
+@pytest.mark.parametrize(
+    "words",
+    [
+        [
+            {"text": "private", "start_time": 0.1, "end_time": 0.4},
+            {"text": "transcript", "start_time": 0.4, "end_time": 0.9},
+        ],
+        [
+            {"text": "private", "start_time": 0.4, "end_time": 0.5},
+            {"text": "aligned", "start_time": 0.3, "end_time": 0.6},
+            {"text": "transcript", "start_time": 0.6, "end_time": 0.9},
+        ],
+        [
+            {"text": "private", "start_time": 0.1, "end_time": 0.25},
+            {"text": "aligned", "start_time": 0.25, "end_time": 0.5},
+            {"text": "transcript", "start_time": 0.5, "end_time": 1.1},
+        ],
+    ],
+)
+def test_forced_alignment_rejects_incomplete_or_invalid_evidence(
+    tmp_path,
+    words,
+) -> None:
+    engine = FakeForcedAlignmentEngine(words)
+    with JobStore(
+        tmp_path / "worker.sqlite3",
+        source_probe=source_probe_for(1),
+    ) as store:
+        job = create_preprocessing_job(
+            store,
+            duration_seconds=1,
+            suffix=f"forced-invalid-{len(words)}-{words[0]['start_time']}",
+        )
+        run_to_alignment(
+            store,
+            job.job_id,
+            lambda audio: result_with_segments(audio, segments=[]),
+        )
+        before = store.get_job_snapshot(job.job_id).stable_segments[0]
+        with pytest.raises(ForcedAlignmentFailed):
+            ForcedAlignmentExecutor(
+                store,
+                engine,
+                boundary_preflight=ready_preflight,
+            ).run_next(job.job_id)
+        after = store.get_job_snapshot(job.job_id).stable_segments[0]
+        evidence = [
+            checkpoint
+            for checkpoint in store.list_checkpoints(job.job_id, stage="aligning")
+            if checkpoint.checkpoint_key == f"forced_alignment_{before.segment_id}"
+        ]
+
+    assert engine.calls == 1
+    assert after == before
+    assert evidence == []
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")
+def test_forced_alignment_requires_language_before_model_call(tmp_path) -> None:
+    engine = FakeForcedAlignmentEngine()
+
+    def result_without_language(audio):
+        payload = result_with_segments(audio, segments=[])
+        payload["language"] = None
+        return payload
+
+    with JobStore(
+        tmp_path / "worker.sqlite3",
+        source_probe=source_probe_for(1),
+    ) as store:
+        job = create_preprocessing_job(
+            store,
+            duration_seconds=1,
+            suffix="forced-language",
+        )
+        run_to_alignment(store, job.job_id, result_without_language)
+        with pytest.raises(ForcedAlignmentFailed, match="language metadata"):
+            ForcedAlignmentExecutor(
+                store,
+                engine,
+                boundary_preflight=ready_preflight,
+            ).run_next(job.job_id)
+
+    assert engine.calls == 0
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")
+def test_forced_alignment_resource_block_pauses_before_model_call(tmp_path) -> None:
+    engine = FakeForcedAlignmentEngine()
+
+    def blocked_preflight(*_, **__):
+        report = ready_preflight()
+        return ResourceReport(
+            status=ResourceStatus.BLOCKED,
+            estimated_required_bytes=report.estimated_required_bytes,
+            disk_reserve_bytes=report.disk_reserve_bytes,
+            disk_free_after_bytes=report.disk_free_after_bytes,
+            disk=report.disk,
+            memory=report.memory,
+            issues=report.issues,
+        )
+
+    with JobStore(
+        tmp_path / "worker.sqlite3",
+        source_probe=source_probe_for(1),
+    ) as store:
+        job = create_preprocessing_job(
+            store,
+            duration_seconds=1,
+            suffix="forced-blocked",
+        )
+        run_to_alignment(
+            store,
+            job.job_id,
+            lambda audio: result_with_segments(audio, segments=[]),
+        )
+        result = ForcedAlignmentExecutor(
+            store,
+            engine,
+            boundary_preflight=blocked_preflight,
+        ).run_next(job.job_id)
+
+    assert result.outcome is ForcedAlignmentOutcome.SAFE_PAUSED
+    assert result.job.state is JobState.PAUSED
+    assert engine.calls == 0
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")
+def test_forced_alignment_rejects_tampered_private_evidence(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    engine = FakeForcedAlignmentEngine()
+    with JobStore(
+        tmp_path / "worker.sqlite3",
+        source_probe=source_probe_for(1),
+    ) as store:
+        job = create_preprocessing_job(
+            store,
+            duration_seconds=1,
+            suffix="forced-tamper",
+        )
+        run_to_alignment(
+            store,
+            job.job_id,
+            lambda audio: result_with_segments(audio, segments=[]),
+        )
+        original_update = store.update_transcript_segment_metadata
+        monkeypatch.setattr(
+            store,
+            "update_transcript_segment_metadata",
+            lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("simulated interruption")),
+        )
+        with pytest.raises(RuntimeError):
+            ForcedAlignmentExecutor(
+                store,
+                engine,
+                boundary_preflight=ready_preflight,
+            ).run_next(job.job_id)
+        monkeypatch.setattr(
+            store,
+            "update_transcript_segment_metadata",
+            original_update,
+        )
+        evidence = next(
+            checkpoint
+            for checkpoint in store.list_checkpoints(job.job_id, stage="aligning")
+            if checkpoint.checkpoint_key.startswith("forced_alignment_seg_")
+        )
+        raw_path = store.data_directory / evidence.payload["raw_relative_path"]
+        raw_path.write_bytes(raw_path.read_bytes() + b"tampered")
+        with pytest.raises(UploadStorageError, match="checksum"):
+            ForcedAlignmentExecutor(
+                store,
+                engine,
+                boundary_preflight=ready_preflight,
+            ).run_next(job.job_id)
+
+    assert engine.calls == 1
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")
+def test_cli_force_aligns_next_segment_without_exposing_text(
+    tmp_path,
+    capsys,
+    monkeypatch,
+) -> None:
+    data_path = tmp_path / "runtime"
+    engine = FakeForcedAlignmentEngine()
+    with JobStore(
+        data_path / "worker.sqlite3",
+        source_probe=source_probe_for(1),
+    ) as store:
+        job = create_preprocessing_job(
+            store,
+            duration_seconds=1,
+            suffix="forced-cli",
+        )
+        run_to_alignment(
+            store,
+            job.job_id,
+            lambda audio: result_with_segments(audio, segments=[]),
+        )
+
+    monkeypatch.setattr(
+        "speech_capture_worker.worker_cli.MlxQwenForcedAlignmentEngine",
+        lambda: engine,
+    )
+    real_executor = ForcedAlignmentExecutor
+    monkeypatch.setattr(
+        "speech_capture_worker.worker_cli.ForcedAlignmentExecutor",
+        lambda store, selected_engine: real_executor(
+            store,
+            selected_engine,
+            boundary_preflight=ready_preflight,
+        ),
+    )
+    exit_code = main(
+        [
+            "force-align-next",
+            "--data-dir",
+            str(data_path),
+            job.job_id,
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert engine.calls == 1
+    assert payload["outcome"] == "aligned"
+    assert payload["segment"]["start_ms"] == 100
+    assert payload["segment"]["end_ms"] == 900
+    assert payload["segment"]["timing_status"] == "aligned"
     assert "private aligned transcript" not in json.dumps(payload)

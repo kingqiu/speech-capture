@@ -222,6 +222,34 @@ accounts for the timeline but keeps transcript completeness false. This
 boundary is explicit human evidence, not automatic audible-content
 classification.
 
+### 7.6 Controlled forced-alignment fallback
+
+The core developer boundary can process the next stable transcribed segment
+whose timing remains `estimated`. It does not retranscribe or replace text.
+
+Before model work, the Worker requires the current alignment report, exact
+normalized-audio plan, unchanged segment revision, and segment language or job
+language hint. It performs a fresh resource boundary check and runs the pinned
+`Qwen/Qwen3-ForcedAligner-0.6B` over only that segment's PCM and stable text.
+
+The returned word units must:
+
+- account for the normalized stable text without additions or omissions;
+- be finite, monotonic, non-overlapping, and inside the original segment range;
+- produce a positive outer range.
+
+The private word result is atomically stored and checksummed before the stable
+segment metadata changes. The Worker preserves segment ID, commit key, text,
+language, and speaker state; only start, end, timing status, and revision
+change. A durable checkpoint binds the evidence to the source alignment report,
+segment revision and text hash, normalized-audio checksum, model, frame range,
+and raw result checksum.
+
+After interruption, durable evidence is replayed without another model call.
+Whole-transcript finalization revalidates the private file; a manual `aligned`
+flag without matching evidence, or later evidence tampering, blocks
+diarization.
+
 ## 8. Job snapshot
 
 The implemented core snapshot is an internally consistent, bounded read containing:

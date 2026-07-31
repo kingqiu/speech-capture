@@ -250,6 +250,12 @@ accounted for.
 
 This rule detects silent truncation even when the ASR process exits successfully.
 
+When a stable transcribed segment initially has only estimated timing, forced
+alignment may revise its outer start and end without changing its ID, commit
+key, text, language, or speaker state. The revised `aligned` status is accepted
+by the completeness gate only while matching checksummed private word evidence
+remains available and valid.
+
 ## 9. Corrections and revisions
 
 Corrections are an append-only ledger:

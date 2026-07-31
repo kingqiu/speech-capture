@@ -22,6 +22,11 @@ from speech_capture_worker.domain import (
     UploadCreateRequest,
 )
 from speech_capture_worker.errors import UploadStorageError, WorkerCoreError
+from speech_capture_worker.forced_alignment import (
+    ForcedAlignmentExecutor,
+    ForcedAlignmentOutcome,
+    MlxQwenForcedAlignmentEngine,
+)
 from speech_capture_worker.gap_analysis import (
     DEFAULT_DEFINITE_SILENCE_PEAK,
     DEFAULT_MIN_DEFINITE_SILENCE_MS,
@@ -300,6 +305,13 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     _add_data_dir(finalize_alignment)
     finalize_alignment.add_argument("job_id")
+
+    force_align_next = subparsers.add_parser(
+        "force-align-next",
+        help="Align the next stable estimated transcript segment without rewriting text.",
+    )
+    _add_data_dir(force_align_next)
+    force_align_next.add_argument("job_id")
 
     analyze_gaps = subparsers.add_parser(
         "analyze-gaps",
@@ -640,6 +652,13 @@ def _dispatch(args: argparse.Namespace) -> int:
                 }
                 else 2
             )
+        if args.command == "force-align-next":
+            result = ForcedAlignmentExecutor(
+                store,
+                MlxQwenForcedAlignmentEngine(),
+            ).run_next(args.job_id)
+            _write_json(result.to_dict())
+            return 2 if result.outcome is ForcedAlignmentOutcome.SAFE_PAUSED else 0
         if args.command == "analyze-gaps":
             result = TranscriptGapAnalyzer(
                 store,

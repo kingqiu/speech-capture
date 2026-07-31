@@ -117,3 +117,7 @@ class AsrAttemptConflict(WorkerCoreError):
 
 class AsrExecutionFailed(WorkerCoreError):
     code = "ASR_EXECUTION_FAILED"
+
+
+class ForcedAlignmentFailed(WorkerCoreError):
+    code = "FORCED_ALIGNMENT_FAILED"

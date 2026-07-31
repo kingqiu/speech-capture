@@ -116,6 +116,11 @@ For each validated source:
 - container-duration rounding cannot make visible progress exceed the verified source duration.
 - every materialized chunk still references matching checksummed raw evidence;
 - estimated transcript timing blocks the alignment exit gate;
+- forced alignment preserves stable text and segment identity while revising only timing metadata;
+- forced-alignment words must account for the stable text and remain monotonic and in bounds;
+- private forced-alignment evidence is checksummed before metadata changes and replays after interruption;
+- missing, stale, incomplete, or tampered forced-alignment evidence blocks diarization;
+- forced alignment pauses before model work when the resource boundary is blocked;
 - uncovered ranges are persisted without transcript text and block diarization;
 - a complete report is idempotent across restart and advances exactly once.
 - uncovered-range PCM evidence is anchored to the exact alignment report and normalized-audio checksum;
