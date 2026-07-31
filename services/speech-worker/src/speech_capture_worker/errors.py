@@ -133,3 +133,7 @@ class ForcedAlignmentFailed(WorkerCoreError):
 
 class DiarizationFailed(WorkerCoreError):
     code = "DIARIZATION_FAILED"
+
+
+class StructuringFailed(WorkerCoreError):
+    code = "STRUCTURING_FAILED"

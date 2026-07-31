@@ -1,6 +1,6 @@
 # Speech Capture Worker
 
-Status: local model spike, persistent Worker core, durable media intake, one-active-job scheduling, progressive transcript persistence, deterministic normalization, restart-safe local ASR chunk execution, one-call batch execution of all remaining ASR chunks, durable whole-transcript alignment finalization, anonymous speaker attribution, controlled forced-alignment fallback, conservative PCM gap evidence, evidence-bound definite-silence materialization, and explicit human-reviewed gap outcomes. There is no network Worker service yet.
+Status: local model spike, persistent Worker core, durable media intake, one-active-job scheduling, progressive transcript persistence, deterministic normalization, restart-safe local ASR chunk execution, one-call batch execution of all remaining ASR chunks, durable whole-transcript alignment finalization, anonymous speaker attribution, content-type classification and evidence-linked extraction, controlled forced-alignment fallback, conservative PCM gap evidence, evidence-bound definite-silence materialization, and explicit human-reviewed gap outcomes. There is no network Worker service yet.
 
 The Worker performs durable local processing outside Obsidian. It will own:
 
@@ -41,6 +41,8 @@ The package now contains:
   transcription completion and alignment advancement to `diarizing`;
 - revision-pinned pyannote speaker diarization with anonymous speaker
   attribution, safe degradation, and restart-safe evidence;
+- content-type classification and bounded-batch evidence-linked extraction
+  through local Ollama, with unsupported findings kept out of the summary;
 - a private alignment report that separately proves raw evidence, aligned timing,
   complete timeline accounting, and transcript completeness before diarization;
 - one-estimated-segment-at-a-time forced alignment that preserves stable text
@@ -114,6 +116,11 @@ uv run speech-capture-worker run-diarization \
   --data-dir runtime/dev-worker \
   job_example \
   --model-revision 84fd25912480287da0247647c3d2b4853cb3ee5d
+
+uv run speech-capture-worker run-structuring \
+  --data-dir runtime/dev-worker \
+  job_example \
+  --model qwen3:14b
 
 uv run speech-capture-worker force-align-next \
   --data-dir runtime/dev-worker \

@@ -837,6 +837,8 @@ The Worker package currently tests:
   alignment advancement to `diarizing`, idempotent across Worker restart.
 - revision-pinned speaker-diarization adapter with anonymous attribution,
   safe degradation to `unavailable`, and restart-idempotent evidence.
+- content-type classification and bounded-batch evidence-linked extraction
+  with unsupported-finding accounting and restart-idempotent evidence.
 - complete aligned transcript advancement to `diarizing`;
 - durable uncovered-range reporting without transcript text;
 - estimated-timing and missing-evidence blocking;
@@ -885,11 +887,13 @@ The scheduler integration continued that source into a bound revision-three queu
 
 The next layer will add:
 
-1. add content detection, hierarchical extraction, and evidence validation;
+1. generate final artifacts and atomic Vault publication;
 2. add FastAPI only after the core behavior is stable under integration tests.
 
 Continuous multi-chunk ASR batches are now available through `run-asr-all`; a
 full packaged background stage loop will still be needed for the network
 service. Anonymous speaker attribution is implemented, covered by
 deterministic-engine tests, and validated on a real 60-second excerpt with
-three anonymous speakers.
+three anonymous speakers. Content classification and evidence-linked
+extraction are implemented with deterministic-engine tests; real Ollama model
+acceptance is pending download confirmation.

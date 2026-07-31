@@ -50,6 +50,11 @@ from speech_capture_worker.resources import (
     estimate_job_disk_bytes,
 )
 from speech_capture_worker.scheduler import JobScheduler, SchedulerOutcome
+from speech_capture_worker.structuring_execution import (
+    OllamaStructuringEngine,
+    StructuringExecutor,
+    StructuringOutcome,
+)
 from speech_capture_worker.transcript import (
     DiarizationStatus,
     SpeakerLabelStatus,
@@ -396,6 +401,18 @@ def _build_parser() -> argparse.ArgumentParser:
         "--model-revision",
         required=True,
         help="Full lowercase commit SHA for pyannote/speaker-diarization-3.1.",
+    )
+
+    run_structuring = subparsers.add_parser(
+        "run-structuring",
+        help="Classify content and extract evidence-linked findings through local Ollama.",
+    )
+    _add_data_dir(run_structuring)
+    run_structuring.add_argument("job_id")
+    run_structuring.add_argument(
+        "--model",
+        default="qwen3:14b",
+        help="Ollama model name for classification and extraction.",
     )
 
     list_asr_attempts = subparsers.add_parser(
@@ -754,6 +771,13 @@ def _dispatch(args: argparse.Namespace) -> int:
             result = SpeakerDiarizationExecutor(store, engine).run(args.job_id)
             _write_json(result.to_dict())
             return 2 if result.outcome is DiarizationOutcome.SAFE_PAUSED else 0
+        if args.command == "run-structuring":
+            result = StructuringExecutor(
+                store,
+                OllamaStructuringEngine(model=args.model),
+            ).run(args.job_id)
+            _write_json(result.to_dict())
+            return 2 if result.outcome is StructuringOutcome.SAFE_PAUSED else 0
         if args.command == "list-asr-attempts":
             attempts = store.list_asr_attempts(
                 args.job_id,

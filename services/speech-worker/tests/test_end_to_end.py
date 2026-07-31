@@ -29,6 +29,10 @@ from speech_capture_worker.resources import (
     ResourceStatus,
 )
 from speech_capture_worker.scheduler import JobScheduler, SchedulerOutcome
+from speech_capture_worker.structuring_execution import (
+    StructuringExecutor,
+    StructuringOutcome,
+)
 from speech_capture_worker.transcript import SpeakerLabelStatus
 
 
@@ -86,6 +90,28 @@ class FakeDiarizationEngine:
                 "start_ms": 0,
                 "end_ms": round(duration * 1000),
                 "speaker": "SPEAKER_00",
+            }
+        ]
+
+
+class FakeStructuringEngine:
+    model_id = "fake/structuring"
+
+    def classify(self, segments, *, speaker_count):
+        return {
+            "type": "meeting",
+            "traits": ["multi_speaker"],
+            "confidence": 0.9,
+        }
+
+    def extract_batch(self, segments, *, content_type):
+        evidence = segments[0]["segment_id"] if segments else "none"
+        return [
+            {
+                "kind": "topic",
+                "text": "端到端测试主题。",
+                "evidence": [evidence],
+                "confidence": 0.9,
             }
         ]
 
@@ -203,3 +229,11 @@ def test_synthetic_multi_chunk_end_to_end_reaches_structuring_with_anonymous_spe
             segment.speaker_label_status is SpeakerLabelStatus.ANONYMOUS
             for segment in snapshot.stable_segments
         )
+        structuring = StructuringExecutor(
+            store,
+            FakeStructuringEngine(),
+            boundary_preflight=ready_preflight,
+        ).run(job_id)
+        assert structuring.outcome is StructuringOutcome.COMPLETED
+        assert structuring.job.state is JobState.QUALITY_CHECK
+        assert structuring.finding_count >= 1
