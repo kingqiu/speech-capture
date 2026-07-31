@@ -23,6 +23,7 @@ dev = [
 ]
 diarization = [
   "pyannote.audio>=4.0.4,<5",
+  "omegaconf>=2.3,<3",
 ]
 
 [project.scripts]
