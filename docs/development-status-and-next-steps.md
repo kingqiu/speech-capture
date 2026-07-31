@@ -7,6 +7,7 @@
 > 本次恢复基线：`682b64f Add evidence-only VAD gap analysis`
 > 当前 Draft PR：`#2`
 > 当前自动化测试：`229 passed`
+> 今晚恢复专用交接文件：[handoff-2026-07-31.md](handoff-2026-07-31.md)
 
 ## 1. 状态说明
 
