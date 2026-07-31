@@ -833,6 +833,8 @@ The Worker package currently tests:
 - safe resource pause before the next model call;
 - container-versus-PCM duration clamping;
 - real local MLX Qwen3-ASR execution on synthetic Chinese speech through aligned stable text.
+- synthetic multi-chunk end-to-end intake through transcription completion and
+  alignment advancement to `diarizing`, idempotent across Worker restart.
 - complete aligned transcript advancement to `diarizing`;
 - durable uncovered-range reporting without transcript text;
 - estimated-timing and missing-evidence blocking;

@@ -37,6 +37,8 @@ The package now contains:
 - real MLX Qwen3-ASR chunk execution with validation, retry, and safe boundary pause;
 - one-call restart-safe batch execution of every remaining ASR chunk with an
   optional per-run chunk limit;
+- a synthetic multi-chunk end-to-end pass from verified intake through
+  transcription completion and alignment advancement to `diarizing`;
 - a private alignment report that separately proves raw evidence, aligned timing,
   complete timeline accounting, and transcript completeness before diarization;
 - one-estimated-segment-at-a-time forced alignment that preserves stable text
