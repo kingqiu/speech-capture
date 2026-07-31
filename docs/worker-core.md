@@ -839,6 +839,8 @@ The Worker package currently tests:
   safe degradation to `unavailable`, and restart-idempotent evidence.
 - content-type classification and bounded-batch evidence-linked extraction
   with unsupported-finding accounting and restart-idempotent evidence.
+- deterministic backend artifact package with raw transcript, evidence
+  transcript, structured record, human note, and a checksummed manifest.
 - complete aligned transcript advancement to `diarizing`;
 - durable uncovered-range reporting without transcript text;
 - estimated-timing and missing-evidence blocking;
@@ -887,7 +889,7 @@ The scheduler integration continued that source into a bound revision-three queu
 
 The next layer will add:
 
-1. generate final artifacts and atomic Vault publication;
+1. atomic Vault publication with leases, retries, and verified package hashes;
 2. add FastAPI only after the core behavior is stable under integration tests.
 
 Continuous multi-chunk ASR batches are now available through `run-asr-all`; a

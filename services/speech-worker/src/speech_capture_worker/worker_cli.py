@@ -13,6 +13,9 @@ from speech_capture_worker.alignment import (
     AlignmentFinalizationOutcome,
     TranscriptAlignmentFinalizer,
 )
+from speech_capture_worker.artifact_generation import (
+    ArtifactGenerator,
+)
 from speech_capture_worker.asr_execution import AsrChunkExecutor, MlxQwenAsrEngine
 from speech_capture_worker.audio_preprocessing import AudioPreprocessor
 from speech_capture_worker.diarization_execution import (
@@ -415,6 +418,13 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Ollama model name for classification and extraction.",
     )
 
+    generate_artifacts = subparsers.add_parser(
+        "generate-artifacts",
+        help="Generate the deterministic backend artifact package.",
+    )
+    _add_data_dir(generate_artifacts)
+    generate_artifacts.add_argument("job_id")
+
     list_asr_attempts = subparsers.add_parser(
         "list-asr-attempts",
         help="List safe raw-attempt metadata without transcript content.",
@@ -778,6 +788,10 @@ def _dispatch(args: argparse.Namespace) -> int:
             ).run(args.job_id)
             _write_json(result.to_dict())
             return 2 if result.outcome is StructuringOutcome.SAFE_PAUSED else 0
+        if args.command == "generate-artifacts":
+            result = ArtifactGenerator(store).generate(args.job_id)
+            _write_json(result.to_dict())
+            return 0
         if args.command == "list-asr-attempts":
             attempts = store.list_asr_attempts(
                 args.job_id,

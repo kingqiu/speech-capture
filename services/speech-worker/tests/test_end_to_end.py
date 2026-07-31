@@ -14,6 +14,10 @@ from speech_capture_worker.alignment import (
     AlignmentFinalizationOutcome,
     TranscriptAlignmentFinalizer,
 )
+from speech_capture_worker.artifact_generation import (
+    ArtifactGenerator,
+    ArtifactOutcome,
+)
 from speech_capture_worker.asr_execution import AsrChunkExecutor, AsrRunOutcome
 from speech_capture_worker.diarization_execution import (
     DiarizationOutcome,
@@ -237,3 +241,12 @@ def test_synthetic_multi_chunk_end_to_end_reaches_structuring_with_anonymous_spe
         assert structuring.outcome is StructuringOutcome.COMPLETED
         assert structuring.job.state is JobState.QUALITY_CHECK
         assert structuring.finding_count >= 1
+        artifacts = ArtifactGenerator(store).generate(job_id)
+        package = store.get_job_stage_directory(job_id, stage="artifacts")
+        assert artifacts.outcome is ArtifactOutcome.GENERATED
+        assert artifacts.job.state is JobState.PROCESSED
+        assert (package / "transcript.raw.json").is_file()
+        assert (package / "transcript.md").is_file()
+        assert (package / "speech-record.json").is_file()
+        assert (package / "note.md").is_file()
+        assert (package / "artifact-manifest.json").is_file()

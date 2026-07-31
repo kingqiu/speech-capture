@@ -137,3 +137,7 @@ class DiarizationFailed(WorkerCoreError):
 
 class StructuringFailed(WorkerCoreError):
     code = "STRUCTURING_FAILED"
+
+
+class ArtifactGenerationFailed(WorkerCoreError):
+    code = "ARTIFACT_GENERATION_FAILED"

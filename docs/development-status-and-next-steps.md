@@ -6,7 +6,7 @@
 > 当前分支：`agent/worker-core`
 > 本次恢复基线：`682b64f Add evidence-only VAD gap analysis`
 > 当前 Draft PR：`#2`
-> 当前自动化测试：`225 passed`
+> 当前自动化测试：`229 passed`
 
 ## 1. 状态说明
 
@@ -757,13 +757,33 @@ SHA-256 和指标，不含路径、文件名、文字稿或凭据，并以 `0600
 
 ---
 
+### 6.19 后端数据产物包
+
+**[已实现并验证]**
+
+- 新增 `ArtifactGenerator` 和 `generate-artifacts` 开发者命令；
+- 生成四份后端产物：
+  - `transcript.raw.json`：不可变原始 ASR 尝试汇总；
+  - `transcript.md`：带稳定块 ID、时间范围、说话人和不确定标记的文字稿；
+  - `speech-record.json`：机器可读记录，含内容类型、段、提炼结果、证据、
+    质量和来源事实；
+  - `note.md`：按内容类型渲染的结构化笔记，保护 `我的补充`；
+- 额外生成 `artifact-manifest.json`，记录每个文件 SHA-256 和版本；
+- 产物写入 Worker 私有目录，原子写入、`0600` 权限；
+- 生成后作业从 `quality_check` 进入 `processed`；
+- 已生成作业跨重启返回 `already_generated`，不重复生成；
+- 使用确定性假引擎完成 4 项测试，并把合成多块端到端测试延伸到
+  `processed`。
+
+---
+
 ## 7. 当前测试和质量验证
 
 ### 7.1 已通过的检查
 
 **[已实现并验证]**
 
-- Python 自动化测试：225 项通过。
+- Python 自动化测试：229 项通过。
 - Ruff 静态检查通过。
 - `uv` 依赖锁文件检查通过。
 - Python 编译检查通过。
@@ -865,7 +885,7 @@ SHA-256 和指标，不含路径、文件名、文字稿或凭据，并以 `0600
 
 ### 8.1 输出产物包
 
-**[设计已确定，待开发]**
+**[已实现并验证]**
 
 计划至少生成：
 
@@ -1097,13 +1117,13 @@ SHA-256 和指标，不含路径、文件名、文字稿或凭据，并以 `0600
 
 #### 工作项
 
-- [ ] 定义并版本化 `transcript.raw.json` schema。
-- [ ] 汇总不可变 ASR 尝试为原始证据产物。
-- [ ] 生成带稳定段 ID 的 `transcript.md`。
-- [ ] 定义并版本化 `speech-record.json` schema。
-- [ ] 实现内容类型对应的 `note.md` 渲染。
-- [ ] 生成完整性和质量清单。
-- [ ] 加入产物哈希、模型版本和生成版本。
+- [x] 定义并版本化 `transcript.raw.json` schema。
+- [x] 汇总不可变 ASR 尝试为原始证据产物。
+- [x] 生成带稳定段 ID 的 `transcript.md`。
+- [x] 定义并版本化 `speech-record.json` schema。
+- [x] 实现内容类型对应的 `note.md` 渲染。
+- [x] 生成完整性和质量清单。
+- [x] 加入产物哈希、模型版本和生成版本。
 - [ ] 实现说话人命名修订。
 - [ ] 实现文字纠正记录。
 - [ ] 实现日期纠正。
@@ -1313,7 +1333,7 @@ SHA-256 和指标，不含路径、文件名、文字稿或凭据，并以 `0600
 6. [已实现] 用合成的多块音频完成第一轮端到端测试。
 7. [已实现并验证] 阶段 B 接入 pyannote 说话人识别。
 8. [代码已实现，模型下载待确认] 下载和评测 Ollama Qwen3 14B/8B。
-9. 完成提炼、产物、发布和正式 API。
+9. [提炼与产物已实现] 完成发布协议和正式 API。
 10. 后端为页面提供的状态和数据稳定后，暂停前端编码，先完成 UI 设计与 GPT Image 关键交互图。
 11. 用户批准页面设计后，再写 Obsidian 插件页面。
 
@@ -1787,3 +1807,34 @@ commit SHA 或下载权重。下一次需要项目所有者先在 Hugging Face �
 下一步需要项目所有者确认 Ollama 下载预算（Qwen3 14B 约 9 GB，8B 约 5 GB，
 当前磁盘可用约 62 GB），确认后启动 Ollama 服务并 `ollama pull`，再跑真实
 提炼冒烟；之后进入阶段 D 最终产物和人工修订。
+
+---
+
+## 27. 2026-07-31 后端数据产物包开发记录
+
+本次完成阶段 D 的后端数据产物生成，没有打开 Vault 发布、正式 API 或
+Obsidian 页面。
+
+完成内容：
+
+- 新增 `ArtifactGenerationFailed` 稳定错误码；
+- 新增 `artifact_generation.py`：
+  - 确定性的 `speech_id` 和稳定块 ID；
+  - `transcript.raw.json` 汇总不可变 ASR 尝试；
+  - `transcript.md` 带时间、说话人和不确定标记；
+  - `speech-record.json` 记录内容、段、提炼结果、证据、质量和来源；
+  - `note.md` 按内容类型渲染并保护 `我的补充`；
+  - `artifact-manifest.json` 记录全部文件 SHA-256；
+- 产物原子写入私有目录，`0600` 权限；
+- 生成后作业进入 `processed`，跨重启幂等；
+- 新增 `generate-artifacts` 开发者 CLI；
+- 新增 4 项测试并把合成多块端到端测试延伸到 `processed`；
+- 更新 Worker README、核心文档、决策日志和本交接文档。
+
+本次验证：
+
+- `229 passed`；
+- Ruff 全目录静态检查通过；
+- `compileall` 通过。
+
+下一步进入阶段 E：处理完成与 Vault 发布协议（发布租约、原子写入、重试）。
