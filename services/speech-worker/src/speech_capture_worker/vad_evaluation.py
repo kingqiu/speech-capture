@@ -20,6 +20,7 @@ from speech_capture_worker.domain import ModelProfile
 from speech_capture_worker.errors import (
     InvalidJobRequest,
     ResourceBlocked,
+    SpeechActivityDetectionFailed,
     VadEvaluationFailed,
 )
 from speech_capture_worker.gap_speech_activity import (
@@ -40,7 +41,8 @@ VAD_SAMPLE_RATE = 16_000
 MAX_MANIFEST_BYTES = 1024 * 1024
 MAX_SAMPLE_COUNT = 100
 MAX_LABEL_COUNT_PER_SAMPLE = 10_000
-MAX_SAMPLE_DURATION_SECONDS = 30 * 60
+VAD_DETECTION_WINDOW_SECONDS = 10 * 60
+VAD_DETECTION_MARGIN_SECONDS = 2.0
 _SAFE_ID_CHARACTERS = frozenset(
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
 )
@@ -227,10 +229,33 @@ class VadGoldEvaluator:
         *,
         audio_decoder: AudioDecoder | None = None,
         boundary_preflight: BoundaryPreflight = check_resource_preflight,
+        detection_window_seconds: float = VAD_DETECTION_WINDOW_SECONDS,
+        detection_margin_seconds: float = VAD_DETECTION_MARGIN_SECONDS,
     ) -> None:
+        if (
+            not isinstance(detection_window_seconds, (int, float))
+            or isinstance(detection_window_seconds, bool)
+            or not math.isfinite(detection_window_seconds)
+            or detection_window_seconds <= 0
+        ):
+            raise InvalidJobRequest(
+                "detection_window_seconds must be a positive finite duration."
+            )
+        if (
+            not isinstance(detection_margin_seconds, (int, float))
+            or isinstance(detection_margin_seconds, bool)
+            or not math.isfinite(detection_margin_seconds)
+            or detection_margin_seconds < 0
+            or detection_margin_seconds >= detection_window_seconds / 2
+        ):
+            raise InvalidJobRequest(
+                "detection_margin_seconds must be non-negative and shorter than half the window."
+            )
         self.detector = detector
         self._audio_decoder = audio_decoder or decode_audio_source
         self._boundary_preflight = boundary_preflight
+        self._detection_window_seconds = detection_window_seconds
+        self._detection_margin_seconds = detection_margin_seconds
 
     def evaluate(
         self,
@@ -257,12 +282,7 @@ class VadGoldEvaluator:
                 raise VadEvaluationFailed(
                     "A gold-standard sample did not decode to valid normalized audio."
                 )
-            detected = self.detector.detect(audio, sample_rate=VAD_SAMPLE_RATE)
-            detected_regions = validate_detected_speech_regions(
-                detected,
-                sample_rate=VAD_SAMPLE_RATE,
-                total_frames=audio.size,
-            )
+            detected_regions = self._detect_in_windows(audio)
             metrics = evaluate_vad_ranges(
                 labels=sample.labels,
                 detected_regions=detected_regions,
@@ -299,6 +319,33 @@ class VadGoldEvaluator:
             samples=tuple(sample_reports),
             resource_report=resource_report,
         )
+
+    def _detect_in_windows(self, audio: np.ndarray) -> tuple[tuple[int, int], ...]:
+        sample_rate = VAD_SAMPLE_RATE
+        total_frames = audio.size
+        window_frames = max(1, round(self._detection_window_seconds * sample_rate))
+        margin_frames = max(0, round(self._detection_margin_seconds * sample_rate))
+        frame_regions: list[tuple[int, int]] = []
+        core_start = 0
+        while core_start < total_frames:
+            core_end = min(core_start + window_frames, total_frames)
+            expanded_start = max(0, core_start - margin_frames)
+            expanded_end = min(total_frames, core_end + margin_frames)
+            window = audio[expanded_start:expanded_end]
+            window_regions = validate_detected_speech_regions(
+                self.detector.detect(window, sample_rate=sample_rate),
+                sample_rate=sample_rate,
+                total_frames=window.size,
+            )
+            for start_frame, end_frame in window_regions:
+                absolute_start = expanded_start + start_frame
+                absolute_end = expanded_start + end_frame
+                clipped_start = max(core_start, absolute_start)
+                clipped_end = min(core_end, absolute_end)
+                if clipped_end > clipped_start:
+                    frame_regions.append((clipped_start, clipped_end))
+            core_start = core_end
+        return _validate_frame_regions(frame_regions, total_frames=total_frames)
 
 
 def load_vad_gold_manifest(path: Path) -> VadGoldManifest:
@@ -455,8 +502,6 @@ def evaluate_acceptance(
 def decode_audio_source(path: Path) -> DecodedAudio:
     source_sha256 = _sha256(path)
     probe = probe_audio_source(path)
-    if probe.duration_seconds > MAX_SAMPLE_DURATION_SECONDS:
-        raise VadEvaluationFailed("A VAD gold sample exceeds the duration limit.")
     timeout_seconds = max(60.0, min(3600.0, probe.duration_seconds * 3))
     try:
         completed = subprocess.run(
@@ -582,6 +627,23 @@ def _parse_labels(raw_labels: Any) -> tuple[VadReferenceRange, ...]:
         )
         cursor = end_ms
     return tuple(labels)
+
+
+def _validate_frame_regions(
+    regions: list[tuple[int, int]],
+    *,
+    total_frames: int,
+) -> tuple[tuple[int, int], ...]:
+    normalized: list[tuple[int, int]] = []
+    cursor = 0
+    for start_frame, end_frame in regions:
+        if start_frame < cursor or end_frame <= start_frame or end_frame > total_frames:
+            raise SpeechActivityDetectionFailed(
+                "Detector speech regions must be ordered, non-overlapping, and bounded."
+            )
+        normalized.append((start_frame, end_frame))
+        cursor = end_frame
+    return tuple(normalized)
 
 
 def _safe_identifier(name: str, value: Any) -> str:

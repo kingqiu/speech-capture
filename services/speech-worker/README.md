@@ -171,6 +171,12 @@ cache/report paths outside the manifest directory. Use opaque dataset and sample
 only ordered, non-overlapping `speech` and `non_speech` ranges in milliseconds.
 Unlabeled ranges are excluded from scoring.
 
+Long recordings are supported. The probe no longer caps samples at 30 minutes;
+the detector runs on fixed 10-minute windows with a 2-second margin on each
+side, so speech spanning a window boundary is not lost. Decoding still
+normalizes the whole sample in memory once, so a two-hour 16 kHz mono sample
+should be planned with roughly one gigabyte of transient memory.
+
 Run a baseline without inventing acceptance thresholds:
 
 First accept the conditions on the

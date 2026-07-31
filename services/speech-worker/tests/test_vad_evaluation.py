@@ -291,6 +291,106 @@ def test_gold_evaluator_rejects_labels_beyond_decoded_audio(tmp_path) -> None:
         ).evaluate(manifest, storage_path=private)
 
 
+def test_gold_evaluator_detects_long_audio_in_windows_without_losing_boundary_speech(
+    tmp_path,
+) -> None:
+    class WholeWindowDetector(FakeDetector):
+        def detect(self, audio, *, sample_rate):
+            self.calls += 1
+            return (
+                DetectedSpeechRegion(
+                    start_seconds=0,
+                    end_seconds=audio.size / sample_rate,
+                ),
+            )
+
+    private = tmp_path / "test-data-private"
+    private.mkdir()
+    (private / "long.wav").write_bytes(wav_bytes(2000))
+    manifest = load_vad_gold_manifest(
+        write_manifest(
+            private,
+            audio="long.wav",
+            labels=[{"start_ms": 0, "end_ms": 2000, "class": "speech"}],
+        )
+    )
+    detector = WholeWindowDetector()
+
+    report = VadGoldEvaluator(
+        detector,
+        audio_decoder=lambda _: (
+            np.zeros(VAD_SAMPLE_RATE * 2, dtype=np.float32),
+            "a" * 64,
+        ),
+        boundary_preflight=ready_preflight,
+        detection_window_seconds=0.5,
+        detection_margin_seconds=0.1,
+    ).evaluate(manifest, storage_path=private)
+
+    assert detector.calls == 4
+    assert report.samples[0].detected_region_count == 4
+    assert report.metrics.speech_recall == 1.0
+    assert report.metrics.false_speech_rate is None
+
+
+def test_gold_evaluator_clips_window_margins_outside_core_ranges(tmp_path) -> None:
+    class MarginDetector(FakeDetector):
+        def detect(self, audio, *, sample_rate):
+            self.calls += 1
+            return (
+                DetectedSpeechRegion(
+                    start_seconds=0,
+                    end_seconds=0.05,
+                ),
+            )
+
+    private = tmp_path / "test-data-private"
+    private.mkdir()
+    (private / "long.wav").write_bytes(wav_bytes(2000))
+    manifest = load_vad_gold_manifest(
+        write_manifest(
+            private,
+            audio="long.wav",
+            labels=[
+                {"start_ms": 0, "end_ms": 100, "class": "speech"},
+                {"start_ms": 100, "end_ms": 2000, "class": "non_speech"},
+            ],
+        )
+    )
+    detector = MarginDetector()
+
+    report = VadGoldEvaluator(
+        detector,
+        audio_decoder=lambda _: (
+            np.zeros(VAD_SAMPLE_RATE * 2, dtype=np.float32),
+            "a" * 64,
+        ),
+        boundary_preflight=ready_preflight,
+        detection_window_seconds=0.5,
+        detection_margin_seconds=0.1,
+    ).evaluate(manifest, storage_path=private)
+
+    assert detector.calls == 4
+    assert report.samples[0].detected_region_count == 1
+    assert report.metrics.speech_recall == 0.5
+    assert report.metrics.false_speech_rate == 0.0
+
+
+def test_gold_evaluator_rejects_unsafe_window_parameters() -> None:
+    detector = FakeDetector()
+
+    with pytest.raises(InvalidJobRequest):
+        VadGoldEvaluator(detector, detection_window_seconds=0)
+    with pytest.raises(InvalidJobRequest):
+        VadGoldEvaluator(detector, detection_margin_seconds=-1)
+    with pytest.raises(InvalidJobRequest):
+        VadGoldEvaluator(
+            detector,
+            detection_window_seconds=10,
+            detection_margin_seconds=5,
+        )
+
+
 def test_gold_evaluator_weights_aggregate_metrics_by_labeled_duration(tmp_path) -> None:
     class SequencedDetector(FakeDetector):
         def detect(self, audio, *, sample_rate):
