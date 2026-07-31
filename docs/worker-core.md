@@ -885,12 +885,11 @@ The scheduler integration continued that source into a bound revision-three queu
 
 The next layer will add:
 
-1. validate the real pyannote diarization model after the owner accepts
-   `pyannote/segmentation-3.0`;
-2. add content detection, hierarchical extraction, and evidence validation;
-3. add FastAPI only after the core behavior is stable under integration tests.
+1. add content detection, hierarchical extraction, and evidence validation;
+2. add FastAPI only after the core behavior is stable under integration tests.
 
 Continuous multi-chunk ASR batches are now available through `run-asr-all`; a
 full packaged background stage loop will still be needed for the network
-service. Anonymous speaker attribution is implemented and covered by
-deterministic-engine tests; real-model acceptance is pending gated-repo access.
+service. Anonymous speaker attribution is implemented, covered by
+deterministic-engine tests, and validated on a real 60-second excerpt with
+three anonymous speakers.

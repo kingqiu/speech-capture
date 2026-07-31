@@ -6,7 +6,7 @@
 > 当前分支：`agent/worker-core`
 > 本次恢复基线：`682b64f Add evidence-only VAD gap analysis`
 > 当前 Draft PR：`#2`
-> 当前自动化测试：`217 passed`
+> 当前自动化测试：`218 passed`
 
 ## 1. 状态说明
 
@@ -719,7 +719,7 @@ SHA-256 和指标，不含路径、文件名、文字稿或凭据，并以 `0600
 
 ### 6.12 匿名说话人归属
 
-**[代码已实现并验证，真实模型冒烟待授权]**
+**[已实现并验证]**
 
 - 已新增 `SpeakerDiarizationExecutor` 和 `run-diarization` 开发者命令；
 - 模型固定为 `pyannote/speaker-diarization-3.1 @ 84fd25912480287da0247647c3d2b4853cb3ee5d`；
@@ -731,8 +731,8 @@ SHA-256 和指标，不含路径、文件名、文字稿或凭据，并以 `0600
 - 证据可跨重启重放，已完成的归属不会重复调用模型；
 - 完成后作业进入 `structuring`，进度里的 `diarization_status` 变为 `ready`；
 - 使用确定性假引擎完成 9 项自动化测试；
-- 真实模型冒烟目前被 `pyannote/segmentation-3.0` 的 403 GatedRepo 拦截，
-  需要项目所有者在模型页面接受条款后再运行。
+- 真实模型冒烟已完成：模型下载、加载、推理全部成功，在 60 秒真实录音
+  片段上识别出 18 个说话人轨迹和 3 个匿名说话人。
 
 ---
 
@@ -742,7 +742,7 @@ SHA-256 和指标，不含路径、文件名、文字稿或凭据，并以 `0600
 
 **[已实现并验证]**
 
-- Python 自动化测试：217 项通过。
+- Python 自动化测试：218 项通过。
 - Ruff 静态检查通过。
 - `uv` 依赖锁文件检查通过。
 - Python 编译检查通过。
@@ -1290,7 +1290,7 @@ SHA-256 和指标，不含路径、文件名、文字稿或凭据，并以 `0600
 4. 保留 `review-gap` 作为人工明确证据通道，不把它写成自动检测。
 5. [已实现] 自动连续执行所有 ASR 块和安全恢复。
 6. [已实现] 用合成的多块音频完成第一轮端到端测试。
-7. [代码已实现，真实模型待授权] 阶段 B 接入 pyannote 说话人识别。
+7. [已实现并验证] 阶段 B 接入 pyannote 说话人识别。
 8. 当“完整文字 + 匿名说话人”稳定后，下载和评测 Ollama 模型。
 9. 完成提炼、产物、发布和正式 API。
 10. 后端为页面提供的状态和数据稳定后，暂停前端编码，先完成 UI 设计与 GPT Image 关键交互图。
@@ -1727,11 +1727,11 @@ commit SHA 或下载权重。下一次需要项目所有者先在 Hugging Face �
 
 本次验证：
 
-- `217 passed`；
+- `218 passed`；
 - Ruff 全目录静态检查通过；
 - `compileall` 通过。
 
-真实模型冒烟尝试返回 `pyannote/segmentation-3.0` 的 403 GatedRepo。下一步
-需要项目所有者在 [pyannote/segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0)
-接受条款，然后运行真实 `run-diarization` 冒烟；之后进入内容类型判断和
-信息提炼（阶段 C）。
+真实模型冒烟完成：先补齐 `pyannote/segmentation-3.0` 和
+`pyannote/speaker-diarization-community-1` 授权，然后修复 pyannote 4.0.7
+`DiarizeOutput` 返回值适配；在 60 秒真实录音片段上识别出 18 个说话人
+轨迹和 3 个匿名说话人。下一步进入内容类型判断和信息提炼（阶段 C）。

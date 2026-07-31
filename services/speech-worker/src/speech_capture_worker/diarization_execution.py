@@ -129,6 +129,8 @@ class PyannoteSpeakerDiarizationEngine:
             annotation = annotation.get("diarization") or annotation.get("annotation")
         if annotation is None:
             return []
+        if hasattr(annotation, "speaker_diarization"):
+            annotation = annotation.speaker_diarization
         turns: list[dict[str, Any]] = []
         for segment, _, speaker in annotation.itertracks(yield_label=True):
             turns.append(

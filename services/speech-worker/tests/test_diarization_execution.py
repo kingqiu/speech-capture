@@ -415,3 +415,35 @@ def test_diarization_requires_a_diarizing_job(tmp_path) -> None:
 def test_pyannote_engine_requires_full_revision_sha() -> None:
     with pytest.raises(InvalidJobRequest):
         PyannoteSpeakerDiarizationEngine(model_revision="main")
+
+
+def test_pyannote_engine_extracts_turns_from_diarize_output(tmp_path) -> None:
+    class Segment:
+        start = 0.0
+        end = 1.0
+
+    class Annotation:
+        def itertracks(self, yield_label=True):
+            yield Segment(), None, "SPEAKER_00"
+
+    class Output:
+        speaker_diarization = Annotation()
+
+    class Pipeline:
+        def __call__(self, payload):
+            return Output()
+
+    engine = PyannoteSpeakerDiarizationEngine(
+        model_revision="a" * 40,
+        cache_dir=tmp_path,
+    )
+    engine._load_pipeline = lambda: Pipeline()
+
+    turns = engine.diarize(
+        np.zeros(16_000, dtype=np.float32),
+        sample_rate=16_000,
+    )
+
+    assert turns == [
+        {"start_ms": 0, "end_ms": 1000, "speaker": "SPEAKER_00"}
+    ]
