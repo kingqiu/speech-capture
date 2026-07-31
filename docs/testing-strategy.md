@@ -121,6 +121,11 @@ For each validated source:
 - uncovered-range PCM evidence is anchored to the exact alignment report and normalized-audio checksum;
 - only sufficiently long near-digital silence receives a definite classification;
 - short or audible PCM remains unresolved, and changed normalized audio invalidates prior measurement assumptions.
+- a source range truncated by the normalized PCM boundary remains unresolved even when all available samples are zero;
+- only current default-policy definite silence can become a stable `non_speech` outcome;
+- silence can be backfilled before or between existing text without changing stable segment IDs or cursors;
+- stale alignment evidence, custom thresholds, audible PCM, and overlapping ranges cannot authorize materialization;
+- alignment is refreshed after backfill so the remaining uncovered timeline is durable immediately.
 
 The core automated assertion is:
 

@@ -183,6 +183,27 @@ Only sufficiently long near-digital silence is reported as
 `unresolved`; it is not assumed to be non-speech. This command does not expose
 transcript text, change stable transcript outcomes, or advance the job.
 
+### 7.4 Definite-silence timeline materialization
+
+The core can backfill only default-policy `definite_silence` as an aligned
+`non_speech` stable timeline outcome while the job is in `aligning`.
+
+Before each insertion, the store verifies that:
+
+- the exact range is marked `definite_silence` in the current gap checkpoint;
+- the gap checkpoint uses the fixed conservative materialization policy;
+- the gap checkpoint still references the current alignment report;
+- the complete source range maps to available PCM frames;
+- the inserted range does not overlap any stable segment.
+
+Backfilled ranges may appear before or between previously committed transcript
+segments. Their stable segment sequence remains append-only, while timeline
+consumers order them by source time. Each range receives a private
+materialization checkpoint linking the segment to the gap report, alignment
+report, normalized-audio checksum, and aggregate PCM evidence. Alignment is
+rerun after insertion so remaining unresolved ranges and stage readiness are
+immediately current.
+
 ## 8. Job snapshot
 
 The implemented core snapshot is an internally consistent, bounded read containing:

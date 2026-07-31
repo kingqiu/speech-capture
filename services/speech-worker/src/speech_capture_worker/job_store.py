@@ -20,6 +20,7 @@ from speech_capture_worker.domain import (
     ACTIVE_PROCESSING_STATES,
     RECOVERY_TARGETS,
     SAFE_IDENTIFIER_PATTERN,
+    SHA256_PATTERN,
     CheckpointRecord,
     JobCreateRequest,
     JobEvent,
@@ -611,11 +612,7 @@ class JobStore:
     ) -> tuple[JobProgress, bool]:
         """Persist one monotonic progress snapshot and emit a content-free update."""
 
-        if (
-            not isinstance(processed_ms, int)
-            or isinstance(processed_ms, bool)
-            or processed_ms < 0
-        ):
+        if not isinstance(processed_ms, int) or isinstance(processed_ms, bool) or processed_ms < 0:
             raise InvalidJobRequest("processed_ms must be zero or greater.")
         validate_progress_number(
             "stage_progress",
@@ -666,9 +663,8 @@ class JobStore:
             if prior is not None:
                 if processed_ms < int(prior["processed_ms"]):
                     raise InvalidJobRequest("processed_ms cannot move backwards.")
-                if (
-                    str(prior["stage"]) == job.state.value
-                    and float(stage_progress) < float(prior["stage_progress"])
+                if str(prior["stage"]) == job.state.value and float(stage_progress) < float(
+                    prior["stage_progress"]
                 ):
                     raise InvalidJobRequest(
                         "stage_progress cannot move backwards within the same stage."
@@ -945,9 +941,7 @@ class JobStore:
             "speaker_label_status": speaker_label_status.value,
             "error_code": error_code,
         }
-        fingerprint = hashlib.sha256(
-            _canonical_json(request_payload).encode("utf-8")
-        ).hexdigest()
+        fingerprint = hashlib.sha256(_canonical_json(request_payload).encode("utf-8")).hexdigest()
         with self._transaction():
             job = self._row_to_job(self._fetch_job_row(job_id))
             if job.state is not JobState.TRANSCRIBING:
@@ -1075,6 +1069,163 @@ class JobStore:
             row = self._fetch_transcript_segment_row(job_id, segment_id)
             return self._row_to_transcript_segment(row), True
 
+    def commit_definite_silence_segment(
+        self,
+        job_id: str,
+        *,
+        commit_key: str,
+        start_ms: int,
+        end_ms: int,
+        gap_analysis_generation: int,
+        gap_analysis_sha256: str,
+    ) -> tuple[TranscriptSegment, bool]:
+        """Backfill one proven-silent alignment gap from current durable evidence."""
+
+        validate_commit_key(commit_key)
+        if (
+            not isinstance(gap_analysis_generation, int)
+            or isinstance(gap_analysis_generation, bool)
+            or gap_analysis_generation < 1
+            or not isinstance(gap_analysis_sha256, str)
+            or not SHA256_PATTERN.fullmatch(gap_analysis_sha256)
+        ):
+            raise InvalidJobRequest("Gap-analysis checkpoint identity is invalid.")
+
+        request_payload = {
+            "commit_key": commit_key,
+            "start_ms": start_ms,
+            "end_ms": end_ms,
+            "outcome": TranscriptOutcome.NON_SPEECH.value,
+            "text": None,
+            "language": None,
+            "confidence": None,
+            "timing_status": TranscriptTimingStatus.ALIGNED.value,
+            "speaker_id": None,
+            "speaker_label_status": SpeakerLabelStatus.UNAVAILABLE.value,
+            "error_code": None,
+            "gap_analysis_generation": gap_analysis_generation,
+            "gap_analysis_sha256": gap_analysis_sha256,
+        }
+        fingerprint = hashlib.sha256(_canonical_json(request_payload).encode("utf-8")).hexdigest()
+
+        with self._transaction():
+            job = self._row_to_job(self._fetch_job_row(job_id))
+            if job.state is not JobState.ALIGNING:
+                raise InvalidJobRequest(
+                    "Definite-silence gaps can be committed only while aligning."
+                )
+            duration_ms = self._job_duration_ms(job)
+            validate_time_range(start_ms, end_ms, duration_ms=duration_ms)
+            self._require_current_definite_silence_evidence(
+                job_id,
+                start_ms=start_ms,
+                end_ms=end_ms,
+                source_duration_ms=duration_ms,
+                gap_analysis_generation=gap_analysis_generation,
+                gap_analysis_sha256=gap_analysis_sha256,
+            )
+
+            prior = self._connection.execute(
+                """
+                SELECT *
+                FROM transcript_segments
+                WHERE job_id = ? AND commit_key = ?
+                """,
+                (job_id, commit_key),
+            ).fetchone()
+            if prior is not None:
+                if str(prior["request_fingerprint"]) != fingerprint:
+                    raise TranscriptConflict(
+                        "The commit key is already bound to different silence evidence.",
+                        details={"job_id": job_id, "commit_key": commit_key},
+                    )
+                return self._row_to_transcript_segment(prior), False
+
+            overlap = self._connection.execute(
+                """
+                SELECT segment_id
+                FROM transcript_segments
+                WHERE job_id = ? AND start_ms < ? AND end_ms > ?
+                LIMIT 1
+                """,
+                (job_id, end_ms, start_ms),
+            ).fetchone()
+            if overlap is not None:
+                raise TranscriptConflict(
+                    "A definite-silence gap cannot overlap an existing segment.",
+                    details={"conflicting_segment_id": str(overlap["segment_id"])},
+                )
+
+            sequence = int(
+                self._connection.execute(
+                    """
+                    SELECT COALESCE(MAX(segment_sequence), 0) + 1
+                    FROM transcript_segments
+                    WHERE job_id = ?
+                    """,
+                    (job_id,),
+                ).fetchone()[0]
+            )
+            segment_id = f"seg_{sequence:08d}"
+            now = _utc_now()
+            self._connection.execute(
+                """
+                INSERT INTO transcript_segments (
+                    job_id,
+                    segment_sequence,
+                    segment_id,
+                    commit_key,
+                    request_fingerprint,
+                    revision,
+                    start_ms,
+                    end_ms,
+                    outcome,
+                    text,
+                    language,
+                    confidence,
+                    timing_status,
+                    speaker_id,
+                    speaker_label_status,
+                    error_code,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, NULL, NULL, NULL, ?, NULL, ?, NULL, ?, ?)
+                """,
+                (
+                    job_id,
+                    sequence,
+                    segment_id,
+                    commit_key,
+                    fingerprint,
+                    start_ms,
+                    end_ms,
+                    TranscriptOutcome.NON_SPEECH.value,
+                    TranscriptTimingStatus.ALIGNED.value,
+                    SpeakerLabelStatus.UNAVAILABLE.value,
+                    now,
+                    now,
+                ),
+            )
+            self._insert_update(
+                job_id=job_id,
+                job_revision=job.revision,
+                event_type="transcript.segment_committed",
+                payload={
+                    "segment_sequence": sequence,
+                    "segment_id": segment_id,
+                    "revision": 1,
+                    "start_ms": start_ms,
+                    "end_ms": end_ms,
+                    "outcome": TranscriptOutcome.NON_SPEECH.value,
+                    "text_length": 0,
+                    "speaker_label_status": SpeakerLabelStatus.UNAVAILABLE.value,
+                },
+                created_at=now,
+            )
+            row = self._fetch_transcript_segment_row(job_id, segment_id)
+            return self._row_to_transcript_segment(row), True
+
     def update_transcript_segment_metadata(
         self,
         job_id: str,
@@ -1172,9 +1323,7 @@ class JobStore:
                     "Transcript timing metadata can be revised only while aligning."
                 )
             if speaker_changed and job.state is not JobState.DIARIZING:
-                raise InvalidJobRequest(
-                    "Speaker attribution can be revised only while diarizing."
-                )
+                raise InvalidJobRequest("Speaker attribution can be revised only while diarizing.")
             revision = current.revision + 1
             now = _utc_now()
             self._connection.execute(
@@ -1288,9 +1437,7 @@ class JobStore:
             return JobSnapshot(
                 job=job,
                 progress=(
-                    self._row_to_job_progress(progress_row)
-                    if progress_row is not None
-                    else None
+                    self._row_to_job_progress(progress_row) if progress_row is not None else None
                 ),
                 stable_segments=segments,
                 provisional=(
@@ -1299,15 +1446,11 @@ class JobStore:
                     else None
                 ),
                 resource_report=(
-                    _json_object(resource_row["payload_json"])
-                    if resource_row is not None
-                    else None
+                    _json_object(resource_row["payload_json"]) if resource_row is not None else None
                 ),
                 latest_event_sequence=latest_sequence,
                 next_after_segment_sequence=(
-                    segments[-1].segment_sequence
-                    if segments
-                    else after_segment_sequence
+                    segments[-1].segment_sequence if segments else after_segment_sequence
                 ),
                 has_more_segments=len(segment_rows) > segment_limit,
             )
@@ -1457,11 +1600,7 @@ class JobStore:
     ) -> tuple[AsrAttemptRecord, bool]:
         """Commit one immutable private raw ASR attempt and safe metadata."""
 
-        if (
-            not isinstance(chunk_index, int)
-            or isinstance(chunk_index, bool)
-            or chunk_index < 0
-        ):
+        if not isinstance(chunk_index, int) or isinstance(chunk_index, bool) or chunk_index < 0:
             raise InvalidJobRequest("chunk_index must be zero or greater.")
         if (
             not isinstance(attempt_number, int)
@@ -1503,9 +1642,7 @@ class JobStore:
             or len(finish_reason) > 100
             or any(not character.isprintable() for character in finish_reason)
         ):
-            raise InvalidJobRequest(
-                "finish_reason must contain 1 to 100 printable characters."
-            )
+            raise InvalidJobRequest("finish_reason must contain 1 to 100 printable characters.")
         if not isinstance(truncated, bool):
             raise InvalidJobRequest("truncated must be a boolean.")
         if (
@@ -1514,9 +1651,7 @@ class JobStore:
             or not math.isfinite(float(elapsed_seconds))
             or elapsed_seconds < 0
         ):
-            raise InvalidJobRequest(
-                "elapsed_seconds must be a finite value of zero or greater."
-            )
+            raise InvalidJobRequest("elapsed_seconds must be a finite value of zero or greater.")
         validate_reason_code(error_code)
         if state is AsrAttemptState.SUCCEEDED and error_code is not None:
             raise InvalidJobRequest("A succeeded ASR attempt cannot contain error_code.")
@@ -1551,9 +1686,7 @@ class JobStore:
         with self._transaction():
             job = self._row_to_job(self._fetch_job_row(job_id))
             if job.state is not JobState.TRANSCRIBING:
-                raise InvalidJobRequest(
-                    "ASR attempts can be committed only while transcribing."
-                )
+                raise InvalidJobRequest("ASR attempts can be committed only while transcribing.")
             prior = self._connection.execute(
                 """
                 SELECT *
@@ -1720,9 +1853,7 @@ class JobStore:
         chunk_index: int | None = None,
     ) -> list[AsrAttemptRecord]:
         if chunk_index is not None and (
-            not isinstance(chunk_index, int)
-            or isinstance(chunk_index, bool)
-            or chunk_index < 0
+            not isinstance(chunk_index, int) or isinstance(chunk_index, bool) or chunk_index < 0
         ):
             raise InvalidJobRequest("chunk_index must be zero or greater.")
         with self._lock:
@@ -1776,13 +1907,9 @@ class JobStore:
             try:
                 content = path.read_bytes()
             except OSError as exc:
-                raise UploadStorageError(
-                    "Private raw ASR evidence could not be read."
-                ) from exc
+                raise UploadStorageError("Private raw ASR evidence could not be read.") from exc
             if hashlib.sha256(content).hexdigest() != attempt.raw_sha256:
-                raise UploadStorageError(
-                    "Private raw ASR evidence failed checksum verification."
-                )
+                raise UploadStorageError("Private raw ASR evidence failed checksum verification.")
             return _json_object(content.decode("utf-8"))
 
     def create_upload(
@@ -2679,6 +2806,125 @@ class JobStore:
         if outcome is not TranscriptOutcome.FAILED and error_code is not None:
             raise InvalidJobRequest("error_code is allowed only for a failed timeline outcome.")
 
+    def _require_current_definite_silence_evidence(
+        self,
+        job_id: str,
+        *,
+        start_ms: int,
+        end_ms: int,
+        source_duration_ms: int,
+        gap_analysis_generation: int,
+        gap_analysis_sha256: str,
+    ) -> None:
+        gap_row = self._connection.execute(
+            """
+            SELECT generation, payload_json, payload_sha256
+            FROM job_checkpoints
+            WHERE job_id = ? AND stage = ? AND checkpoint_key = ?
+            """,
+            (job_id, "aligning", "gap_audio_evidence"),
+        ).fetchone()
+        if (
+            gap_row is None
+            or int(gap_row["generation"]) != gap_analysis_generation
+            or str(gap_row["payload_sha256"]) != gap_analysis_sha256
+        ):
+            raise InvalidJobRequest(
+                "Definite-silence materialization requires the current gap evidence."
+            )
+
+        payload = _json_object(gap_row["payload_json"])
+        if (
+            payload.get("schema_version") != "1.0.0"
+            or payload.get("alignment_report_schema_version") != "1.0.0"
+            or not isinstance(payload.get("source_duration_ms"), int)
+            or isinstance(payload["source_duration_ms"], bool)
+            or payload.get("source_duration_ms") != source_duration_ms
+            or not isinstance(payload.get("window_ms"), int)
+            or isinstance(payload["window_ms"], bool)
+            or payload.get("window_ms") != 20
+            or not isinstance(payload.get("minimum_definite_silence_ms"), int)
+            or isinstance(payload["minimum_definite_silence_ms"], bool)
+            or payload.get("minimum_definite_silence_ms") != 100
+            or not isinstance(
+                payload.get("definite_silence_peak_threshold"),
+                int,
+            )
+            or isinstance(payload["definite_silence_peak_threshold"], bool)
+            or payload.get("definite_silence_peak_threshold") != 8
+            or not isinstance(payload.get("normalized_sha256"), str)
+            or not SHA256_PATTERN.fullmatch(payload["normalized_sha256"])
+            or not isinstance(payload.get("sample_rate"), int)
+            or isinstance(payload["sample_rate"], bool)
+            or payload["sample_rate"] <= 0
+            or not isinstance(payload.get("alignment_report_generation"), int)
+            or isinstance(payload["alignment_report_generation"], bool)
+            or payload["alignment_report_generation"] < 1
+            or not isinstance(payload.get("alignment_report_sha256"), str)
+            or not SHA256_PATTERN.fullmatch(payload["alignment_report_sha256"])
+            or not isinstance(payload.get("evidence"), list)
+        ):
+            raise InvalidJobRequest("The current gap evidence is not safe to materialize.")
+
+        alignment_row = self._connection.execute(
+            """
+            SELECT generation, payload_sha256
+            FROM job_checkpoints
+            WHERE job_id = ? AND stage = ? AND checkpoint_key = ?
+            """,
+            (job_id, "aligning", "transcript_alignment_report"),
+        ).fetchone()
+        if (
+            alignment_row is None
+            or int(alignment_row["generation"]) != payload["alignment_report_generation"]
+            or str(alignment_row["payload_sha256"]) != payload["alignment_report_sha256"]
+        ):
+            raise InvalidJobRequest("The alignment report changed after gap analysis.")
+
+        matching = [
+            value
+            for value in payload["evidence"]
+            if isinstance(value, dict)
+            and value.get("start_ms") == start_ms
+            and value.get("end_ms") == end_ms
+        ]
+        if len(matching) != 1:
+            raise InvalidJobRequest(
+                "The requested range is not present in the current gap evidence."
+            )
+        evidence = matching[0]
+        strict_integer_fields = (
+            "start_ms",
+            "end_ms",
+            "start_frame",
+            "end_frame",
+            "frame_count",
+            "duration_ms",
+            "peak_absolute_amplitude",
+        )
+        if (
+            any(
+                not isinstance(evidence.get(field), int) or isinstance(evidence[field], bool)
+                for field in strict_integer_fields
+            )
+            or evidence["duration_ms"] != end_ms - start_ms
+            or evidence["start_frame"] < 0
+            or evidence["end_frame"] <= evidence["start_frame"]
+            or evidence["start_frame"]
+            != round(start_ms * payload["sample_rate"] / 1000)
+            or evidence["end_frame"]
+            != round(end_ms * payload["sample_rate"] / 1000)
+            or evidence["frame_count"] != evidence["end_frame"] - evidence["start_frame"]
+            or evidence["peak_absolute_amplitude"] < 0
+            or evidence["peak_absolute_amplitude"] > 8
+            or not isinstance(evidence.get("quiet_window_ratio"), (int, float))
+            or isinstance(evidence["quiet_window_ratio"], bool)
+            or evidence["quiet_window_ratio"] != 1
+            or evidence.get("classification") != "definite_silence"
+            or evidence.get("reason_code") != "PCM_NEAR_DIGITAL_SILENCE"
+        ):
+            raise InvalidJobRequest("The requested range is not proven definite silence.")
+
     def _fetch_upload_row(self, upload_id: str) -> sqlite3.Row:
         _validate_upload_id(upload_id)
         row = self._connection.execute(
@@ -3155,9 +3401,7 @@ class JobStore:
             start_ms=int(row["start_ms"]),
             end_ms=int(row["end_ms"]),
             language=str(row["language"]) if row["language"] is not None else None,
-            finish_reason=(
-                str(row["finish_reason"]) if row["finish_reason"] is not None else None
-            ),
+            finish_reason=(str(row["finish_reason"]) if row["finish_reason"] is not None else None),
             truncated=bool(row["truncated"]),
             elapsed_seconds=float(row["elapsed_seconds"]),
             raw_relative_path=str(row["raw_relative_path"]),

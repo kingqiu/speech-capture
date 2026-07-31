@@ -1,6 +1,6 @@
 # Speech Capture Worker
 
-Status: local model spike, persistent Worker core, durable media intake, one-active-job scheduling, progressive transcript persistence, deterministic normalization, restart-safe local ASR chunk execution, durable whole-transcript alignment finalization, and conservative PCM gap evidence. There is no network Worker service yet.
+Status: local model spike, persistent Worker core, durable media intake, one-active-job scheduling, progressive transcript persistence, deterministic normalization, restart-safe local ASR chunk execution, durable whole-transcript alignment finalization, conservative PCM gap evidence, and evidence-bound definite-silence materialization. There is no network Worker service yet.
 
 The Worker performs durable local processing outside Obsidian. It will own:
 
@@ -39,6 +39,8 @@ The package now contains:
   complete timeline accounting, and transcript completeness before diarization;
 - a private gap-analysis report that classifies only sufficiently long
   near-digital silence and leaves all audible or uncertain PCM unresolved;
+- evidence-bound backfill of default-policy definite silence as aligned
+  `non_speech` timeline outcomes, followed by automatic alignment refresh;
 - idempotent creation, revision guards, and restart recovery;
 - disk and memory preflight.
 
@@ -97,6 +99,10 @@ uv run speech-capture-worker finalize-alignment \
 uv run speech-capture-worker analyze-gaps \
   --data-dir runtime/dev-worker \
   job_example
+
+uv run speech-capture-worker materialize-silence \
+  --data-dir runtime/dev-worker \
+  job_example
 ```
 
 `runtime/` is ignored by Git. The CLI requires an explicit data directory and does not create a global service installation.
@@ -105,6 +111,11 @@ uv run speech-capture-worker analyze-gaps \
 in `aligning`. Its evidence is anchored to that report generation and the
 checksummed normalized WAV. It does not infer non-speech from audible PCM or
 advance the job by itself.
+
+`materialize-silence` reruns the conservative default policy, commits only
+currently proven silence, stores one evidence checkpoint per inserted range,
+and reruns whole-transcript alignment. Custom thresholds remain useful for
+inspection but cannot authorize timeline materialization.
 
 Upload completion requires FFprobe. The packaged Worker will own that dependency; during development it must be available on `PATH`.
 

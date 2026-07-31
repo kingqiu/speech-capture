@@ -29,6 +29,7 @@ The Worker core now has an executable local foundation for:
 - durable whole-transcript alignment, evidence, and timeline-readiness reports;
 - a strict completeness gate before speaker diarization;
 - conservative, checksummed PCM evidence for uncovered timeline ranges;
+- evidence-bound definite-silence backfill and immediate alignment refresh;
 - stable machine-readable errors;
 - a developer CLI.
 
@@ -66,6 +67,8 @@ This is not yet the network Worker service. It can execute or replay one local A
 28. A job cannot enter diarization while transcribed timing is estimated, a source range lacks a stable outcome, or an inaudible or failed range remains.
 29. Alignment checkpoints contain ranges, counts, and stable issue codes, but never transcript text.
 30. Gap analysis may prove sufficiently long near-digital silence, but audible or uncertain PCM remains unresolved and cannot be silently labeled non-speech.
+31. Only current gap evidence produced by the fixed conservative policy may authorize an aligned `non_speech` backfill.
+32. Alignment backfill may append a stable segment sequence before or between existing timeline ranges, but it may never rewrite IDs, overlap another segment, or change transcript text.
 
 ## 3. SQLite layout
 
@@ -538,6 +541,31 @@ The report contains no transcript text, filenames, or absolute paths. Repeating
 the same analysis is idempotent; revising the source alignment report creates a
 new anchored gap-evidence generation.
 
+### 12.7 Definite-silence timeline backfill
+
+`materialize-silence` reruns gap analysis with the fixed 20 ms window, 100 ms
+minimum duration, and near-digital peak threshold of 8. Diagnostic runs with
+custom thresholds cannot authorize timeline changes.
+
+For every current `definite_silence` range, the Worker:
+
+1. verifies the current gap checkpoint generation and SHA-256;
+2. verifies that it still references the current alignment report;
+3. revalidates the exact range, PCM frame count, peak, quiet-window ratio,
+   classification, and reason code;
+4. proves that the complete source range maps to available PCM frames;
+5. rejects any overlap with existing stable outcomes;
+6. appends an aligned `non_speech` segment with no text or speaker attribution;
+7. persists a range-specific evidence checkpoint linking the segment to the
+   gap report, alignment report, normalized WAV checksum, and PCM measurements;
+8. reruns whole-transcript alignment immediately.
+
+This dedicated backfill path can insert source-time ranges before or between
+existing text without changing existing segment IDs or sequence cursors.
+Retries before alignment refresh reuse the same commit key and evidence
+fingerprint. A crash after segment insertion but before its evidence checkpoint
+or alignment refresh is repaired idempotently by the next invocation.
+
 ## 13. Developer CLI
 
 From `services/speech-worker/`:
@@ -599,6 +627,10 @@ uv run speech-capture-worker finalize-alignment \
   job_example
 
 uv run speech-capture-worker analyze-gaps \
+  --data-dir runtime/dev-worker \
+  job_example
+
+uv run speech-capture-worker materialize-silence \
   --data-dir runtime/dev-worker \
   job_example
 
@@ -681,6 +713,13 @@ The Worker package currently tests:
 - alignment-report validation, generation anchoring, and idempotent replay;
 - normalized-audio tamper rejection;
 - machine-readable `analyze-gaps` CLI output.
+- evidence-bound silence backfill before and between existing text;
+- rejection of audible, stale, custom-policy, and overlapping evidence;
+- rejection of source ranges not fully backed by available PCM frames;
+- range-specific materialization checkpoints and idempotent retry;
+- immediate whole-transcript alignment refresh;
+- successful advancement to `diarizing` when proven silence is the final gap;
+- machine-readable `materialize-silence` CLI output.
 
 A separate CLI integration run advanced a job to `transcribing`, closed the store, recovered it to `queued`, and verified all seven events and database integrity.
 
@@ -692,7 +731,7 @@ The scheduler integration continued that source into a bound revision-three queu
 
 The next layer will add:
 
-1. materialize proven silence as an explicit timeline outcome and safely classify the remaining non-speech or inaudible gaps;
+1. safely classify the remaining audible or uncertain non-speech and inaudible gaps without relying on amplitude alone;
 2. add a controlled forced-alignment fallback for any stable text that still has estimated timing;
 3. integrate pyannote diarization and anonymous speaker attribution;
 4. run a continuous restart-safe stage loop rather than one backend command per chunk;

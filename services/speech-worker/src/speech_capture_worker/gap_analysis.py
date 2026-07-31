@@ -14,7 +14,9 @@ import numpy as np
 from speech_capture_worker.alignment import (
     ALIGNMENT_REPORT_SCHEMA_VERSION,
     CHECKPOINT_STAGE,
+    AlignmentFinalizationResult,
     TimelineRange,
+    TranscriptAlignmentFinalizer,
 )
 from speech_capture_worker.alignment import (
     CHECKPOINT_KEY as ALIGNMENT_CHECKPOINT_KEY,
@@ -23,9 +25,12 @@ from speech_capture_worker.audio_preprocessing import AudioPreprocessor
 from speech_capture_worker.domain import JobRecord, JobState
 from speech_capture_worker.errors import InvalidJobRequest, NormalizedAudioInvalid
 from speech_capture_worker.job_store import JobStore
+from speech_capture_worker.transcript import TranscriptSegment
 
 GAP_ANALYSIS_SCHEMA_VERSION = "1.0.0"
 GAP_ANALYSIS_CHECKPOINT_KEY = "gap_audio_evidence"
+SILENCE_MATERIALIZATION_SCHEMA_VERSION = "1.0.0"
+SILENCE_MATERIALIZATION_CHECKPOINT_SUFFIX = "_materialized"
 DEFAULT_WINDOW_MS = 20
 DEFAULT_MIN_DEFINITE_SILENCE_MS = 100
 DEFAULT_DEFINITE_SILENCE_PEAK = 8
@@ -104,6 +109,50 @@ class GapAnalysisResult:
             "job": self.job.to_dict(),
             "report": self.report.to_dict(),
             "checkpoint_generation": self.checkpoint_generation,
+        }
+
+
+class SilenceMaterializationOutcome(StrEnum):
+    MATERIALIZED = "materialized"
+    NO_DEFINITE_SILENCE = "no_definite_silence"
+    ALREADY_FINALIZED = "already_finalized"
+
+
+@dataclass(frozen=True)
+class SilenceMaterializationRecord:
+    segment: TranscriptSegment
+    created: bool
+    evidence_checkpoint_generation: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "segment": self.segment.to_dict(),
+            "created": self.created,
+            "evidence_checkpoint_generation": (self.evidence_checkpoint_generation),
+        }
+
+
+@dataclass(frozen=True)
+class SilenceMaterializationResult:
+    outcome: SilenceMaterializationOutcome
+    job: JobRecord
+    gap_analysis_generation: int | None
+    materializations: tuple[SilenceMaterializationRecord, ...]
+    alignment: AlignmentFinalizationResult
+
+    @property
+    def created_segment_count(self) -> int:
+        return sum(value.created for value in self.materializations)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "outcome": self.outcome.value,
+            "job": self.job.to_dict(),
+            "gap_analysis_generation": self.gap_analysis_generation,
+            "materialized_segment_count": len(self.materializations),
+            "created_segment_count": self.created_segment_count,
+            "materializations": [value.to_dict() for value in self.materializations],
+            "alignment": self.alignment.to_dict(),
         }
 
 
@@ -258,6 +307,107 @@ class TranscriptGapAnalyzer:
         return tuple(ranges), checkpoint.generation, checkpoint.payload_sha256
 
 
+class DefiniteSilenceMaterializer:
+    """Backfill only default-policy definite silence, then refresh alignment."""
+
+    def __init__(
+        self,
+        store: JobStore,
+        *,
+        analyzer: TranscriptGapAnalyzer | None = None,
+        finalizer: TranscriptAlignmentFinalizer | None = None,
+    ) -> None:
+        self.store = store
+        self.analyzer = analyzer or TranscriptGapAnalyzer(store)
+        self.finalizer = finalizer or TranscriptAlignmentFinalizer(store)
+
+    def materialize(self, job_id: str) -> SilenceMaterializationResult:
+        job = self.store.get_job(job_id)
+        if job.state is JobState.DIARIZING:
+            alignment = self.finalizer.finalize(job_id)
+            return SilenceMaterializationResult(
+                outcome=SilenceMaterializationOutcome.ALREADY_FINALIZED,
+                job=alignment.job,
+                gap_analysis_generation=None,
+                materializations=(),
+                alignment=alignment,
+            )
+        if job.state is not JobState.ALIGNING:
+            raise InvalidJobRequest(
+                "Silence materialization requires an aligning or diarizing job."
+            )
+
+        analysis = self.analyzer.analyze(job_id)
+        gap_checkpoint = next(
+            (
+                value
+                for value in self.store.list_checkpoints(
+                    job_id,
+                    stage=CHECKPOINT_STAGE,
+                )
+                if value.checkpoint_key == GAP_ANALYSIS_CHECKPOINT_KEY
+            ),
+            None,
+        )
+        if (
+            gap_checkpoint is None
+            or gap_checkpoint.generation != analysis.checkpoint_generation
+            or gap_checkpoint.payload != analysis.report.to_dict()
+        ):
+            raise InvalidJobRequest("The durable gap evidence changed before materialization.")
+
+        materializations: list[SilenceMaterializationRecord] = []
+        for evidence in analysis.report.evidence:
+            if evidence.classification is not GapEvidenceClassification.DEFINITE_SILENCE:
+                continue
+            commit_key = _silence_key(evidence.start_ms, evidence.end_ms)
+            segment, created = self.store.commit_definite_silence_segment(
+                job_id,
+                commit_key=commit_key,
+                start_ms=evidence.start_ms,
+                end_ms=evidence.end_ms,
+                gap_analysis_generation=gap_checkpoint.generation,
+                gap_analysis_sha256=gap_checkpoint.payload_sha256,
+            )
+            evidence_checkpoint, _ = self.store.put_checkpoint(
+                job_id,
+                stage=CHECKPOINT_STAGE,
+                checkpoint_key=(f"{commit_key}{SILENCE_MATERIALIZATION_CHECKPOINT_SUFFIX}"),
+                payload={
+                    "schema_version": SILENCE_MATERIALIZATION_SCHEMA_VERSION,
+                    "gap_analysis_schema_version": GAP_ANALYSIS_SCHEMA_VERSION,
+                    "gap_analysis_generation": gap_checkpoint.generation,
+                    "gap_analysis_sha256": gap_checkpoint.payload_sha256,
+                    "alignment_report_generation": (analysis.report.alignment_report_generation),
+                    "alignment_report_sha256": (analysis.report.alignment_report_sha256),
+                    "normalized_sha256": analysis.report.normalized_sha256,
+                    "segment_id": segment.segment_id,
+                    "commit_key": segment.commit_key,
+                    "evidence": evidence.to_dict(),
+                },
+            )
+            materializations.append(
+                SilenceMaterializationRecord(
+                    segment=segment,
+                    created=created,
+                    evidence_checkpoint_generation=(evidence_checkpoint.generation),
+                )
+            )
+
+        alignment = self.finalizer.finalize(job_id)
+        return SilenceMaterializationResult(
+            outcome=(
+                SilenceMaterializationOutcome.MATERIALIZED
+                if materializations
+                else SilenceMaterializationOutcome.NO_DEFINITE_SILENCE
+            ),
+            job=alignment.job,
+            gap_analysis_generation=analysis.checkpoint_generation,
+            materializations=tuple(materializations),
+            alignment=alignment,
+        )
+
+
 def _analyze_wav_ranges(
     path: Path,
     *,
@@ -280,13 +430,19 @@ def _analyze_wav_ranges(
             ):
                 raise NormalizedAudioInvalid("Normalized audio changed before gap analysis.")
             for timeline_range in ranges:
+                requested_start_frame = round(
+                    timeline_range.start_ms * sample_rate / 1000
+                )
+                requested_end_frame = round(
+                    timeline_range.end_ms * sample_rate / 1000
+                )
                 start_frame = min(
                     total_frames,
-                    max(0, round(timeline_range.start_ms * sample_rate / 1000)),
+                    max(0, requested_start_frame),
                 )
                 end_frame = min(
                     total_frames,
-                    max(start_frame, round(timeline_range.end_ms * sample_rate / 1000)),
+                    max(start_frame, requested_end_frame),
                 )
                 audio.setpos(start_frame)
                 raw = audio.readframes(end_frame - start_frame)
@@ -300,6 +456,11 @@ def _analyze_wav_ranges(
                         start_frame=start_frame,
                         end_frame=end_frame,
                         window_frames=window_frames,
+                        pcm_range_complete=(
+                            requested_start_frame == start_frame
+                            and requested_end_frame == end_frame
+                            and requested_end_frame > requested_start_frame
+                        ),
                         minimum_definite_silence_ms=minimum_definite_silence_ms,
                         definite_silence_peak_threshold=definite_silence_peak_threshold,
                     )
@@ -318,6 +479,7 @@ def _measure_gap(
     start_frame: int,
     end_frame: int,
     window_frames: int,
+    pcm_range_complete: bool,
     minimum_definite_silence_ms: int,
     definite_silence_peak_threshold: int,
 ) -> GapAudioEvidence:
@@ -332,7 +494,9 @@ def _measure_gap(
     quiet_windows = sum(value <= definite_silence_peak_threshold for value in window_peaks)
     quiet_window_ratio = quiet_windows / len(window_peaks) if window_peaks else 0
     duration_ms = timeline_range.duration_ms
-    pcm_range_available = end_frame > start_frame and samples.size > 0
+    pcm_range_available = (
+        pcm_range_complete and end_frame > start_frame and samples.size > 0
+    )
     definite_silence = (
         pcm_range_available
         and duration_ms >= minimum_definite_silence_ms
@@ -369,3 +533,7 @@ def _measure_gap(
 
 def _is_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _silence_key(start_ms: int, end_ms: int) -> str:
+    return f"gap_silence_{start_ms:012d}_{end_ms:012d}"

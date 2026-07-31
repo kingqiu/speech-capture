@@ -26,6 +26,7 @@ from speech_capture_worker.gap_analysis import (
     DEFAULT_DEFINITE_SILENCE_PEAK,
     DEFAULT_MIN_DEFINITE_SILENCE_MS,
     DEFAULT_WINDOW_MS,
+    DefiniteSilenceMaterializer,
     TranscriptGapAnalyzer,
 )
 from speech_capture_worker.job_store import JobStore
@@ -317,6 +318,13 @@ def _build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_DEFINITE_SILENCE_PEAK,
     )
 
+    materialize_silence = subparsers.add_parser(
+        "materialize-silence",
+        help="Commit default-policy definite silence and refresh alignment.",
+    )
+    _add_data_dir(materialize_silence)
+    materialize_silence.add_argument("job_id")
+
     list_asr_attempts = subparsers.add_parser(
         "list-asr-attempts",
         help="List safe raw-attempt metadata without transcript content.",
@@ -599,10 +607,7 @@ def _dispatch(args: argparse.Namespace) -> int:
             ).run_next(args.job_id)
             _write_json(result.to_dict())
             return (
-                2
-                if result.outcome.value
-                in {"retryable_failure", "safe_paused", "partial"}
-                else 0
+                2 if result.outcome.value in {"retryable_failure", "safe_paused", "partial"} else 0
             )
         if args.command == "finalize-alignment":
             result = TranscriptAlignmentFinalizer(store).finalize(args.job_id)
@@ -621,10 +626,12 @@ def _dispatch(args: argparse.Namespace) -> int:
                 store,
                 window_ms=args.window_ms,
                 minimum_definite_silence_ms=args.minimum_definite_silence_ms,
-                definite_silence_peak_threshold=(
-                    args.definite_silence_peak_threshold
-                ),
+                definite_silence_peak_threshold=(args.definite_silence_peak_threshold),
             ).analyze(args.job_id)
+            _write_json(result.to_dict())
+            return 0
+        if args.command == "materialize-silence":
+            result = DefiniteSilenceMaterializer(store).materialize(args.job_id)
             _write_json(result.to_dict())
             return 0
         if args.command == "list-asr-attempts":
