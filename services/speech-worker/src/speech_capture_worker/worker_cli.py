@@ -15,6 +15,11 @@ from speech_capture_worker.alignment import (
 )
 from speech_capture_worker.asr_execution import AsrChunkExecutor, MlxQwenAsrEngine
 from speech_capture_worker.audio_preprocessing import AudioPreprocessor
+from speech_capture_worker.diarization_execution import (
+    DiarizationOutcome,
+    PyannoteSpeakerDiarizationEngine,
+    SpeakerDiarizationExecutor,
+)
 from speech_capture_worker.domain import (
     JobCreateRequest,
     JobState,
@@ -381,6 +386,18 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Full lowercase commit SHA for pyannote/segmentation.",
     )
 
+    run_diarization = subparsers.add_parser(
+        "run-diarization",
+        help="Run revision-pinned speaker diarization and anonymous attribution.",
+    )
+    _add_data_dir(run_diarization)
+    run_diarization.add_argument("job_id")
+    run_diarization.add_argument(
+        "--model-revision",
+        required=True,
+        help="Full lowercase commit SHA for pyannote/speaker-diarization-3.1.",
+    )
+
     list_asr_attempts = subparsers.add_parser(
         "list-asr-attempts",
         help="List safe raw-attempt metadata without transcript content.",
@@ -729,6 +746,14 @@ def _dispatch(args: argparse.Namespace) -> int:
             result = GapSpeechActivityAnalyzer(store, detector).analyze(args.job_id)
             _write_json(result.to_dict())
             return 2 if result.outcome.value == "safe_paused" else 0
+        if args.command == "run-diarization":
+            engine = PyannoteSpeakerDiarizationEngine(
+                model_revision=args.model_revision,
+                cache_dir=args.data_dir.resolve() / "models" / "pyannote",
+            )
+            result = SpeakerDiarizationExecutor(store, engine).run(args.job_id)
+            _write_json(result.to_dict())
+            return 2 if result.outcome is DiarizationOutcome.SAFE_PAUSED else 0
         if args.command == "list-asr-attempts":
             attempts = store.list_asr_attempts(
                 args.job_id,

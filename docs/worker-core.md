@@ -835,6 +835,8 @@ The Worker package currently tests:
 - real local MLX Qwen3-ASR execution on synthetic Chinese speech through aligned stable text.
 - synthetic multi-chunk end-to-end intake through transcription completion and
   alignment advancement to `diarizing`, idempotent across Worker restart.
+- revision-pinned speaker-diarization adapter with anonymous attribution,
+  safe degradation to `unavailable`, and restart-idempotent evidence.
 - complete aligned transcript advancement to `diarizing`;
 - durable uncovered-range reporting without transcript text;
 - estimated-timing and missing-evidence blocking;
@@ -883,10 +885,12 @@ The scheduler integration continued that source into a bound revision-three queu
 
 The next layer will add:
 
-1. integrate pyannote diarization and anonymous speaker attribution;
+1. validate the real pyannote diarization model after the owner accepts
+   `pyannote/segmentation-3.0`;
 2. add content detection, hierarchical extraction, and evidence validation;
 3. add FastAPI only after the core behavior is stable under integration tests.
 
 Continuous multi-chunk ASR batches are now available through `run-asr-all`; a
 full packaged background stage loop will still be needed for the network
-service.
+service. Anonymous speaker attribution is implemented and covered by
+deterministic-engine tests; real-model acceptance is pending gated-repo access.

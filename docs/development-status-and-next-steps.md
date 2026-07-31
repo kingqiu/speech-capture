@@ -6,7 +6,7 @@
 > 当前分支：`agent/worker-core`
 > 本次恢复基线：`682b64f Add evidence-only VAD gap analysis`
 > 当前 Draft PR：`#2`
-> 当前自动化测试：`208 passed`
+> 当前自动化测试：`217 passed`
 
 ## 1. 状态说明
 
@@ -717,13 +717,32 @@ SHA-256 和指标，不含路径、文件名、文字稿或凭据，并以 `0600
 
 ---
 
+### 6.12 匿名说话人归属
+
+**[代码已实现并验证，真实模型冒烟待授权]**
+
+- 已新增 `SpeakerDiarizationExecutor` 和 `run-diarization` 开发者命令；
+- 模型固定为 `pyannote/speaker-diarization-3.1 @ 84fd25912480287da0247647c3d2b4853cb3ee5d`；
+- 模型前执行资源检查，阻塞时安全暂停；
+- 原始说话人轨迹先写入私有、带校验和的证据文件，再更新文字段元数据；
+- 只改 `speaker_id` 和 `speaker_label_status`，不重写稳定文字；
+- 匿名说话人按首次出现顺序映射为 `speaker_01`、`speaker_02` 等；
+- 模型失败或返回空结果时降级为 `UNAVAILABLE`，文字不丢失，作业仍前进；
+- 证据可跨重启重放，已完成的归属不会重复调用模型；
+- 完成后作业进入 `structuring`，进度里的 `diarization_status` 变为 `ready`；
+- 使用确定性假引擎完成 9 项自动化测试；
+- 真实模型冒烟目前被 `pyannote/segmentation-3.0` 的 403 GatedRepo 拦截，
+  需要项目所有者在模型页面接受条款后再运行。
+
+---
+
 ## 7. 当前测试和质量验证
 
 ### 7.1 已通过的检查
 
 **[已实现并验证]**
 
-- Python 自动化测试：198 项通过。
+- Python 自动化测试：217 项通过。
 - Ruff 静态检查通过。
 - `uv` 依赖锁文件检查通过。
 - Python 编译检查通过。
@@ -1271,7 +1290,7 @@ SHA-256 和指标，不含路径、文件名、文字稿或凭据，并以 `0600
 4. 保留 `review-gap` 作为人工明确证据通道，不把它写成自动检测。
 5. [已实现] 自动连续执行所有 ASR 块和安全恢复。
 6. [已实现] 用合成的多块音频完成第一轮端到端测试。
-7. 然后进入阶段 B，接入 pyannote 说话人识别。
+7. [代码已实现，真实模型待授权] 阶段 B 接入 pyannote 说话人识别。
 8. 当“完整文字 + 匿名说话人”稳定后，下载和评测 Ollama 模型。
 9. 完成提炼、产物、发布和正式 API。
 10. 后端为页面提供的状态和数据稳定后，暂停前端编码，先完成 UI 设计与 GPT Image 关键交互图。
@@ -1685,3 +1704,34 @@ commit SHA 或下载权重。下一次需要项目所有者先在 Hugging Face �
 - `compileall` 通过。
 
 下一次从阶段 B 接入 pyannote 说话人识别继续。
+
+---
+
+## 25. 2026-07-31 匿名说话人归属开发记录
+
+本次完成阶段 B 的说话人归属代码和确定性测试，没有打开总结、API 或前端。
+
+完成内容：
+
+- 新增 `DiarizationFailed` 稳定错误码；
+- 新增 `diarization_execution.py`：
+  - revision-pinned `pyannote/speaker-diarization-3.1` 真实引擎适配器；
+  - 匿名说话人映射和最大重叠归属；
+  - 私有原始证据先落盘、校验后才更新段元数据；
+  - 跨重启证据重放和幂等完成；
+  - 模型失败或空轨迹降级为 `UNAVAILABLE`，不丢文字；
+  - 资源阻塞时安全暂停；
+- 新增 `run-diarization` 开发者 CLI；
+- 新增 9 项测试并扩展合成多块端到端测试到 `structuring`；
+- 更新 Worker README、核心文档和本交接文档。
+
+本次验证：
+
+- `217 passed`；
+- Ruff 全目录静态检查通过；
+- `compileall` 通过。
+
+真实模型冒烟尝试返回 `pyannote/segmentation-3.0` 的 403 GatedRepo。下一步
+需要项目所有者在 [pyannote/segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0)
+接受条款，然后运行真实 `run-diarization` 冒烟；之后进入内容类型判断和
+信息提炼（阶段 C）。

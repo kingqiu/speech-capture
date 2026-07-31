@@ -129,3 +129,7 @@ class AsrExecutionFailed(WorkerCoreError):
 
 class ForcedAlignmentFailed(WorkerCoreError):
     code = "FORCED_ALIGNMENT_FAILED"
+
+
+class DiarizationFailed(WorkerCoreError):
+    code = "DIARIZATION_FAILED"
