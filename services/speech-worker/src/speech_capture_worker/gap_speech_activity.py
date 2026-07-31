@@ -356,7 +356,7 @@ class GapSpeechActivityAnalyzer:
                 plan=plan,
             )
             detected = self.detector.detect(audio, sample_rate=plan.sample_rate)
-            normalized_regions = _validate_and_normalize_regions(
+            normalized_regions = validate_detected_speech_regions(
                 detected,
                 sample_rate=plan.sample_rate,
                 total_frames=plan.total_frames,
@@ -462,7 +462,7 @@ def _read_normalized_audio(path: Path, *, plan: NormalizedAudioPlan) -> np.ndarr
     return (samples.astype(np.float32) / 32768.0).copy()
 
 
-def _validate_and_normalize_regions(
+def validate_detected_speech_regions(
     regions: tuple[DetectedSpeechRegion, ...],
     *,
     sample_rate: int,

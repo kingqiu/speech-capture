@@ -115,6 +115,10 @@ class SpeechActivityDetectionFailed(WorkerCoreError):
     code = "SPEECH_ACTIVITY_DETECTION_FAILED"
 
 
+class VadEvaluationFailed(WorkerCoreError):
+    code = "VAD_EVALUATION_FAILED"
+
+
 class AsrAttemptConflict(WorkerCoreError):
     code = "ASR_ATTEMPT_CONFLICT"
 

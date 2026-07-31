@@ -646,6 +646,33 @@ VAD speech is not yet proof of `non_speech`, and VAD cannot by itself identify
 cannot leave a partial evidence report, and resource pressure safely pauses
 before the detector runs.
 
+### 12.11 Private VAD gold-set evaluation
+
+`speech-capture-vad-probe` evaluates the same revision-pinned detector against
+a local manifest stored under `test-data-private/`; its cache and report must
+remain inside the manifest directory. Each sample uses an opaque ID,
+a relative audio path, and ordered, non-overlapping millisecond ranges labeled
+only as `speech` or `non_speech`. Unlabeled time is excluded from scoring.
+
+The probe normalizes each source in memory to 16 kHz mono PCM, rejects path
+escape, symlinked audio, changed source bytes, excessive duration, out-of-bounds
+labels, and invalid detector regions. It reports duration-weighted:
+
+- speech recall and speech miss rate;
+- non-speech specificity and false-speech rate;
+- true-positive, false-negative, false-positive, and true-negative durations;
+- the number of samples containing any missed speech or false speech.
+
+No default quality thresholds are embedded. An acceptance result remains
+unapproved unless the owner supplies both rate limits and both minimum labeled
+durations. All four policy values are reported verbatim. Even a passing policy
+sets `automatic_materialization_authorized: false`; benchmark success does not
+silently create a production decision rule.
+
+The private report is written atomically with `0600` permissions. It contains
+source hashes and opaque IDs, not audio paths, filenames, transcript text, or
+model credentials.
+
 ## 13. Developer CLI
 
 From `services/speech-worker/`:
@@ -832,6 +859,11 @@ The Worker package currently tests:
 - current gap/alignment/normalized-audio evidence anchoring;
 - resource blocking before VAD model invocation and no model load for empty gaps;
 - explicit rejection of automatic materialization from either VAD observation.
+- strict private gold-manifest schema, path containment, and label validation;
+- duration-weighted VAD confusion metrics and aggregate/sample accounting;
+- all-or-none owner-supplied acceptance policy with no invented defaults;
+- path-free, transcript-free, `0600` atomic evaluation reports;
+- passing evaluation still cannot authorize stable timeline materialization.
 
 A separate CLI integration run advanced a job to `transcribing`, closed the store, recovered it to `queued`, and verified all seven events and database integrity.
 

@@ -173,6 +173,14 @@ For a small, high-value subset, create:
 
 The gold-standard directory is excluded from Git and cloud processing.
 
+For VAD candidate evaluation, the implemented private manifest uses opaque
+dataset/sample IDs, relative audio paths, and explicit `speech` or
+`non_speech` millisecond ranges. Unlabeled ranges are excluded. The evaluator
+rejects escaping/symlinked paths, overlapping or out-of-bounds labels, changed
+source bytes, invalid detector regions, and incomplete policy configuration.
+Its `0600` report contains hashes and metrics but no audio path, filename, or
+transcript.
+
 ### 5.2 Metrics
 
 Possible quantitative measurements:
@@ -185,6 +193,9 @@ Possible quantitative measurements:
 - evidence precision;
 - unsupported critical-claim count;
 - unresolved-range accuracy.
+- speech miss rate and speech recall;
+- false-speech rate and non-speech specificity;
+- labeled speech/non-speech duration and sample-level error incidence.
 
 Human review also scores usefulness, clarity, omission severity, and whether uncertainty is represented honestly.
 
@@ -201,6 +212,9 @@ A summary passes only when:
 - the note remains useful at normal reading length.
 
 Thresholds will be set from the first measured local baseline rather than invented before the models are evaluated.
+The VAD evaluator therefore accepts no default thresholds: all rate limits and
+minimum labeled-duration requirements must be supplied together by the owner,
+and even a passing benchmark does not authorize automatic materialization.
 
 ## 6. Fault-injection plan
 

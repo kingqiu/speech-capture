@@ -161,6 +161,54 @@ anchors. Both `speech_detected` and `no_speech_detected` explicitly carry
 `inaudible` segments. A cached Hugging Face authorization may be required to
 obtain the revision-pinned model.
 
+## Private VAD gold-set probe
+
+Copy
+[`examples/vad-gold-manifest.example.json`](examples/vad-gold-manifest.example.json)
+and the referenced local audio into a `test-data-private/` directory. That
+directory is ignored by Git, and the CLI refuses manifests outside it or
+cache/report paths outside the manifest directory. Use opaque dataset and sample IDs; labels accept
+only ordered, non-overlapping `speech` and `non_speech` ranges in milliseconds.
+Unlabeled ranges are excluded from scoring.
+
+Run a baseline without inventing acceptance thresholds:
+
+First accept the conditions on the
+[`pyannote/segmentation` model page](https://huggingface.co/pyannote/segmentation)
+and authenticate through the local Hugging Face credential store. Never put a
+token in the command line, manifest, or report. Resolve the accepted model's
+full commit SHA and pass that immutable value below; `main` is rejected.
+
+```bash
+uv sync --extra dev --extra diarization
+uv run speech-capture-vad-probe \
+  --manifest test-data-private/vad/manifest.json \
+  --model-revision aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  --cache-dir test-data-private/vad/model-cache \
+  --output test-data-private/vad/report.json
+```
+
+After the owner explicitly chooses a policy from measured baselines, all four
+policy options must be supplied together:
+
+```bash
+uv run speech-capture-vad-probe \
+  --manifest test-data-private/vad/manifest.json \
+  --model-revision aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  --cache-dir test-data-private/vad/model-cache \
+  --output test-data-private/vad/report.json \
+  --max-speech-miss-rate <OWNER_SELECTED_RATE> \
+  --max-false-speech-rate <OWNER_SELECTED_RATE> \
+  --minimum-speech-reference-ms <OWNER_SELECTED_DURATION_MS> \
+  --minimum-non-speech-reference-ms <OWNER_SELECTED_DURATION_MS>
+```
+
+The placeholders must be replaced with an explicitly reviewed policy; the
+project does not provide default values. Reports contain source hashes, opaque IDs, aggregate durations,
+and confusion metrics, but no audio path, filename, or transcript. They are
+atomically written with `0600` permissions. A passing report still has
+`automatic_materialization_authorized: false`.
+
 Upload completion requires FFprobe. The packaged Worker will own that dependency; during development it must be available on `PATH`.
 
 See [Persistent Worker core](../../docs/worker-core.md) for state, schema, recovery, resource rules, and current boundaries.
