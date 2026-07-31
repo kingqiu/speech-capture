@@ -119,6 +119,12 @@ uv run speech-capture-worker review-gap \
   --start-ms 12500 \
   --end-ms 13900 \
   --outcome non_speech
+
+uv sync --extra dev --extra diarization
+uv run speech-capture-worker analyze-speech-activity \
+  --data-dir runtime/dev-worker \
+  job_example \
+  --model-revision aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 ```
 
 `runtime/` is ignored by Git. The CLI requires an explicit data directory and does not create a global service installation.
@@ -145,6 +151,15 @@ The review key is an opaque idempotency key, not a reviewer identity. Only
 `non_speech` and `inaudible` are accepted; the command stores no free-form
 review text, rejects stale alignment reports or partial-range decisions, and
 refreshes alignment after materialization. This is not an automatic classifier.
+
+`analyze-speech-activity` is an evidence-only evaluation boundary. It requires
+the optional `diarization` dependency and a full commit SHA for
+`pyannote/segmentation`, runs a resource check before loading the model, and
+stores only detector identity, timing observations, and source-evidence
+anchors. Both `speech_detected` and `no_speech_detected` explicitly carry
+`materialization_authorized: false`; the command never inserts `non_speech` or
+`inaudible` segments. A cached Hugging Face authorization may be required to
+obtain the revision-pinned model.
 
 Upload completion requires FFprobe. The packaged Worker will own that dependency; during development it must be available on `PATH`.
 

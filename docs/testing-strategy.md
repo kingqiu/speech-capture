@@ -137,6 +137,11 @@ For each validated source:
 - reviewed `inaudible` accounts for time without claiming a complete transcript;
 - interruption after a reviewed segment commit is repaired without duplicating the segment;
 - routine review checkpoints and CLI output contain no transcript or free-form reviewer text.
+- speech-activity candidates are pinned to immutable model revisions and fixed configurations;
+- detector regions must be finite, ordered, non-overlapping, non-empty, and within normalized audio;
+- VAD observations are bound to current gap/alignment evidence and never materialize stable outcomes;
+- resource blocking occurs before VAD model invocation, and no-gap runs do not load the model;
+- `no_speech_detected` remains an evaluation observation, not proof of non-speech or inaudibility.
 
 The core automated assertion is:
 

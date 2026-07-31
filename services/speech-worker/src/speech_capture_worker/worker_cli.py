@@ -35,6 +35,10 @@ from speech_capture_worker.gap_analysis import (
     TranscriptGapAnalyzer,
 )
 from speech_capture_worker.gap_review import ReviewedGapMaterializer
+from speech_capture_worker.gap_speech_activity import (
+    GapSpeechActivityAnalyzer,
+    PyannoteVoiceActivityDetector,
+)
 from speech_capture_worker.job_store import JobStore
 from speech_capture_worker.resources import (
     check_resource_preflight,
@@ -354,6 +358,18 @@ def _build_parser() -> argparse.ArgumentParser:
             TranscriptOutcome.INAUDIBLE.value,
         ],
         required=True,
+    )
+
+    analyze_speech_activity = subparsers.add_parser(
+        "analyze-speech-activity",
+        help="Record revision-pinned VAD observations without materializing gap outcomes.",
+    )
+    _add_data_dir(analyze_speech_activity)
+    analyze_speech_activity.add_argument("job_id")
+    analyze_speech_activity.add_argument(
+        "--model-revision",
+        required=True,
+        help="Full lowercase commit SHA for pyannote/segmentation.",
     )
 
     list_asr_attempts = subparsers.add_parser(
@@ -682,6 +698,14 @@ def _dispatch(args: argparse.Namespace) -> int:
             )
             _write_json(result.to_dict())
             return 0
+        if args.command == "analyze-speech-activity":
+            detector = PyannoteVoiceActivityDetector(
+                model_revision=args.model_revision,
+                cache_dir=args.data_dir.resolve() / "models" / "pyannote",
+            )
+            result = GapSpeechActivityAnalyzer(store, detector).analyze(args.job_id)
+            _write_json(result.to_dict())
+            return 2 if result.outcome.value == "safe_paused" else 0
         if args.command == "list-asr-attempts":
             attempts = store.list_asr_attempts(
                 args.job_id,

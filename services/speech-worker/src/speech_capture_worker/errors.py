@@ -111,6 +111,10 @@ class NormalizedAudioInvalid(WorkerCoreError):
     code = "NORMALIZED_AUDIO_INVALID"
 
 
+class SpeechActivityDetectionFailed(WorkerCoreError):
+    code = "SPEECH_ACTIVITY_DETECTION_FAILED"
+
+
 class AsrAttemptConflict(WorkerCoreError):
     code = "ASR_ATTEMPT_CONFLICT"
 

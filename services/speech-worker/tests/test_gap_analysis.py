@@ -3,6 +3,7 @@ import io
 import json
 import shutil
 import wave
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -35,6 +36,7 @@ from speech_capture_worker.errors import (
     InvalidJobRequest,
     NormalizedAudioInvalid,
     TranscriptConflict,
+    WorkerCoreError,
 )
 from speech_capture_worker.gap_analysis import (
     GAP_ANALYSIS_CHECKPOINT_KEY,
@@ -49,6 +51,15 @@ from speech_capture_worker.gap_review import (
     GAP_REVIEW_SCHEMA_VERSION,
     GapReviewResultOutcome,
     ReviewedGapMaterializer,
+)
+from speech_capture_worker.gap_speech_activity import (
+    SPEECH_ACTIVITY_CHECKPOINT_KEY,
+    DetectedSpeechRegion,
+    GapSpeechActivityAnalyzer,
+    GapSpeechActivityOutcome,
+    PyannoteVoiceActivityDetector,
+    SpeechActivityDetectorIdentity,
+    SpeechActivityObservation,
 )
 from speech_capture_worker.job_store import JobStore
 from speech_capture_worker.media_probe import MediaProbeResult
@@ -134,6 +145,27 @@ class FakeGapEngine:
             "finish_reason": "stop",
             "truncated": False,
         }
+
+
+class FakeSpeechActivityDetector:
+    identity = SpeechActivityDetectorIdentity(
+        detector_id="fixture_vad",
+        detector_version="1.0.0",
+        model_id="fixture/speech-detector",
+        model_revision="fixture-revision-1",
+        configuration_id="fixture-default-v1",
+    )
+
+    def __init__(self, regions=()):
+        self.regions = tuple(regions)
+        self.calls = 0
+
+    def detect(self, audio, *, sample_rate):
+        self.calls += 1
+        assert audio.dtype == np.float32
+        assert audio.ndim == 1
+        assert sample_rate == 16_000
+        return self.regions
 
 
 def create_aligning_job(
@@ -1035,3 +1067,221 @@ def test_cli_materializes_explicit_review_without_exposing_text(
     assert payload["segment"]["outcome"] == "non_speech"
     assert payload["alignment"]["report"]["unresolved_ranges"] == []
     assert "private transcript" not in json.dumps(payload)
+
+
+def test_vad_evidence_is_anchored_and_never_materializes_gap_outcomes(tmp_path) -> None:
+    detector = FakeSpeechActivityDetector(
+        [DetectedSpeechRegion(start_seconds=0.8, end_seconds=0.9)]
+    )
+    with JobStore(
+        tmp_path / "worker.sqlite3",
+        source_probe=source_probe,
+    ) as store:
+        job, _ = create_aligning_job(
+            store,
+            ranges=[(0, 50), (500, 1000)],
+        )
+        result = GapSpeechActivityAnalyzer(
+            store,
+            detector,
+            boundary_preflight=lambda *_, **__: ready_preflight(),
+        ).analyze(job.job_id)
+        checkpoints = store.list_checkpoints(job.job_id, stage="aligning")
+        snapshot = store.get_job_snapshot(job.job_id)
+
+    assert result.outcome is GapSpeechActivityOutcome.EVIDENCE_RECORDED
+    assert result.report is not None
+    assert result.report.automatic_materialization_authorized is False
+    assert result.report.evaluated_gap_count == 2
+    assert result.report.no_speech_detected_count == 1
+    assert result.report.speech_detected_count == 1
+    assert result.report.evidence[0].observation is SpeechActivityObservation.NO_SPEECH_DETECTED
+    assert result.report.evidence[0].materialization_authorized is False
+    assert result.report.evidence[1].observation is SpeechActivityObservation.SPEECH_DETECTED
+    assert result.report.evidence[1].speech_duration_ms == 100
+    assert result.report.evidence[1].speech_ratio == 0.2
+    assert result.report.evidence[1].speech_regions[0].start_ms == 800
+    assert result.report.evidence[1].speech_regions[0].end_ms == 900
+    assert detector.calls == 1
+    assert snapshot.stable_segments == []
+    assert snapshot.job.state is JobState.ALIGNING
+    checkpoint = next(
+        value
+        for value in checkpoints
+        if value.checkpoint_key == SPEECH_ACTIVITY_CHECKPOINT_KEY
+    )
+    assert checkpoint.payload == result.report.to_dict()
+    assert checkpoint.payload["gap_analysis_generation"] >= 1
+    assert len(checkpoint.payload["gap_analysis_sha256"]) == 64
+
+
+def test_vad_evidence_skips_model_when_no_unresolved_ranges(tmp_path) -> None:
+    detector = FakeSpeechActivityDetector()
+    with JobStore(
+        tmp_path / "worker.sqlite3",
+        source_probe=source_probe,
+    ) as store:
+        job, _ = create_aligning_job(store, ranges=[])
+        result = GapSpeechActivityAnalyzer(
+            store,
+            detector,
+            boundary_preflight=lambda *_, **__: pytest.fail("preflight should not run"),
+        ).analyze(job.job_id)
+
+    assert result.outcome is GapSpeechActivityOutcome.NO_UNRESOLVED_RANGES
+    assert result.report is not None
+    assert result.report.evidence == ()
+    assert result.resource_report is None
+    assert detector.calls == 0
+
+
+def test_vad_evidence_rejects_invalid_or_overlapping_detector_regions(tmp_path) -> None:
+    detector = FakeSpeechActivityDetector(
+        [
+            DetectedSpeechRegion(start_seconds=0.2, end_seconds=0.5),
+            DetectedSpeechRegion(start_seconds=0.4, end_seconds=0.6),
+        ]
+    )
+    with JobStore(
+        tmp_path / "worker.sqlite3",
+        source_probe=source_probe,
+    ) as store:
+        job, _ = create_aligning_job(store, ranges=[(0, 1000)])
+        with pytest.raises(WorkerCoreError) as raised:
+            GapSpeechActivityAnalyzer(
+                store,
+                detector,
+                boundary_preflight=lambda *_, **__: ready_preflight(),
+            ).analyze(job.job_id)
+        checkpoints = store.list_checkpoints(job.job_id, stage="aligning")
+
+    assert raised.value.code == "SPEECH_ACTIVITY_DETECTION_FAILED"
+    assert all(
+        value.checkpoint_key != SPEECH_ACTIVITY_CHECKPOINT_KEY for value in checkpoints
+    )
+
+
+def test_vad_evidence_safe_pauses_before_model_when_resources_are_blocked(tmp_path) -> None:
+    detector = FakeSpeechActivityDetector()
+    blocked_report = ResourceReport(
+        status=ResourceStatus.BLOCKED,
+        estimated_required_bytes=2 * GIB,
+        disk_reserve_bytes=20 * GIB,
+        disk_free_after_bytes=10 * GIB,
+        disk=DiskSnapshot(total_bytes=256 * GIB, free_bytes=12 * GIB),
+        memory=MemorySnapshot(
+            total_bytes=32 * GIB,
+            available_bytes=1 * GIB,
+            used_percent=97,
+            swap_used_bytes=5 * GIB,
+        ),
+        issues=(),
+    )
+    with JobStore(
+        tmp_path / "worker.sqlite3",
+        source_probe=source_probe,
+    ) as store:
+        job, _ = create_aligning_job(store, ranges=[(0, 1000)])
+        result = GapSpeechActivityAnalyzer(
+            store,
+            detector,
+            boundary_preflight=lambda *_, **__: blocked_report,
+        ).analyze(job.job_id)
+        checkpoints = store.list_checkpoints(job.job_id, stage="aligning")
+
+    assert result.outcome is GapSpeechActivityOutcome.SAFE_PAUSED
+    assert result.report is None
+    assert result.resource_report is blocked_report
+    assert detector.calls == 0
+    assert all(
+        value.checkpoint_key != SPEECH_ACTIVITY_CHECKPOINT_KEY for value in checkpoints
+    )
+    assert any(
+        value.checkpoint_key == "gap_speech_activity_resource_boundary"
+        for value in checkpoints
+    )
+
+
+def test_vad_evidence_rejects_audio_changed_during_model_inference(tmp_path) -> None:
+    class MutatingDetector(FakeSpeechActivityDetector):
+        def __init__(self, normalized_path):
+            super().__init__()
+            self.normalized_path = normalized_path
+
+        def detect(self, audio, *, sample_rate):
+            content = bytearray(self.normalized_path.read_bytes())
+            content[-1] ^= 1
+            self.normalized_path.write_bytes(content)
+            return super().detect(audio, sample_rate=sample_rate)
+
+    with JobStore(
+        tmp_path / "worker.sqlite3",
+        source_probe=source_probe,
+    ) as store:
+        job, normalized_path = create_aligning_job(store, ranges=[(500, 1000)])
+        detector = MutatingDetector(normalized_path)
+        with pytest.raises(NormalizedAudioInvalid):
+            GapSpeechActivityAnalyzer(
+                store,
+                detector,
+                boundary_preflight=lambda *_, **__: ready_preflight(),
+            ).analyze(job.job_id)
+        checkpoints = store.list_checkpoints(job.job_id, stage="aligning")
+
+    assert detector.calls == 1
+    assert all(
+        value.checkpoint_key != SPEECH_ACTIVITY_CHECKPOINT_KEY for value in checkpoints
+    )
+
+
+def test_pyannote_vad_requires_revision_pinning_and_normalizes_timeline() -> None:
+    with pytest.raises(InvalidJobRequest):
+        PyannoteVoiceActivityDetector(
+            model_revision="main",
+            cache_dir=Path("unused"),
+        )
+
+    class Segment:
+        start = 0.1
+        end = 0.2
+
+    class Timeline:
+        def support(self):
+            return [Segment()]
+
+    class Annotation:
+        def get_timeline(self):
+            return Timeline()
+
+    class Pipeline:
+        def __call__(self, value):
+            assert value["waveform"].shape == (1, 16_000)
+            assert value["sample_rate"] == 16_000
+            return Annotation()
+
+    detector = PyannoteVoiceActivityDetector(
+        model_revision="a" * 40,
+        cache_dir=Path("unused"),
+        pipeline_factory=Pipeline,
+    )
+    result = detector.detect(np.zeros(16_000, dtype=np.float32), sample_rate=16_000)
+
+    assert result == (DetectedSpeechRegion(start_seconds=0.1, end_seconds=0.2),)
+
+
+def test_cli_rejects_unpinned_vad_model_revision(tmp_path, capsys) -> None:
+    exit_code = main(
+        [
+            "analyze-speech-activity",
+            "--data-dir",
+            str(tmp_path / "runtime"),
+            "job_missing",
+            "--model-revision",
+            "main",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().err)
+
+    assert exit_code == 2
+    assert payload["error"]["code"] == "INVALID_JOB_REQUEST"
+    assert "revision" in payload["error"]["message"]

@@ -620,6 +620,32 @@ changed `aligned` flag without evidence, missing evidence, or later checksum
 failure produces `MISSING_FORCED_ALIGNMENT_EVIDENCE` and cannot pass the
 diarization gate.
 
+### 12.10 Revision-pinned speech-activity evaluation evidence
+
+`analyze-speech-activity` provides an evidence-only boundary for evaluating
+audible unresolved ranges with `pyannote.audio`. It deliberately does not
+implement automatic gap classification.
+
+The command:
+
+1. reruns conservative gap analysis and selects only ranges still marked
+   `unresolved`;
+2. requires a full immutable commit SHA for `pyannote/segmentation`;
+3. records the pyannote runtime version and fixed DIHARD3 VAD configuration;
+4. runs a fresh resource boundary check before loading or invoking the model;
+5. validates that every returned speech region is finite, ordered,
+   non-overlapping, non-empty, and inside the normalized audio;
+6. intersects speech regions with exact current gap PCM ranges;
+7. persists timing-only observations bound to the gap report, alignment report,
+   and normalized-audio checksum.
+
+The report distinguishes `speech_detected` from `no_speech_detected`, but both
+the report and every range state `materialization_authorized: false`. Absence of
+VAD speech is not yet proof of `non_speech`, and VAD cannot by itself identify
+`inaudible`. No stable transcript segment or job state changes. Model failure
+cannot leave a partial evidence report, and resource pressure safely pauses
+before the detector runs.
+
 ## 13. Developer CLI
 
 From `services/speech-worker/`:
@@ -695,6 +721,11 @@ uv run speech-capture-worker review-gap \
   --start-ms 12500 \
   --end-ms 13900 \
   --outcome inaudible
+
+uv run speech-capture-worker analyze-speech-activity \
+  --data-dir runtime/dev-worker \
+  job_example \
+  --model-revision aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 
 uv run speech-capture-worker materialize-silence \
   --data-dir runtime/dev-worker \
@@ -796,6 +827,11 @@ The Worker package currently tests:
 - immutable review-key behavior for range and outcome decisions;
 - reviewed `inaudible` timeline accounting without a false complete result;
 - reviewed-segment interruption repair and machine-readable `review-gap` output.
+- immutable VAD model revision and fixed-configuration identity;
+- finite, ordered, non-overlapping, in-bounds VAD region validation;
+- current gap/alignment/normalized-audio evidence anchoring;
+- resource blocking before VAD model invocation and no model load for empty gaps;
+- explicit rejection of automatic materialization from either VAD observation.
 
 A separate CLI integration run advanced a job to `transcribing`, closed the store, recovered it to `queued`, and verified all seven events and database integrity.
 
@@ -807,7 +843,7 @@ The scheduler integration continued that source into a bound revision-three queu
 
 The next layer will add:
 
-1. evaluate and validate an automatic classifier for remaining audible or uncertain non-speech and inaudible gaps without relying on amplitude or empty ASR alone;
+1. run the revision-pinned VAD candidate against private labeled samples and measure false speech negatives and non-speech false positives before defining any automatic rule;
 2. integrate pyannote diarization and anonymous speaker attribution;
 3. run a continuous restart-safe stage loop rather than one backend command per chunk;
 4. add content detection, hierarchical extraction, and evidence validation;

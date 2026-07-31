@@ -250,6 +250,20 @@ Whole-transcript finalization revalidates the private file; a manual `aligned`
 flag without matching evidence, or later evidence tampering, blocks
 diarization.
 
+### 7.7 Evidence-only speech-activity evaluation
+
+The developer boundary can run a revision-pinned `pyannote/segmentation` VAD
+candidate over the normalized audio and persist timing-only observations for
+the exact ranges that remain unresolved.
+
+The report binds detector and model versions to the current gap checkpoint,
+alignment checkpoint, and normalized-audio checksum. Returned regions must be
+finite, ordered, non-overlapping, and in bounds. Resource blocking happens
+before model work. The result never changes stable transcript outcomes or job
+state, and `no_speech_detected` is explicitly not treated as proof of
+`non_speech` or `inaudible`. Automatic materialization remains disabled until a
+representative labeled evaluation establishes an accepted decision policy.
+
 ## 8. Job snapshot
 
 The implemented core snapshot is an internally consistent, bounded read containing:
