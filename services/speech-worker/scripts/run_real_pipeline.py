@@ -34,6 +34,7 @@ from speech_capture_worker.diarization_execution import (
 from speech_capture_worker.domain import (
     JobState,
     UploadCreateRequest,
+    UploadState,
 )
 from speech_capture_worker.job_store import JobStore
 from speech_capture_worker.scheduler import JobScheduler, SchedulerOutcome
@@ -67,13 +68,20 @@ def _ensure_upload_and_job(
         ),
         idempotency_key=f"real-{checksum[:16]}-upload",
     )
-    store.put_upload_part(
-        upload.upload_id,
-        part_number=1,
-        content=content,
-        part_sha256=checksum,
-    )
-    store.complete_upload(upload.upload_id)
+    if upload.state is UploadState.UPLOADING:
+        chunk_size = 64 * 1024 * 1024
+        for part_number, start in enumerate(
+            range(0, len(content), chunk_size),
+            start=1,
+        ):
+            part = content[start : start + chunk_size]
+            store.put_upload_part(
+                upload.upload_id,
+                part_number=part_number,
+                content=part,
+                part_sha256=hashlib.sha256(part).hexdigest(),
+            )
+        store.complete_upload(upload.upload_id)
     queued, _ = store.create_job_from_upload(
         upload.upload_id,
         idempotency_key=f"real-{checksum[:16]}-job",
