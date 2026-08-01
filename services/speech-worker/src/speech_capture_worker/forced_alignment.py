@@ -82,20 +82,23 @@ class MlxQwenForcedAlignmentEngine:
         text: str,
         language: str,
     ) -> list[dict[str, Any]]:
-        if sample_rate != 16_000:
-            raise ForcedAlignmentFailed("The forced aligner requires 16 kHz normalized audio.")
         if self._aligner is None:
             from mlx_qwen3_asr import ForcedAligner
 
             self._aligner = ForcedAligner(model_path=self.model_id)
-        return [
+        normalized_audio = _prepare_aligner_audio(audio, sample_rate=sample_rate)
+        words = [
             asdict(word)
             for word in self._aligner.align(
-                audio,
+                normalized_audio,
                 text,
                 language,
             )
         ]
+        return _clamp_alignment_words(
+            words,
+            duration_seconds=normalized_audio.size / sample_rate,
+        )
 
 
 class ForcedAlignmentOutcome(StrEnum):
@@ -649,6 +652,44 @@ def _read_segment_audio(
     if samples.size != end_frame - start_frame:
         raise NormalizedAudioInvalid("Normalized audio ended during forced alignment.")
     return samples, start_frame, end_frame
+
+
+def _prepare_aligner_audio(audio: np.ndarray, *, sample_rate: int) -> np.ndarray:
+    if sample_rate != 16_000:
+        raise ForcedAlignmentFailed("The forced aligner requires 16 kHz normalized audio.")
+    if audio.ndim != 1 or audio.size == 0:
+        raise ForcedAlignmentFailed("The forced aligner received invalid audio.")
+    if audio.dtype == np.int16:
+        return (audio.astype(np.float32) / 32768.0).copy()
+    if audio.dtype != np.float32:
+        raise ForcedAlignmentFailed("The forced aligner requires int16 or float32 audio.")
+    return audio
+
+
+def _clamp_alignment_words(
+    words: list[dict[str, Any]],
+    *,
+    duration_seconds: float,
+) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for word in words:
+        try:
+            start_time = float(word["start_time"])
+            end_time = float(word["end_time"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ForcedAlignmentFailed(
+                "The forced aligner returned invalid timing metadata."
+            ) from exc
+        start_time = max(0.0, min(start_time, duration_seconds))
+        end_time = max(start_time, min(end_time, duration_seconds))
+        normalized.append(
+            {
+                "text": word["text"],
+                "start_time": round(start_time, 6),
+                "end_time": round(end_time, 6),
+            }
+        )
+    return normalized
 
 
 def _validate_alignment_words(

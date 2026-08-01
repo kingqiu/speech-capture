@@ -22,6 +22,8 @@ from speech_capture_worker.errors import (
 from speech_capture_worker.forced_alignment import (
     ForcedAlignmentExecutor,
     ForcedAlignmentOutcome,
+    _clamp_alignment_words,
+    _prepare_aligner_audio,
 )
 from speech_capture_worker.job_store import JobStore
 from speech_capture_worker.media_probe import MediaProbeResult
@@ -37,6 +39,30 @@ from speech_capture_worker.transcript import (
     TranscriptTimingStatus,
 )
 from speech_capture_worker.worker_cli import main
+
+
+def test_prepare_aligner_audio_normalizes_int16_to_float32() -> None:
+    raw = np.array([0, 16384, -32768, 32767], dtype=np.int16)
+
+    prepared = _prepare_aligner_audio(raw, sample_rate=16_000)
+
+    assert prepared.dtype == np.float32
+    np.testing.assert_allclose(prepared, raw.astype(np.float32) / 32768.0)
+    with pytest.raises(ForcedAlignmentFailed):
+        _prepare_aligner_audio(raw, sample_rate=8_000)
+
+
+def test_clamp_alignment_words_bounds_timing_to_segment() -> None:
+    words = [
+        {"text": "个", "start_time": 0.0, "end_time": 0.0},
+        {"text": "啊", "start_time": 1.76, "end_time": 2.0},
+    ]
+
+    clamped = _clamp_alignment_words(words, duration_seconds=1.84)
+
+    assert clamped[0]["end_time"] == 0.0
+    assert clamped[1]["start_time"] == 1.76
+    assert clamped[1]["end_time"] == 1.84
 
 
 def wav_bytes(*, duration_seconds: float) -> bytes:
