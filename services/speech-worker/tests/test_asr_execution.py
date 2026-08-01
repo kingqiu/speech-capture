@@ -10,8 +10,16 @@ import numpy as np
 import pytest
 
 from speech_capture_worker.asr_domain import AsrAttemptState
-from speech_capture_worker.asr_execution import AsrChunkExecutor, AsrRunOutcome
-from speech_capture_worker.audio_preprocessing import AudioPreprocessor
+from speech_capture_worker.asr_execution import (
+    AsrChunkExecutor,
+    AsrRunOutcome,
+    _result_segments,
+    _validate_raw_result,
+)
+from speech_capture_worker.audio_preprocessing import (
+    AudioChunkPlan,
+    AudioPreprocessor,
+)
 from speech_capture_worker.domain import JobState, ResourceStatus, UploadCreateRequest
 from speech_capture_worker.errors import (
     AsrAttemptConflict,
@@ -389,6 +397,88 @@ def test_boundary_resource_block_safely_pauses_before_model_call(tmp_path) -> No
     assert result.job.state is JobState.PAUSED
     assert result.job.last_error_code == "RESOURCE_BOUNDARY_BLOCKED"
     assert engine.calls == 0
+
+
+def test_zero_duration_timestamp_segments_are_merged_without_losing_text() -> None:
+    chunk = AudioChunkPlan(
+        chunk_index=0,
+        start_frame=0,
+        end_frame=80_000,
+        start_ms=0,
+        end_ms=5000,
+    )
+    payload = {
+        "text": "甲乙丙丁",
+        "language": "Chinese",
+        "segments": [
+            {"text": "甲", "start": 0.0, "end": 1.0},
+            {"text": "乙", "start": 1.0, "end": 1.0},
+            {"text": "丙", "start": 1.0, "end": 2.0},
+            {"text": "丁", "start": 4.0, "end": 5.0},
+        ],
+    }
+
+    issues = _validate_raw_result(payload, chunk=chunk)
+    segments = _result_segments(payload, chunk=chunk, source_duration_ms=5000)
+
+    assert not any(
+        issue.code in {"INVALID_TIMESTAMP_RANGE", "REVERSED_TIMESTAMP"}
+        for issue in issues
+    )
+    assert [item["text"] for item in segments] == ["甲乙丙", "丁"]
+    assert all(item["end_ms"] > item["start_ms"] for item in segments)
+    assert (segments[0]["start_ms"], segments[0]["end_ms"]) == (0, 2000)
+    assert (segments[1]["start_ms"], segments[1]["end_ms"]) == (4000, 5000)
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")
+def test_executor_materializes_zero_duration_timestamp_segments(tmp_path) -> None:
+    class ZeroDurationEngine(FakeEngine):
+        def transcribe(self, audio, *, sample_rate, language_hint, context):
+            duration = len(audio) / sample_rate
+            return {
+                "text": "甲乙丙",
+                "language": "Chinese",
+                "segments": [
+                    {"text": "甲", "start": 0.0, "end": 1.0},
+                    {"text": "乙", "start": 1.0, "end": 1.0},
+                    {"text": "丙", "start": 1.0, "end": duration},
+                ],
+                "chunks": [
+                    {
+                        "text": "甲乙丙",
+                        "start": 0.0,
+                        "end": duration,
+                        "chunk_index": 0,
+                        "finish_reason": "stop",
+                        "truncated": False,
+                    }
+                ],
+                "finish_reason": "stop",
+                "truncated": False,
+            }
+
+    with JobStore(
+        tmp_path / "worker.sqlite3",
+        source_probe=source_probe_for(2),
+    ) as store:
+        job = create_preprocessing_job(
+            store,
+            duration_seconds=2,
+            suffix="zero-duration",
+        )
+        result = AsrChunkExecutor(
+            store,
+            ZeroDurationEngine(),
+            boundary_preflight=preflight(),
+        ).run_next(job.job_id)
+        snapshot = store.get_job_snapshot(job.job_id)
+
+    assert result.outcome is AsrRunOutcome.TRANSCRIPTION_COMPLETED
+    assert "".join(segment.text or "" for segment in snapshot.stable_segments) == "甲乙丙"
+    assert all(
+        segment.end_ms > segment.start_ms for segment in snapshot.stable_segments
+    )
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")

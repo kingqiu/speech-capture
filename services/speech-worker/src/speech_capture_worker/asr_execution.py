@@ -727,11 +727,11 @@ def _validate_raw_result(
         try:
             start_seconds = float(segment["start"])
             end_seconds = float(segment["end"])
-            if end_seconds <= start_seconds:
+            if end_seconds < start_seconds:
                 issues.append(
                     CoverageIssue(
                         code="INVALID_TIMESTAMP_RANGE",
-                        message=f"Timestamp segment {index} has no positive duration.",
+                        message=f"Timestamp segment {index} ends before it starts.",
                     )
                 )
             if start_seconds < timestamp_cursor:
@@ -765,22 +765,85 @@ def _result_segments(
                 "timing_status": TranscriptTimingStatus.ESTIMATED,
             }
         ]
-    return [
-        {
-            "start_ms": min(
-                chunk.start_ms + round(float(segment["start"]) * 1000),
-                source_duration_ms - 1,
-            ),
-            "end_ms": min(
-                chunk.start_ms + round(float(segment["end"]) * 1000),
-                source_duration_ms,
-            ),
-            "text": str(segment["text"]).strip(),
-            "language": language,
-            "timing_status": TranscriptTimingStatus.ALIGNED,
-        }
-        for segment in raw_segments
-    ]
+    normalized_raw: list[tuple[float, float, str]] = []
+    for raw_segment in raw_segments:
+        try:
+            start_seconds = float(raw_segment["start"])
+            end_seconds = float(raw_segment["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        text = str(raw_segment.get("text", "")).strip()
+        if text:
+            normalized_raw.append((start_seconds, end_seconds, text))
+    if not normalized_raw:
+        return [
+            {
+                "start_ms": chunk.start_ms,
+                "end_ms": min(chunk.end_ms, source_duration_ms),
+                "text": str(payload.get("text", "")).strip(),
+                "language": language,
+                "timing_status": TranscriptTimingStatus.ESTIMATED,
+            }
+        ]
+
+    merged: list[dict[str, Any]] = []
+    buffer_text: list[str] = []
+    buffer_start_ms: int | None = None
+    buffer_end_ms: int | None = None
+    for index, (start_seconds, end_seconds, text) in enumerate(normalized_raw):
+        start_ms = chunk.start_ms + round(start_seconds * 1000)
+        end_ms = chunk.start_ms + round(end_seconds * 1000)
+        if buffer_start_ms is None:
+            buffer_start_ms = start_ms
+        if end_ms > start_ms:
+            buffer_end_ms = end_ms
+        buffer_text.append(text)
+        next_start_seconds = (
+            normalized_raw[index + 1][0] if index + 1 < len(normalized_raw) else None
+        )
+        next_gap_ms = (
+            chunk.start_ms + round(next_start_seconds * 1000) - (buffer_end_ms or start_ms)
+            if next_start_seconds is not None and buffer_end_ms is not None
+            else 0
+        )
+        buffer_chars = sum(len(value) for value in buffer_text)
+        should_close = (
+            index + 1 == len(normalized_raw)
+            or buffer_chars >= 160
+            or next_gap_ms > 1500
+            or text.endswith(("。", "！", "？", "…", "；", ";"))
+        )
+        if should_close:
+            merged.append(
+                {
+                    "start_ms": buffer_start_ms,
+                    "end_ms": buffer_end_ms if buffer_end_ms is not None else buffer_start_ms + 1,
+                    "text": "".join(buffer_text),
+                    "language": language,
+                    "timing_status": TranscriptTimingStatus.ALIGNED,
+                }
+            )
+            buffer_text = []
+            buffer_start_ms = None
+            buffer_end_ms = None
+    if buffer_text:
+        if merged:
+            merged[-1]["text"] += "".join(buffer_text)
+        else:
+            return [
+                {
+                    "start_ms": chunk.start_ms,
+                    "end_ms": min(chunk.end_ms, source_duration_ms),
+                    "text": str(payload.get("text", "")).strip(),
+                    "language": language,
+                    "timing_status": TranscriptTimingStatus.ESTIMATED,
+                }
+            ]
+    for item in merged:
+        item["start_ms"] = min(item["start_ms"], source_duration_ms - 1)
+        item["end_ms"] = max(item["end_ms"], item["start_ms"] + 1)
+        item["end_ms"] = min(item["end_ms"], source_duration_ms)
+    return merged
 
 
 def _attempt_key(chunk_index: int, attempt_number: int) -> str:
