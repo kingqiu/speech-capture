@@ -40,6 +40,7 @@ from speech_capture_worker.errors import (
     GapRetranscriptionFailed,
     InvalidJobRequest,
     NormalizedAudioInvalid,
+    TranscriptConflict,
     UploadStorageError,
 )
 from speech_capture_worker.gap_speech_activity import (
@@ -48,11 +49,6 @@ from speech_capture_worker.gap_speech_activity import (
 )
 from speech_capture_worker.job_store import JobStore
 from speech_capture_worker.resources import GIB, ResourceReport, check_resource_preflight
-from speech_capture_worker.transcript import (
-    SpeakerLabelStatus,
-    TranscriptOutcome,
-    TranscriptTimingStatus,
-)
 
 GAP_RETRANSCRIPTION_SCHEMA_VERSION = "1.0.0"
 GAP_RETRANSCRIPTION_RAW_SCHEMA_VERSION = "1.0.0"
@@ -189,6 +185,23 @@ class GapRetranscriptionExecutor:
             if isinstance(evidence, dict)
             and evidence.get("observation") == SpeechActivityObservation.SPEECH_DETECTED.value
         ]
+        unresolved_ranges = alignment_checkpoint.payload.get("unresolved_ranges") or []
+        resolved_gaps: list[dict[str, int]] = []
+        for gap in gaps:
+            match = next(
+                (
+                    item
+                    for item in unresolved_ranges
+                    if gap["start_ms"] < item["end_ms"]
+                    and item["start_ms"] < gap["end_ms"]
+                ),
+                None,
+            )
+            if match is not None:
+                resolved_gaps.append(
+                    {"start_ms": match["start_ms"], "end_ms": match["end_ms"]}
+                )
+        gaps = resolved_gaps
         gaps.sort(key=lambda item: (item["start_ms"], item["end_ms"]))
         if not gaps:
             alignment = self.finalizer.finalize(job_id)
@@ -323,45 +336,61 @@ class GapRetranscriptionExecutor:
                         raw_sha256=raw_sha256,
                         raw_bytes=raw_bytes,
                     )
-                    for segment_index, item in enumerate(segments):
-                        segment, _ = self.store.commit_transcript_segment(
+                    try:
+                        for segment_index, item in enumerate(segments):
+                            segment, _ = self.store.commit_gap_retranscription_segment(
+                                job_id,
+                                commit_key=(
+                                    f"gap_{start_ms:010d}_{end_ms:010d}"
+                                    f"_segment_{segment_index:04d}"
+                                ),
+                                start_ms=item["start_ms"],
+                                end_ms=item["end_ms"],
+                                text=item["text"],
+                                language=item["language"],
+                                confidence=item.get("confidence"),
+                                raw_sha256=raw_sha256,
+                                raw_relative_path=raw_relative_path,
+                            )
+                            segment_ids.append(segment.segment_id)
+                            segment_commit_keys.append(segment.commit_key)
+                            added_segments += 1
+                        self.store.put_checkpoint(
                             job_id,
-                            commit_key=(
-                                f"gap_{start_ms:010d}_{end_ms:010d}"
-                                f"_segment_{segment_index:04d}"
-                            ),
-                            start_ms=item["start_ms"],
-                            end_ms=item["end_ms"],
-                            outcome=TranscriptOutcome.TRANSCRIBED,
-                            text=item["text"],
-                            language=item["language"],
-                            timing_status=TranscriptTimingStatus.ALIGNED,
-                            speaker_label_status=SpeakerLabelStatus.PENDING,
-                            allow_aligning=True,
+                            stage=ALIGNMENT_STAGE,
+                            checkpoint_key=self._evidence_key(start_ms, end_ms),
+                            payload={
+                                "schema_version": GAP_RETRANSCRIPTION_SCHEMA_VERSION,
+                                "alignment_report_generation": alignment_checkpoint.generation,
+                                "alignment_report_sha256": alignment_checkpoint.payload_sha256,
+                                "model_id": self.engine.model_id,
+                                "normalized_sha256": plan.normalized_sha256,
+                                "start_ms": start_ms,
+                                "end_ms": end_ms,
+                                "raw_relative_path": raw_relative_path,
+                                "raw_sha256": raw_sha256,
+                                "segment_ids": segment_ids,
+                                "segment_commit_keys": segment_commit_keys,
+                                "elapsed_seconds": round(elapsed_seconds, 6),
+                            },
                         )
-                        segment_ids.append(segment.segment_id)
-                        segment_commit_keys.append(segment.commit_key)
-                        added_segments += 1
-                    self.store.put_checkpoint(
-                        job_id,
-                        stage=ALIGNMENT_STAGE,
-                        checkpoint_key=self._evidence_key(start_ms, end_ms),
-                        payload={
-                            "schema_version": GAP_RETRANSCRIPTION_SCHEMA_VERSION,
-                            "alignment_report_generation": alignment_checkpoint.generation,
-                            "alignment_report_sha256": alignment_checkpoint.payload_sha256,
-                            "model_id": self.engine.model_id,
-                            "normalized_sha256": plan.normalized_sha256,
-                            "start_ms": start_ms,
-                            "end_ms": end_ms,
-                            "raw_relative_path": raw_relative_path,
-                            "raw_sha256": raw_sha256,
-                            "segment_ids": segment_ids,
-                            "segment_commit_keys": segment_commit_keys,
-                            "elapsed_seconds": round(elapsed_seconds, 6),
-                        },
-                    )
-                    retranscribed += 1
+                        retranscribed += 1
+                    except TranscriptConflict:
+                        self.store.put_checkpoint(
+                            job_id,
+                            stage=ALIGNMENT_STAGE,
+                            checkpoint_key=(
+                                f"gap_retranscription_failed_{start_ms:010d}_{end_ms:010d}"
+                            ),
+                            payload={
+                                "schema_version": GAP_RETRANSCRIPTION_SCHEMA_VERSION,
+                                "start_ms": start_ms,
+                                "end_ms": end_ms,
+                                "attempt_count": attempt,
+                                "last_error_code": "TRANSCRIPT_COMMIT_CONFLICT",
+                            },
+                        )
+                        failed += 1
                     break
                 if attempt >= self._max_attempts:
                     self.store.put_checkpoint(

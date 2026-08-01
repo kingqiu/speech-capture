@@ -211,9 +211,9 @@ def write_speech_evidence(store: JobStore, job_id: str) -> None:
             "automatic_materialization_authorized": False,
             "evidence": [
                 {
-                    "start_ms": 500,
-                    "end_ms": 1000,
-                    "duration_ms": 500,
+                    "start_ms": 480,
+                    "end_ms": 1020,
+                    "duration_ms": 540,
                     "speech_duration_ms": 500,
                     "speech_ratio": 1.0,
                     "observation": "speech_detected",

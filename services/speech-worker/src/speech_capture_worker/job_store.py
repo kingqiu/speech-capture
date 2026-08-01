@@ -1399,6 +1399,164 @@ class JobStore:
             row = self._fetch_transcript_segment_row(job_id, segment_id)
             return self._row_to_transcript_segment(row), True
 
+    def commit_gap_retranscription_segment(
+        self,
+        job_id: str,
+        *,
+        commit_key: str,
+        start_ms: int,
+        end_ms: int,
+        text: str,
+        language: str | None,
+        confidence: float | None,
+        raw_sha256: str,
+        raw_relative_path: str,
+    ) -> tuple[TranscriptSegment, bool]:
+        """Insert one gap re-transcription outcome into the stable timeline."""
+
+        validate_commit_key(commit_key)
+        validate_language(language)
+        validate_confidence(confidence)
+        validate_transcript_text(text)
+        if not isinstance(raw_sha256, str) or not SHA256_PATTERN.fullmatch(raw_sha256):
+            raise InvalidJobRequest("Gap re-transcription raw_sha256 is invalid.")
+        if (
+            not isinstance(raw_relative_path, str)
+            or not raw_relative_path
+            or len(raw_relative_path) > 500
+        ):
+            raise InvalidJobRequest("Gap re-transcription raw path is invalid.")
+
+        request_payload = {
+            "commit_key": commit_key,
+            "start_ms": start_ms,
+            "end_ms": end_ms,
+            "outcome": TranscriptOutcome.TRANSCRIBED.value,
+            "text": text,
+            "language": language,
+            "confidence": float(confidence) if confidence is not None else None,
+            "timing_status": TranscriptTimingStatus.ALIGNED.value,
+            "speaker_id": None,
+            "speaker_label_status": SpeakerLabelStatus.PENDING.value,
+            "error_code": None,
+            "raw_sha256": raw_sha256,
+            "raw_relative_path": raw_relative_path,
+        }
+        fingerprint = hashlib.sha256(
+            _canonical_json(request_payload).encode("utf-8")
+        ).hexdigest()
+
+        with self._transaction():
+            job = self._row_to_job(self._fetch_job_row(job_id))
+            if job.state is not JobState.ALIGNING:
+                raise InvalidJobRequest(
+                    "Gap re-transcription segments can be committed only while aligning."
+                )
+            duration_ms = self._job_duration_ms(job)
+            validate_time_range(start_ms, end_ms, duration_ms=duration_ms)
+            prior = self._connection.execute(
+                """
+                SELECT *
+                FROM transcript_segments
+                WHERE job_id = ? AND commit_key = ?
+                """,
+                (job_id, commit_key),
+            ).fetchone()
+            if prior is not None:
+                if str(prior["request_fingerprint"]) != fingerprint:
+                    raise TranscriptConflict(
+                        "The commit key is already bound to different gap evidence.",
+                        details={"job_id": job_id, "commit_key": commit_key},
+                    )
+                return self._row_to_transcript_segment(prior), False
+            overlap = self._connection.execute(
+                """
+                SELECT segment_id
+                FROM transcript_segments
+                WHERE job_id = ? AND start_ms < ? AND end_ms > ?
+                LIMIT 1
+                """,
+                (job_id, end_ms, start_ms),
+            ).fetchone()
+            if overlap is not None:
+                raise TranscriptConflict(
+                    "A gap re-transcription segment cannot overlap existing segments.",
+                    details={"conflicting_segment_id": str(overlap["segment_id"])},
+                )
+            sequence = int(
+                self._connection.execute(
+                    """
+                    SELECT COALESCE(MAX(segment_sequence), 0) + 1
+                    FROM transcript_segments
+                    WHERE job_id = ?
+                    """,
+                    (job_id,),
+                ).fetchone()[0]
+            )
+            segment_id = f"seg_{sequence:08d}"
+            now = _utc_now()
+            self._connection.execute(
+                """
+                INSERT INTO transcript_segments (
+                    job_id,
+                    segment_sequence,
+                    segment_id,
+                    commit_key,
+                    request_fingerprint,
+                    revision,
+                    start_ms,
+                    end_ms,
+                    outcome,
+                    text,
+                    language,
+                    confidence,
+                    timing_status,
+                    speaker_id,
+                    speaker_label_status,
+                    error_code,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?)
+                """,
+                (
+                    job_id,
+                    sequence,
+                    segment_id,
+                    commit_key,
+                    fingerprint,
+                    start_ms,
+                    end_ms,
+                    TranscriptOutcome.TRANSCRIBED.value,
+                    text,
+                    language,
+                    float(confidence) if confidence is not None else None,
+                    TranscriptTimingStatus.ALIGNED.value,
+                    SpeakerLabelStatus.PENDING.value,
+                    now,
+                    now,
+                ),
+            )
+            self._insert_update(
+                job_id=job_id,
+                job_revision=job.revision,
+                event_type="transcript.segment_committed",
+                payload={
+                    "segment_sequence": sequence,
+                    "segment_id": segment_id,
+                    "revision": 1,
+                    "start_ms": start_ms,
+                    "end_ms": end_ms,
+                    "outcome": TranscriptOutcome.TRANSCRIBED.value,
+                    "text_length": len(text),
+                    "speaker_label_status": SpeakerLabelStatus.PENDING.value,
+                    "evidence_type": "gap_retranscription",
+                },
+                created_at=now,
+            )
+            row = self._fetch_transcript_segment_row(job_id, segment_id)
+            return self._row_to_transcript_segment(row), True
+
     def update_transcript_segment_metadata(
         self,
         job_id: str,
