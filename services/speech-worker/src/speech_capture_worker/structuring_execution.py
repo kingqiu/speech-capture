@@ -57,6 +57,37 @@ class FindingKind(StrEnum):
     NEXT_STEP = "next_step"
 
 
+CLASSIFICATION_JSON_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "type": {"type": "string", "enum": [value.value for value in ContentType]},
+        "traits": {
+            "type": "array",
+            "items": {"type": "string"},
+            "maxItems": MAX_TRAIT_COUNT,
+        },
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+    },
+    "required": ["type", "traits", "confidence"],
+    "additionalProperties": False,
+}
+
+FINDINGS_JSON_SCHEMA = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "properties": {
+            "kind": {"type": "string", "enum": [value.value for value in FindingKind]},
+            "text": {"type": "string", "minLength": 1},
+            "evidence": {"type": "array", "items": {"type": "string"}},
+            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        },
+        "required": ["kind", "text", "evidence", "confidence"],
+        "additionalProperties": False,
+    },
+}
+
+
 @dataclass(frozen=True)
 class ContentClassification:
     type: ContentType
@@ -125,7 +156,7 @@ class OllamaStructuringEngine:
             f"说话人数：{speaker_count}。文字段：\n"
             + json.dumps(segments, ensure_ascii=False)
         )
-        response = self._generate(prompt)
+        response = self._generate(prompt, format_schema=CLASSIFICATION_JSON_SCHEMA)
         return _parse_json_object(response)
 
     def extract_batch(
@@ -144,16 +175,16 @@ class OllamaStructuringEngine:
             f"内容类型：{content_type}。文字段：\n"
             + json.dumps(segments, ensure_ascii=False)
         )
-        response = self._generate(prompt)
+        response = self._generate(prompt, format_schema=FINDINGS_JSON_SCHEMA)
         return _parse_json_list(response)
 
-    def _generate(self, prompt: str) -> str:
+    def _generate(self, prompt: str, *, format_schema: dict[str, Any]) -> str:
         payload = json.dumps(
             {
                 "model": self.model,
                 "prompt": prompt,
                 "stream": False,
-                "format": "json",
+                "format": format_schema,
                 "options": {
                     "temperature": 0.2,
                     "num_ctx": 8192,
@@ -183,6 +214,7 @@ class OllamaStructuringEngine:
 class StructuringOutcome(StrEnum):
     COMPLETED = "completed"
     REPLAYED = "replayed"
+    REGENERATED = "regenerated"
     SAFE_PAUSED = "safe_paused"
     ALREADY_COMPLETED = "already_completed"
 
@@ -250,9 +282,11 @@ class StructuringExecutor:
         self._boundary_preflight = boundary_preflight
         self._batch_max_chars = batch_max_chars
 
-    def run(self, job_id: str) -> StructuringResult:
+    def run(self, job_id: str, *, force: bool = False) -> StructuringResult:
+        if not isinstance(force, bool):
+            raise InvalidJobRequest("force must be a boolean.")
         job = self.store.get_job(job_id)
-        if job.state is JobState.QUALITY_CHECK:
+        if job.state in {JobState.QUALITY_CHECK, JobState.PROCESSED} and not force:
             return StructuringResult(
                 outcome=StructuringOutcome.ALREADY_COMPLETED,
                 job=job,
@@ -264,9 +298,13 @@ class StructuringExecutor:
                 unavailable_reason_code=None,
                 resource_report=None,
             )
-        if job.state is not JobState.STRUCTURING:
+        if job.state not in {
+            JobState.STRUCTURING,
+            JobState.QUALITY_CHECK,
+            JobState.PROCESSED,
+        }:
             raise InvalidJobRequest(
-                "Structuring requires a structuring or quality-check job."
+                "Structuring requires a structuring, quality-check, or processed job."
             )
 
         plan = self.preprocessor.get_plan(job_id)
@@ -277,6 +315,8 @@ class StructuringExecutor:
             self.store.list_checkpoints(job_id, stage=STRUCTURING_STAGE),
             STRUCTURING_CHECKPOINT_KEY,
         )
+        if force:
+            evidence = None
         resource_report: ResourceReport | None = None
         replayed = evidence is not None
         if evidence is None:
@@ -292,6 +332,18 @@ class StructuringExecutor:
                 payload=resource_report.to_dict(),
             )
             if resource_report.status is ResourceStatus.BLOCKED:
+                if job.state in {JobState.QUALITY_CHECK, JobState.PROCESSED}:
+                    return StructuringResult(
+                        outcome=StructuringOutcome.SAFE_PAUSED,
+                        job=job,
+                        evidence_checkpoint_generation=None,
+                        content_type=None,
+                        finding_count=0,
+                        unsupported_finding_count=0,
+                        batch_count=0,
+                        unavailable_reason_code=None,
+                        resource_report=resource_report,
+                    )
                 current = self.store.get_job(job_id)
                 paused = self.store.transition_job(
                     job_id,
@@ -321,7 +373,7 @@ class StructuringExecutor:
             )
             segment_payload = _segment_payload(transcribed)
             started = time.monotonic()
-            unavailable_reason: str | None = None
+            unavailable_reasons: list[str] = []
             try:
                 classification = _validate_classification(
                     self.engine.classify(
@@ -329,35 +381,46 @@ class StructuringExecutor:
                         speaker_count=speaker_count,
                     )
                 )
-                batches = _build_batches(
-                    transcribed,
-                    max_chars=self._batch_max_chars,
-                )
-                batch_results: list[dict[str, Any]] = []
-                for index, batch in enumerate(batches):
-                    batch_findings = _validate_findings(
-                        self.engine.extract_batch(
-                            _segment_payload(batch),
-                            content_type=classification.type,
-                        ),
-                        segment_ids={segment.segment_id for segment in segments},
-                    )
-                    batch_results.append(
-                        {
-                            "batch_index": index,
-                            "segment_ids": [segment.segment_id for segment in batch],
-                            "findings": [finding.to_dict() for finding in batch_findings],
-                        }
-                    )
             except Exception as exc:
-                unavailable_reason = type(exc).__name__
+                unavailable_reasons.append(type(exc).__name__)
                 classification = ContentClassification(
                     type=ContentType.GENERIC,
                     traits=(),
                     confidence=0.0,
                 )
-                batches = []
-                batch_results = []
+            batches = _build_batches(
+                transcribed,
+                max_chars=self._batch_max_chars,
+            )
+            batch_results: list[dict[str, Any]] = []
+            valid_segment_ids = {segment.segment_id for segment in segments}
+            for index, batch in enumerate(batches):
+                batch_error: str | None = None
+                try:
+                    batch_findings = _validate_findings(
+                        self.engine.extract_batch(
+                            _segment_payload(batch),
+                            content_type=classification.type,
+                        ),
+                        segment_ids=valid_segment_ids,
+                    )
+                except Exception as exc:
+                    batch_error = type(exc).__name__
+                    unavailable_reasons.append(batch_error)
+                    batch_findings = ()
+                batch_results.append(
+                    {
+                        "batch_index": index,
+                        "segment_ids": [segment.segment_id for segment in batch],
+                        "findings": [finding.to_dict() for finding in batch_findings],
+                        "unavailable_reason_code": batch_error,
+                    }
+                )
+            unavailable_reason = (
+                ",".join(dict.fromkeys(unavailable_reasons))
+                if unavailable_reasons
+                else None
+            )
             elapsed_seconds = time.monotonic() - started
             raw_payload = {
                 "schema_version": STRUCTURING_RAW_SCHEMA_VERSION,
@@ -414,25 +477,33 @@ class StructuringExecutor:
         elapsed_seconds = prior_elapsed_seconds + float(
             evidence.payload.get("elapsed_seconds", 0) or 0
         )
-        self.store.put_job_progress(
-            job_id,
-            processed_ms=self.store.get_job_duration_ms(job_id),
-            stage_progress=1.0,
-            elapsed_seconds=elapsed_seconds,
-        )
+        if job.state is JobState.STRUCTURING:
+            self.store.put_job_progress(
+                job_id,
+                processed_ms=self.store.get_job_duration_ms(job_id),
+                stage_progress=1.0,
+                elapsed_seconds=elapsed_seconds,
+            )
         current = self.store.get_job(job_id)
-        quality_check = self.store.transition_job(
-            job_id,
-            JobState.QUALITY_CHECK,
-            expected_revision=current.revision,
-            reason_code="structuring_complete",
-            event_type="job.structuring_completed",
-        )
+        if job.state is JobState.STRUCTURING:
+            result_job = self.store.transition_job(
+                job_id,
+                JobState.QUALITY_CHECK,
+                expected_revision=current.revision,
+                reason_code="structuring_complete",
+                event_type="job.structuring_completed",
+            )
+        else:
+            result_job = current
         return StructuringResult(
             outcome=(
-                StructuringOutcome.REPLAYED if replayed else StructuringOutcome.COMPLETED
+                StructuringOutcome.REGENERATED
+                if force
+                else StructuringOutcome.REPLAYED
+                if replayed
+                else StructuringOutcome.COMPLETED
             ),
-            job=quality_check,
+            job=result_job,
             evidence_checkpoint_generation=evidence.generation,
             content_type=classification.type,
             finding_count=len(findings),

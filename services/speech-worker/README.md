@@ -128,6 +128,18 @@ uv run speech-capture-worker generate-artifacts \
   --data-dir runtime/dev-worker \
   job_example
 
+# Recompute useful structure and replace artifacts after reviewing a processed job.
+uv run speech-capture-worker run-structuring \
+  --data-dir runtime/dev-worker \
+  job_example \
+  --model qwen3:14b \
+  --force
+
+uv run speech-capture-worker generate-artifacts \
+  --data-dir runtime/dev-worker \
+  job_example \
+  --force
+
 uv run speech-capture-worker force-align-next \
   --data-dir runtime/dev-worker \
   job_example
@@ -156,6 +168,13 @@ uv run speech-capture-worker analyze-speech-activity \
 ```
 
 `runtime/` is ignored by Git. The CLI requires an explicit data directory and does not create a global service installation.
+
+Ollama classification and extraction use strict JSON Schemas. Extraction runs
+in bounded independent batches, so one invalid batch is rejected without
+discarding valid findings from the rest of the recording. Every published
+finding must reference stable transcript segment IDs. `--force` writes a new
+durable structuring generation and atomically replaces the artifact package
+without changing the processed transcript.
 
 `analyze-gaps` consumes the latest durable alignment report while the job remains
 in `aligning`. Its evidence is anchored to that report generation and the

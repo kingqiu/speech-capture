@@ -421,6 +421,11 @@ def _build_parser() -> argparse.ArgumentParser:
         default="qwen3:14b",
         help="Ollama model name for classification and extraction.",
     )
+    run_structuring.add_argument(
+        "--force",
+        action="store_true",
+        help="Recompute structuring evidence for a quality-check or processed job.",
+    )
 
     generate_artifacts = subparsers.add_parser(
         "generate-artifacts",
@@ -428,6 +433,11 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     _add_data_dir(generate_artifacts)
     generate_artifacts.add_argument("job_id")
+    generate_artifacts.add_argument(
+        "--force",
+        action="store_true",
+        help="Regenerate artifacts for an already processed job.",
+    )
 
     retranscribe_gaps = subparsers.add_parser(
         "retranscribe-gaps",
@@ -797,11 +807,11 @@ def _dispatch(args: argparse.Namespace) -> int:
             result = StructuringExecutor(
                 store,
                 OllamaStructuringEngine(model=args.model),
-            ).run(args.job_id)
+            ).run(args.job_id, force=args.force)
             _write_json(result.to_dict())
             return 2 if result.outcome is StructuringOutcome.SAFE_PAUSED else 0
         if args.command == "generate-artifacts":
-            result = ArtifactGenerator(store).generate(args.job_id)
+            result = ArtifactGenerator(store).generate(args.job_id, force=args.force)
             _write_json(result.to_dict())
             return 0
         if args.command == "retranscribe-gaps":

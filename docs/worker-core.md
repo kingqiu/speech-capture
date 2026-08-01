@@ -843,10 +843,13 @@ The Worker package currently tests:
   alignment advancement to `diarizing`, idempotent across Worker restart.
 - revision-pinned speaker-diarization adapter with anonymous attribution,
   safe degradation to `unavailable`, and restart-idempotent evidence.
-- content-type classification and bounded-batch evidence-linked extraction
-  with unsupported-finding accounting and restart-idempotent evidence.
+- strict-schema content-type classification and bounded-batch evidence-linked
+  extraction, with per-batch rejection, unsupported-finding accounting,
+  restart-idempotent evidence, and explicit processed-job regeneration.
 - deterministic backend artifact package with raw transcript, evidence
-  transcript, structured record, human note, and a checksummed manifest.
+  transcript, structured record, content-first human note, and a checksummed
+  manifest; processed artifacts can be atomically regenerated from a newer
+  structuring evidence generation.
 - complete aligned transcript advancement to `diarizing`;
 - durable uncovered-range reporting without transcript text;
 - estimated-timing and missing-evidence blocking;

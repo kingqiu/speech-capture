@@ -277,6 +277,51 @@ def test_artifact_generation_is_idempotent_after_restart(tmp_path) -> None:
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")
+def test_processed_job_can_restructure_and_regenerate_useful_note(tmp_path) -> None:
+    with JobStore(
+        tmp_path / "worker.sqlite3",
+        source_probe=source_probe_for(95),
+    ) as store:
+        job = create_quality_check_job(
+            store,
+            duration_seconds=95,
+            suffix="regenerate",
+        )
+        first = ArtifactGenerator(store).generate(job.job_id)
+        segment_id = store.get_job_snapshot(job.job_id).stable_segments[0].segment_id
+        engine = FakeStructuringEngine(
+            [
+                {
+                    "kind": "decision",
+                    "text": "重新生成后的有效结论。",
+                    "evidence": [segment_id],
+                    "confidence": 0.95,
+                }
+            ]
+        )
+
+        structured = StructuringExecutor(
+            store,
+            engine,
+            boundary_preflight=preflight(),
+        ).run(job.job_id, force=True)
+        regenerated = ArtifactGenerator(store).generate(job.job_id, force=True)
+        package = store.get_job_stage_directory(job.job_id, stage="artifacts")
+        note = (package / "note.md").read_text("utf-8")
+        manifest = json.loads((package / "artifact-manifest.json").read_text("utf-8"))
+
+    assert structured.outcome.value == "regenerated"
+    assert structured.job.state is JobState.PROCESSED
+    assert regenerated.outcome is ArtifactOutcome.REGENERATED
+    assert regenerated.job.state is JobState.PROCESSED
+    assert regenerated.manifest_sha256 != first.manifest_sha256
+    assert "## 一分钟总览" in note
+    assert "重新生成后的有效结论。" in note
+    assert "证据：^sp-" in note
+    assert manifest["structuring_checkpoint_generation"] == 2
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")
 def test_artifact_generation_requires_quality_check_state(tmp_path) -> None:
     with JobStore(
         tmp_path / "worker.sqlite3",

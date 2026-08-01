@@ -373,7 +373,7 @@ def test_structuring_degrades_findings_without_transcript_evidence(tmp_path) -> 
         ).run(job.job_id)
 
         assert result.job.state is JobState.QUALITY_CHECK
-        assert result.content_type is ContentType.GENERIC
+        assert result.content_type is ContentType.MEETING
         assert result.finding_count == 0
         assert result.unavailable_reason_code == "StructuringFailed"
 

@@ -55,6 +55,7 @@ ARTIFACT_FILES = (
 
 class ArtifactOutcome(StrEnum):
     GENERATED = "generated"
+    REGENERATED = "regenerated"
     REPLAYED = "replayed"
     SAFE_PAUSED = "safe_paused"
     ALREADY_GENERATED = "already_generated"
@@ -85,9 +86,11 @@ class ArtifactGenerator:
         self.store = store
         self.preprocessor = preprocessor or AudioPreprocessor(store)
 
-    def generate(self, job_id: str) -> ArtifactResult:
+    def generate(self, job_id: str, *, force: bool = False) -> ArtifactResult:
+        if not isinstance(force, bool):
+            raise InvalidJobRequest("force must be a boolean.")
         job = self.store.get_job(job_id)
-        if job.state is JobState.PROCESSED:
+        if job.state is JobState.PROCESSED and not force:
             checkpoint = _checkpoint_by_key(
                 self.store.list_checkpoints(job_id, stage=ARTIFACT_STAGE),
                 ARTIFACT_CHECKPOINT_KEY,
@@ -104,7 +107,7 @@ class ArtifactGenerator:
                 manifest_sha256=checkpoint.payload["manifest_sha256"],
                 package_relative_path=checkpoint.payload["package_relative_path"],
             )
-        if job.state is not JobState.QUALITY_CHECK:
+        if job.state not in {JobState.QUALITY_CHECK, JobState.PROCESSED}:
             raise InvalidJobRequest(
                 "Artifact generation requires a quality-check or processed job."
             )
@@ -229,16 +232,19 @@ class ArtifactGenerator:
             },
         )
         current = self.store.get_job(job_id)
-        processed = self.store.transition_job(
-            job_id,
-            JobState.PROCESSED,
-            expected_revision=current.revision,
-            reason_code="artifacts_generated",
-            event_type="job.processed",
-        )
+        if current.state is JobState.QUALITY_CHECK:
+            result_job = self.store.transition_job(
+                job_id,
+                JobState.PROCESSED,
+                expected_revision=current.revision,
+                reason_code="artifacts_generated",
+                event_type="job.processed",
+            )
+        else:
+            result_job = current
         return ArtifactResult(
-            outcome=ArtifactOutcome.GENERATED,
-            job=processed,
+            outcome=(ArtifactOutcome.REGENERATED if force else ArtifactOutcome.GENERATED),
+            job=result_job,
             speech_id=speech_id,
             artifact_count=len(contents),
             manifest_sha256=manifest_sha256,
@@ -457,6 +463,7 @@ def _build_note_markdown(
     content_type = classification.get("type") or "generic"
     supported = [finding for finding in findings if not finding.unsupported]
     unsupported = [finding for finding in findings if finding.unsupported]
+    overview = _overview_findings(supported)
     speakers = sorted({segment.speaker_id for segment in segments if segment.speaker_id})
     duration_seconds = round(upload.duration_seconds or 0, 1)
     status = (
@@ -484,20 +491,26 @@ def _build_note_markdown(
             "",
             "## 一分钟总览",
             "",
-            f"- 内容类型：{content_type}",
-            f"- 时长：{_format_duration(int(duration_seconds * 1000))}",
-            f"- 说话人数：{len(speakers)}",
-            "",
-            "## 关键信息",
-            "",
         ]
     )
+    if overview:
+        for finding in overview:
+            evidence = "、".join(
+                f"^{block_ids[segment_id]}" for segment_id in finding.evidence
+            )
+            lines.append(f"- {finding.text}（证据：{evidence}）")
+    else:
+        lines.append("未生成有可靠证据的内容摘要。")
+    lines.extend(["", "## 关键信息", ""])
     if supported:
         for finding in supported:
             evidence = "、".join(
                 f"^{block_ids[segment_id]}" for segment_id in finding.evidence
             )
-            lines.append(f"- [{finding.kind.value}] {finding.text}（证据：{evidence}）")
+            lines.append(
+                f"- [{_finding_kind_label(finding.kind.value)}] "
+                f"{finding.text}（证据：{evidence}）"
+            )
     else:
         lines.append("无。")
     lines.extend(["", "## 内容类型明细", ""])
@@ -506,18 +519,32 @@ def _build_note_markdown(
     uncertain_segments = [
         segment
         for segment in segments
-        if segment.outcome is not TranscriptOutcome.TRANSCRIBED
+        if segment.outcome in {TranscriptOutcome.INAUDIBLE, TranscriptOutcome.FAILED}
     ]
     lines.extend(["## 不确定与遗漏", ""])
     if uncertain_segments or unsupported:
         if uncertain_segments:
-            lines.append(
-                "以下时间范围没有稳定转写："
-                + ", ".join(
-                    _format_range(segment.start_ms, segment.end_ms)
-                    for segment in uncertain_segments
-                )
+            uncertain_duration_ms = sum(
+                segment.end_ms - segment.start_ms for segment in uncertain_segments
             )
+            lines.append(
+                f"共有 {len(uncertain_segments)} 处未稳定转写，合计约 "
+                f"{_format_duration(uncertain_duration_ms)}；"
+                "具体位置已在 transcript.md 中标为「听不清」。"
+            )
+            significant = [
+                segment
+                for segment in uncertain_segments
+                if segment.end_ms - segment.start_ms >= 2000
+            ]
+            if significant:
+                lines.append(
+                    "较长区间："
+                    + "、".join(
+                        _format_range(segment.start_ms, segment.end_ms)
+                        for segment in significant
+                    )
+                )
         if unsupported:
             lines.append(f"{len(unsupported)} 条提炼结论证据不足，未进入关键信息。")
     else:
@@ -537,6 +564,48 @@ def _build_note_markdown(
         ]
     )
     return "\n".join(lines)
+
+
+def _overview_findings(findings: list[Any], *, limit: int = 6) -> list[Any]:
+    by_kind: dict[str, list[Any]] = {}
+    for finding in findings:
+        by_kind.setdefault(finding.kind.value, []).append(finding)
+    for values in by_kind.values():
+        values.sort(key=lambda finding: (-finding.confidence, finding.text))
+
+    quotas = (
+        ("decision", 2),
+        ("topic", 2),
+        ("fact", 2),
+        ("idea", 2),
+        ("action_item", 2),
+        ("next_step", 1),
+        ("question", 1),
+        ("disagreement", 1),
+        ("uncertainty", 1),
+        ("deadline", 1),
+    )
+    selected: list[Any] = []
+    for kind, quota in quotas:
+        selected.extend(by_kind.get(kind, [])[:quota])
+        if len(selected) >= limit:
+            return selected[:limit]
+    return selected
+
+
+def _finding_kind_label(kind: str) -> str:
+    return {
+        "decision": "决定",
+        "action_item": "行动项",
+        "fact": "关键事实",
+        "question": "问题",
+        "disagreement": "分歧",
+        "uncertainty": "不确定",
+        "deadline": "截止时间",
+        "topic": "主题",
+        "idea": "观点",
+        "next_step": "下一步",
+    }.get(kind, kind)
 
 
 def _content_sections(
