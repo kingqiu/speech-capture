@@ -349,8 +349,6 @@ class StructuringExecutor:
                             "findings": [finding.to_dict() for finding in batch_findings],
                         }
                     )
-            except StructuringFailed:
-                raise
             except Exception as exc:
                 unavailable_reason = type(exc).__name__
                 classification = ContentClassification(

@@ -66,7 +66,7 @@ This is not yet the network Worker service. It can execute or replay one local A
 25. Retrying a completed attempt replays its raw evidence instead of invoking the model again.
 26. Severe resource pressure pauses before the next chunk; it never discards prior raw attempts or segments.
 27. A job cannot enter diarization until every planned chunk has matching durable raw evidence and a materialization checkpoint.
-28. A job cannot enter diarization while transcribed timing is estimated, a source range lacks a stable outcome, or an inaudible or failed range remains.
+28. A job cannot enter diarization while transcribed timing is estimated, a source range lacks a stable outcome, or a failed range remains. An explicitly reviewed `inaudible` range may proceed while preserving partial transcript semantics.
 29. Alignment checkpoints contain ranges, counts, and stable issue codes, but never transcript text.
 30. Gap analysis may prove sufficiently long near-digital silence, but audible or uncertain PCM remains unresolved and cannot be silently labeled non-speech.
 31. Only current gap evidence produced by the fixed conservative policy may authorize an aligned `non_speech` backfill.
@@ -522,14 +522,19 @@ job rather than trusting the last successful model call. It verifies:
 - each referenced raw attempt still passes its file checksum;
 - every transcribed stable segment has aligned rather than estimated timing;
 - stable outcomes are non-overlapping and account for the full verified source;
-- no `inaudible` or `failed` outcome is being presented as complete.
+- no `inaudible` or `failed` outcome is being presented as complete;
+- a fully accounted timeline containing reviewed `inaudible` ranges may proceed
+  to diarization while retaining `transcript_complete = false`, but a `failed`
+  range still blocks the exit gate.
 
 The resulting `transcript_alignment_report` checkpoint is deterministic and
 contains only counts, durations, ranges, booleans, and stable issue codes. It
-does not contain transcript text. Uncovered ranges and estimated timing keep the
-job in `aligning`. Only a fully verified report advances the job to `diarizing`.
-Calling the finalizer again after restart returns the same report without a
-second model call or a duplicate state transition.
+does not contain transcript text. Uncovered ranges, estimated timing, and failed
+outcomes keep the job in `aligning`. A fully verified and fully accounted report
+advances the job to `diarizing`; reviewed `inaudible` ranges preserve partial
+transcript semantics without blocking that transition. Calling the finalizer
+again after restart returns the same report without a second model call or a
+duplicate state transition.
 
 ### 12.6 Conservative PCM gap evidence
 
@@ -594,9 +599,10 @@ rerunning whole-transcript alignment.
 
 Repeating the same review key and decision returns the original segment.
 Changing the range or outcome is an explicit conflict. A reviewed `inaudible`
-range accounts for source time but keeps `transcript_complete` false. This path
-does not classify audible content automatically and does not treat an empty ASR
-result as review evidence.
+range accounts for source time and may proceed to diarization, but keeps
+`transcript_complete` false so later artifacts remain explicitly partial. This
+path does not classify audible content automatically and does not treat an
+empty ASR result as review evidence.
 
 ### 12.9 Controlled forced-alignment fallback
 

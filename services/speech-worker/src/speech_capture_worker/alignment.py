@@ -262,8 +262,14 @@ class TranscriptAlignmentFinalizer:
             issue.code in {"INAUDIBLE_TRANSCRIPT_RANGE", "FAILED_TRANSCRIPT_RANGE"}
             for issue in transcript_issues
         )
+        failed_ranges_present = any(
+            issue.code == "FAILED_TRANSCRIPT_RANGE" for issue in transcript_issues
+        )
         ready_for_diarization = (
-            evidence_complete and alignment_complete and timeline_accounted and transcript_complete
+            evidence_complete
+            and alignment_complete
+            and timeline_accounted
+            and not failed_ranges_present
         )
         return AlignmentReport(
             schema_version=ALIGNMENT_REPORT_SCHEMA_VERSION,

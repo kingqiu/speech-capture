@@ -167,8 +167,10 @@ before entering diarization. The report independently states whether:
 
 The report exposes only safe counts, durations, ranges, and issue codes. It does
 not expose transcript text through routine events or diagnostics. Estimated
-timing, missing evidence, uncovered ranges, and partial outcomes keep the job
-out of diarization.
+timing, missing evidence, uncovered ranges, and failed outcomes keep the job
+out of diarization. An explicitly reviewed `inaudible` range keeps
+`transcript_complete: false` but may continue through diarization so downstream
+artifacts can preserve an honest `partial` result.
 
 ### 7.3 Conservative uncovered-range evidence
 

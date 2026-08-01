@@ -134,7 +134,8 @@ For each validated source:
 - a human-reviewed outcome must match one complete current unresolved range;
 - review keys are idempotent and cannot be rebound to another range or outcome;
 - stale review evidence and overlapping stable segments cannot authorize materialization;
-- reviewed `inaudible` accounts for time without claiming a complete transcript;
+- reviewed `inaudible` accounts for time and permits downstream processing
+  without claiming a complete transcript;
 - interruption after a reviewed segment commit is repaired without duplicating the segment;
 - routine review checkpoints and CLI output contain no transcript or free-form reviewer text.
 - speech-activity candidates are pinned to immutable model revisions and fixed configurations;

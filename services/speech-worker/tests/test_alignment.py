@@ -25,6 +25,7 @@ from speech_capture_worker.forced_alignment import (
     _clamp_alignment_words,
     _prepare_aligner_audio,
 )
+from speech_capture_worker.gap_review import ReviewedGapMaterializer
 from speech_capture_worker.job_store import JobStore
 from speech_capture_worker.media_probe import MediaProbeResult
 from speech_capture_worker.resources import (
@@ -312,6 +313,52 @@ def test_uncovered_aligned_ranges_are_durable_and_block_diarization(tmp_path) ->
         {"start_ms": 0, "end_ms": 250},
         {"start_ms": 750, "end_ms": 1000},
     ]
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")
+def test_reviewed_inaudible_timeline_advances_to_diarization_as_partial(
+    tmp_path,
+) -> None:
+    with JobStore(
+        tmp_path / "worker.sqlite3",
+        source_probe=source_probe_for(1),
+    ) as store:
+        job = create_preprocessing_job(
+            store,
+            duration_seconds=1,
+            suffix="reviewed-inaudible",
+        )
+        run_to_alignment(
+            store,
+            job.job_id,
+            lambda audio: result_with_segments(
+                audio,
+                segments=[
+                    {
+                        "text": "private aligned transcript",
+                        "start": 0.25,
+                        "end": 1,
+                    }
+                ],
+            ),
+        )
+        initial = TranscriptAlignmentFinalizer(store).finalize(job.job_id)
+        result = ReviewedGapMaterializer(store).materialize(
+            job.job_id,
+            review_key="reviewed-inaudible",
+            start_ms=0,
+            end_ms=250,
+            outcome=TranscriptOutcome.INAUDIBLE,
+        )
+
+    assert initial.outcome is AlignmentFinalizationOutcome.TIMELINE_INCOMPLETE
+    assert result.alignment.outcome is AlignmentFinalizationOutcome.READY_FOR_DIARIZATION
+    assert result.job.state is JobState.DIARIZING
+    assert result.alignment.report.evidence_complete is True
+    assert result.alignment.report.timeline_accounted is True
+    assert result.alignment.report.transcript_complete is False
+    assert result.alignment.report.ready_for_diarization is True
+    assert result.alignment.report.unresolved_ranges == ()
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")

@@ -178,7 +178,9 @@ inspection but cannot authorize timeline materialization.
 The review key is an opaque idempotency key, not a reviewer identity. Only
 `non_speech` and `inaudible` are accepted; the command stores no free-form
 review text, rejects stale alignment reports or partial-range decisions, and
-refreshes alignment after materialization. This is not an automatic classifier.
+refreshes alignment after materialization. A fully accounted timeline with
+reviewed `inaudible` ranges may continue through diarization while downstream
+artifacts remain explicitly partial. This is not an automatic classifier.
 
 `analyze-speech-activity` is an evidence-only evaluation boundary. It requires
 the optional `diarization` dependency and a full commit SHA for

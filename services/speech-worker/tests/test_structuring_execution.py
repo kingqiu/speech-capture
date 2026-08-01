@@ -16,7 +16,7 @@ from speech_capture_worker.alignment import (
 )
 from speech_capture_worker.asr_execution import AsrChunkExecutor, AsrRunOutcome
 from speech_capture_worker.domain import JobState, ResourceStatus, UploadCreateRequest
-from speech_capture_worker.errors import InvalidJobRequest, StructuringFailed
+from speech_capture_worker.errors import InvalidJobRequest
 from speech_capture_worker.job_store import JobStore
 from speech_capture_worker.media_probe import MediaProbeResult
 from speech_capture_worker.resources import (
@@ -345,7 +345,7 @@ def test_structuring_engine_failure_degrades_without_inventing_findings(tmp_path
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")
-def test_structuring_rejects_findings_without_transcript_evidence(tmp_path) -> None:
+def test_structuring_degrades_findings_without_transcript_evidence(tmp_path) -> None:
     with JobStore(
         tmp_path / "worker.sqlite3",
         source_probe=source_probe_for(95),
@@ -366,12 +366,16 @@ def test_structuring_rejects_findings_without_transcript_evidence(tmp_path) -> N
             ]
         )
 
-        with pytest.raises(StructuringFailed):
-            StructuringExecutor(
-                store,
-                engine,
-                boundary_preflight=preflight(),
-            ).run(job.job_id)
+        result = StructuringExecutor(
+            store,
+            engine,
+            boundary_preflight=preflight(),
+        ).run(job.job_id)
+
+        assert result.job.state is JobState.QUALITY_CHECK
+        assert result.content_type is ContentType.GENERIC
+        assert result.finding_count == 0
+        assert result.unavailable_reason_code == "StructuringFailed"
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")
