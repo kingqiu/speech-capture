@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import time
 import urllib.request
 from collections.abc import Callable
@@ -22,21 +23,27 @@ from speech_capture_worker.errors import (
     UploadStorageError,
 )
 from speech_capture_worker.job_store import JobStore
+from speech_capture_worker.note_prompt_profiles import (
+    NOTE_PROMPT_VERSION,
+    extraction_guidance,
+    synthesis_guidance,
+)
 from speech_capture_worker.resources import GIB, ResourceReport, check_resource_preflight
 from speech_capture_worker.transcript import TranscriptSegment
 
-STRUCTURING_SCHEMA_VERSION = "1.1.0"
-STRUCTURING_RAW_SCHEMA_VERSION = "1.1.0"
+STRUCTURING_SCHEMA_VERSION = "1.3.0"
+STRUCTURING_RAW_SCHEMA_VERSION = "1.3.0"
+LEGACY_STRUCTURING_SCHEMA_VERSIONS = {"1.1.0", "1.2.0"}
 STRUCTURING_STAGE = "structuring"
 STRUCTURING_CHECKPOINT_KEY = "structuring_result"
 STRUCTURING_HEADROOM_BYTES = GIB
 DEFAULT_BATCH_MAX_CHARS = 6000
-DEFAULT_EDITOR_BATCH_MAX_CHARS = 2400
+DEFAULT_EDITOR_BATCH_MAX_CHARS = 4800
 MAX_FINDING_TEXT_CHARACTERS = 2000
 MAX_TRAIT_COUNT = 20
 MAX_DOCUMENT_TITLE_CHARACTERS = 120
 MAX_DOCUMENT_TEXT_CHARACTERS = 3000
-MAX_DOCUMENT_ITEMS = 20
+MAX_DOCUMENT_EVIDENCE_ITEMS = 3
 
 
 class ContentType(StrEnum):
@@ -100,11 +107,103 @@ EVIDENCE_TEXT_JSON_SCHEMA = {
             "type": "array",
             "items": {"type": "string"},
             "minItems": 1,
-            "maxItems": 12,
+            "maxItems": 3,
         },
     },
     "required": ["text", "evidence"],
     "additionalProperties": False,
+}
+
+CONTEXT_ITEM_JSON_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "kind": {
+            "type": "string",
+            "enum": [
+                "purpose",
+                "participant",
+                "organization",
+                "relationship",
+                "constraint",
+                "background",
+            ],
+        },
+        "title": {"type": "string", "minLength": 1},
+        "text": {"type": "string", "minLength": 1},
+        "evidence": {
+            "type": "array",
+            "items": {"type": "string"},
+            "minItems": 1,
+            "maxItems": 3,
+        },
+    },
+    "required": ["kind", "title", "text", "evidence"],
+    "additionalProperties": False,
+}
+
+SPEAKER_SUMMARY_JSON_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "speaker_id": {"type": "string", "minLength": 1},
+        "display_name": {"type": "string"},
+        "affiliation": {"type": "string"},
+        "role": {"type": "string"},
+        "summary": {"type": "string", "minLength": 1},
+        "evidence": {
+            "type": "array",
+            "items": {"type": "string"},
+            "minItems": 1,
+            "maxItems": 3,
+        },
+    },
+    "required": [
+        "speaker_id",
+        "display_name",
+        "affiliation",
+        "role",
+        "summary",
+        "evidence",
+    ],
+    "additionalProperties": False,
+}
+
+SPEAKER_SUMMARIES_JSON_SCHEMA = {
+    "type": "array",
+    "items": SPEAKER_SUMMARY_JSON_SCHEMA,
+    "maxItems": 8,
+}
+
+DISCUSSION_THREAD_JSON_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "title": {"type": "string", "minLength": 1},
+        "initial_position": EVIDENCE_TEXT_JSON_SCHEMA,
+        "developments": {
+            "type": "array",
+            "items": EVIDENCE_TEXT_JSON_SCHEMA,
+            "minItems": 1,
+            "maxItems": 3,
+        },
+        "current_direction": EVIDENCE_TEXT_JSON_SCHEMA,
+        "status": {
+            "type": "string",
+            "enum": ["confirmed", "tentative", "open"],
+        },
+    },
+    "required": [
+        "title",
+        "initial_position",
+        "developments",
+        "current_direction",
+        "status",
+    ],
+    "additionalProperties": False,
+}
+
+DISCUSSION_THREADS_JSON_SCHEMA = {
+    "type": "array",
+    "items": DISCUSSION_THREAD_JSON_SCHEMA,
+    "maxItems": 6,
 }
 
 DOCUMENT_JSON_SCHEMA = {
@@ -112,11 +211,16 @@ DOCUMENT_JSON_SCHEMA = {
     "properties": {
         "title": {"type": "string", "minLength": 1},
         "summary": EVIDENCE_TEXT_JSON_SCHEMA,
+        "context": {
+            "type": "array",
+            "items": CONTEXT_ITEM_JSON_SCHEMA,
+            "maxItems": 5,
+        },
         "highlights": {
             "type": "array",
             "items": EVIDENCE_TEXT_JSON_SCHEMA,
-            "minItems": 5,
-            "maxItems": 8,
+            "minItems": 3,
+            "maxItems": 6,
         },
         "topics": {
             "type": "array",
@@ -128,25 +232,30 @@ DOCUMENT_JSON_SCHEMA = {
                     "details": {
                         "type": "array",
                         "items": EVIDENCE_TEXT_JSON_SCHEMA,
-                        "maxItems": 8,
+                        "maxItems": 2,
                     },
                     "evidence": {
                         "type": "array",
                         "items": {"type": "string"},
                         "minItems": 1,
-                        "maxItems": 12,
+                        "maxItems": 3,
                     },
                 },
                 "required": ["title", "summary", "details", "evidence"],
                 "additionalProperties": False,
             },
-            "minItems": 5,
-            "maxItems": 10,
+            "minItems": 3,
+            "maxItems": 6,
+        },
+        "speaker_summaries": {
+            "type": "array",
+            "items": SPEAKER_SUMMARY_JSON_SCHEMA,
+            "maxItems": 8,
         },
         "decisions": {
             "type": "array",
             "items": EVIDENCE_TEXT_JSON_SCHEMA,
-            "maxItems": 15,
+            "maxItems": 10,
         },
         "actions": {
             "type": "array",
@@ -160,55 +269,36 @@ DOCUMENT_JSON_SCHEMA = {
                         "type": "array",
                         "items": {"type": "string"},
                         "minItems": 1,
-                        "maxItems": 12,
+                        "maxItems": 3,
                     },
                 },
                 "required": ["task", "owner", "deadline", "evidence"],
                 "additionalProperties": False,
             },
-            "maxItems": 15,
+            "maxItems": 10,
         },
         "risks": {
             "type": "array",
             "items": EVIDENCE_TEXT_JSON_SCHEMA,
-            "maxItems": 15,
+            "maxItems": 10,
         },
         "open_questions": {
             "type": "array",
             "items": EVIDENCE_TEXT_JSON_SCHEMA,
-            "maxItems": 15,
-        },
-        "chapters": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "title": {"type": "string", "minLength": 1},
-                    "summary": {"type": "string", "minLength": 1},
-                    "evidence": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "minItems": 1,
-                        "maxItems": 12,
-                    },
-                },
-                "required": ["title", "summary", "evidence"],
-                "additionalProperties": False,
-            },
-            "minItems": 6,
-            "maxItems": 15,
+            "maxItems": 10,
         },
     },
     "required": [
         "title",
         "summary",
+        "context",
         "highlights",
         "topics",
+        "speaker_summaries",
         "decisions",
         "actions",
         "risks",
         "open_questions",
-        "chapters",
     ],
     "additionalProperties": False,
 }
@@ -280,6 +370,29 @@ class StructuringEngine(Protocol):
         content_type: ContentType,
     ) -> dict[str, Any]: ...
 
+    def synthesize_speaker_summaries(
+        self,
+        segments: list[dict[str, Any]],
+        *,
+        speaker_ids: list[str],
+        content_type: ContentType,
+    ) -> list[dict[str, Any]]: ...
+
+    def synthesize_discussion_threads(
+        self,
+        segments: list[dict[str, Any]],
+        *,
+        content_type: ContentType,
+    ) -> list[dict[str, Any]]: ...
+
+    def reconcile_decisions(
+        self,
+        document: dict[str, Any],
+        segments: list[dict[str, Any]],
+        *,
+        content_type: ContentType,
+    ) -> list[dict[str, Any]]: ...
+
     def polish_transcript_batch(
         self,
         segments: list[dict[str, Any]],
@@ -322,7 +435,9 @@ class OllamaStructuringEngine:
         response = self._generate(
             prompt,
             format_schema=CLASSIFICATION_JSON_SCHEMA,
+            model=self.editor_model,
             num_predict=512,
+            num_ctx=8192,
         )
         return _parse_json_object(response)
 
@@ -339,12 +454,15 @@ class OllamaStructuringEngine:
             "kind 只能是 decision、action_item、fact、question、disagreement、"
             "uncertainty、deadline、topic、idea、next_step。"
             "evidence 必须来自下方给出的 segment_id，不能编造没有证据的内容。"
-            "只提取本批最重要的 8-20 条信息，合并重复表达，不要把每句话都列成一项。"
-            f"内容类型：{content_type}。文字段：\n" + json.dumps(segments, ensure_ascii=False)
+            "提取本批有助于理解整篇记录的 6-20 条候选信息，合并重复表达，不要逐句罗列。\n"
+            + extraction_guidance(content_type.value)
+            + f"\n内容类型：{content_type.value}。文字段：\n"
+            + json.dumps(segments, ensure_ascii=False)
         )
         response = self._generate(
             prompt,
             format_schema=FINDINGS_JSON_SCHEMA,
+            model=self.editor_model,
             num_predict=3072,
         )
         return _parse_json_list(response)
@@ -356,31 +474,152 @@ class OllamaStructuringEngine:
         *,
         content_type: ContentType,
     ) -> dict[str, Any]:
+        speaker_stats: dict[str, dict[str, int]] = {}
+        for segment in segments:
+            speaker_id = segment.get("speaker_id")
+            if not isinstance(speaker_id, str) or not speaker_id:
+                continue
+            stats = speaker_stats.setdefault(speaker_id, {"segments": 0, "characters": 0})
+            stats["segments"] += 1
+            stats["characters"] += len(str(segment.get("text") or ""))
         prompt = (
-            "你是资深中文内容编辑。请把分批提取的信息合并为一篇可直接使用的完整笔记，"
-            "而不是转写片段清单。只返回符合 schema 的 JSON，不要解释。\n"
-            "要求：title 要具体；summary 用一段 120-300 字的连贯文字讲清背景、核心讨论和结果；"
-            "highlights 保留最重要的 5-8 点；topics 按语义合并成 5-8 个主题，每个主题写概述并列出"
-            "2-6 条具体信息；decisions 只写明确达成的结论；actions 必须写清任务，只有原文明确时"
-            "才填 owner 和 deadline，否则填空字符串；risks 与 open_questions 分开；chapters 按时间"
-            "顺序写 6-12 个章节并覆盖主要内容。主题应在证据存在时覆盖业务背景与目标、优先场景、"
-            "实施路径、组织协作、技术平台、案例成效以及风险；每个主题的概述必须与其 details 对应。"
-            "合并重复待办，避免空话、重复和 Meta 信息，保留人名、数字、范围和时间。\n"
-            "所有 evidence 必须使用输入中的 segment_id，且每一项至少有一个证据；不得补写原文没有"
-            "的信息。可以基于同一证据做忠实归纳。\n"
+            "你是资深中文内容编辑。请直接阅读下方完整的校订后逐字稿，生成一篇可直接使用的完整"
+            "笔记，而不是转写片段清单。请自行从完整逐字稿中发现背景、人物、组织、关系、决定和"
+            "关键细节。只返回符合 schema 的 JSON，不要解释。\n"
+            + synthesis_guidance(content_type.value)
+            + "\n结构要求：title 要具体；summary 用连贯文字讲清背景、参与方、会议或记录目标、"
+            "核心讨论和"
+            "结果；context 提取目的、人物、组织、关系、约束等理解全文必需的上下文；highlights 只"
+            "保留真正影响记录目标的 3-6 点，宁缺毋滥；topics 按语义组织 3-6 个主题，每个主题写"
+            "概述并列出最多 2 条具体信息；speaker_summaries 只总结最多 8 位有实质发言者，每人"
+            "用简洁 summary 准确概括其核心立场；不能遗漏发言量较大的实质参与者；decisions 只写明确"
+            "达成的结论；actions 写清任务，只有原文明确时才填 owner 和 deadline，否则填空字符串；"
+            "risks 与 open_questions 分开。合并重复内容，避免空话、"
+            "Meta 信息和同一内容在多个章节反复出现，保留人名、公司名、数字、范围和时间。\n"
+            "所有 evidence 必须使用完整逐字稿中的 segment_id，且每一项至少有一个证据；不得补写"
+            "原文没有的信息。每项只选择 1-3 个最直接、最有代表性的证据，不要堆砌编号。"
+            "speaker_summaries 中的核心陈述应优先引用该 speaker_id 自己的"
+            "发言；不能确认姓名、所属方或角色时对应字段填空字符串。owner 和 deadline 必须保留"
+            "原文说法并能在所引证据中直接找到，禁止推算日期、转换成原文没有的日期或猜测负责人。\n"
             f"内容类型：{content_type.value}\n"
-            "已提取信息：\n"
-            + json.dumps(findings, ensure_ascii=False)
-            + "\n证据原文：\n"
+            "说话人发言量统计（characters >= 500 的 speaker 必须进入 speaker_summaries）：\n"
+            + json.dumps(speaker_stats, ensure_ascii=False)
+            + "\n"
+            "完整校订后逐字稿：\n"
             + json.dumps(segments, ensure_ascii=False)
         )
         response = self._generate(
             prompt,
             format_schema=DOCUMENT_JSON_SCHEMA,
-            num_predict=6144,
+            num_predict=3584,
+            num_ctx=24576,
             timeout_seconds=1200,
         )
         return _parse_json_object(response)
+
+    def synthesize_speaker_summaries(
+        self,
+        segments: list[dict[str, Any]],
+        *,
+        speaker_ids: list[str],
+        content_type: ContentType,
+    ) -> list[dict[str, Any]]:
+        prompt = (
+            "你是中文多人会议观点编辑。只返回 JSON 数组，不要解释。必须对指定的每一个 speaker_id "
+            "恰好返回一项，不得遗漏或增加。每项包含 speaker_id、display_name、affiliation、role、"
+            "summary、evidence。summary 用一段简洁文字概括该参与者在本次记录中的核心主张、承诺、"
+            "顾虑或修正意见，不能复制其他人的观点。display_name、affiliation、role 只有从开场介绍"
+            "或原文能唯一确认时填写，否则留空。evidence 选择 1-3 个 segment_id，且至少包含该"
+            "speaker_id 本人的发言。不得编造。\n"
+            f"内容类型：{content_type.value}\n"
+            "必须补充的 speaker_id："
+            + json.dumps(speaker_ids, ensure_ascii=False)
+            + "\n相关逐字稿：\n"
+            + json.dumps(segments, ensure_ascii=False)
+        )
+        response = self._generate(
+            prompt,
+            format_schema=SPEAKER_SUMMARIES_JSON_SCHEMA,
+            model=self.editor_model,
+            num_predict=1536,
+            num_ctx=12288,
+        )
+        return _parse_json_list(response)
+
+    def synthesize_discussion_threads(
+        self,
+        segments: list[dict[str, Any]],
+        *,
+        content_type: ContentType,
+    ) -> list[dict[str, Any]]:
+        if content_type is not ContentType.MEETING:
+            return []
+        prompt = (
+            "你是中文会议讨论脉络编辑。只返回 JSON 数组，不要解释。请阅读完整校订后逐字稿，"
+            "只找出确实发生观点变化的议题，不要摘录普通的并列讨论。每项包含 title、"
+            "initial_position、developments、current_direction、status。initial_position 是较早"
+            "提出的方案；developments 按时间顺序记录后续反对、澄清或方向调整；current_direction "
+            "是截至会议结束时最后出现的方向。每段文字都必须引用 1-3 个最直接的 segment_id。"
+            "后续证据必须晚于最初方案，不能把竞争方案合并成含糊结论。status 只能是 confirmed、"
+            "tentative、open：只有原文明确确认才用 confirmed；倾向某方向但仍需材料或验证用 "
+            "tentative；没有形成方向用 open。current_direction 不等于会议决定，不得夸大。"
+            "为每个议题填写 current_direction 前，必须继续向后扫描该议题在全文中的所有后续出现；"
+            "如果会议后段还有更晚的实质表态、材料要求或下一步，current_direction 必须引用其中"
+            "最晚且最直接的证据，不能停在中段。"
+            "若不存在真实演变，返回空数组。\n"
+            "完整校订后逐字稿：\n"
+            + json.dumps(segments, ensure_ascii=False)
+        )
+        response = self._generate(
+            prompt,
+            format_schema=DISCUSSION_THREADS_JSON_SCHEMA,
+            model=self.editor_model,
+            num_predict=1536,
+            num_ctx=24576,
+        )
+        return _parse_json_list(response)
+
+    def reconcile_decisions(
+        self,
+        document: dict[str, Any],
+        segments: list[dict[str, Any]],
+        *,
+        content_type: ContentType,
+    ) -> list[dict[str, Any]]:
+        if content_type is not ContentType.MEETING or not document.get(
+            "discussion_threads"
+        ):
+            value = document.get("decisions")
+            return list(value) if isinstance(value, list) else []
+        prompt = (
+            "你是中文会议决定核对员。只返回 JSON 数组，不要解释。请结合完整校订后逐字稿和已经"
+            "按时间整理的讨论演变，重新核对现有 decisions。只保留会议结束时仍然成立、且原文明"
+            "确确认的决定；删除后来被修正的早期提议、单方建议、暂定方向和仍需材料验证的事项。"
+            "不要把 discussion thread 的 current_direction 自动升级为决定。每项只包含 text 和 "
+            "evidence，并引用 1-3 个最直接的 segment_id。没有明确决定可以返回空数组。\n"
+            "待核对内容：\n"
+            + json.dumps(
+                {
+                    "discussion_threads": document.get("discussion_threads", []),
+                    "existing_decisions": document.get("decisions", []),
+                },
+                ensure_ascii=False,
+            )
+            + "\n完整校订后逐字稿：\n"
+            + json.dumps(segments, ensure_ascii=False)
+        )
+        response = self._generate(
+            prompt,
+            format_schema={
+                "type": "array",
+                "items": EVIDENCE_TEXT_JSON_SCHEMA,
+                "maxItems": 10,
+            },
+            model=self.editor_model,
+            num_predict=1024,
+            num_ctx=24576,
+        )
+        return _parse_json_list(response)
 
     def polish_transcript_batch(
         self,
@@ -408,6 +647,7 @@ class OllamaStructuringEngine:
         format_schema: dict[str, Any],
         model: str | None = None,
         num_predict: int,
+        num_ctx: int = 16384,
         timeout_seconds: int = 600,
     ) -> str:
         payload = json.dumps(
@@ -419,7 +659,7 @@ class OllamaStructuringEngine:
                 "format": format_schema,
                 "options": {
                     "temperature": 0.2,
-                    "num_ctx": 16384,
+                    "num_ctx": num_ctx,
                     "num_predict": num_predict,
                 },
             }
@@ -515,6 +755,110 @@ class StructuringExecutor:
         self._boundary_preflight = boundary_preflight
         self._batch_max_chars = batch_max_chars
 
+    def _synthesize_document_with_speaker_coverage(
+        self,
+        findings: list[dict[str, Any]],
+        segments: list[dict[str, Any]],
+        *,
+        content_type: ContentType,
+    ) -> dict[str, Any]:
+        document = self.engine.synthesize_document(
+            findings,
+            segments,
+            content_type=content_type,
+        )
+        if not isinstance(document, dict):
+            return document
+        result = dict(document)
+        if content_type is not ContentType.MEETING:
+            result["discussion_threads"] = []
+            return result
+        raw_summaries = document.get("speaker_summaries")
+        if not isinstance(raw_summaries, list):
+            return document
+        present = {
+            item.get("speaker_id")
+            for item in raw_summaries
+            if isinstance(item, dict) and isinstance(item.get("speaker_id"), str)
+        }
+        substantive = _substantive_speaker_ids_from_payload(segments)
+        missing = sorted(substantive - present)
+        if missing:
+            relevant = [
+                segment
+                for index, segment in enumerate(segments)
+                if index < 8 or segment.get("speaker_id") in missing
+            ]
+            supplements = self.engine.synthesize_speaker_summaries(
+                relevant,
+                speaker_ids=missing,
+                content_type=content_type,
+            )
+            supplemented_ids = [
+                item.get("speaker_id") for item in supplements if isinstance(item, dict)
+            ]
+            if len(supplements) != len(missing) or set(supplemented_ids) != set(missing):
+                raise StructuringFailed(
+                    "The speaker supplement did not cover the requested speakers."
+                )
+            result["speaker_summaries"] = [*raw_summaries, *supplements]
+        result["discussion_threads"] = self.engine.synthesize_discussion_threads(
+            segments,
+            content_type=content_type,
+        )
+        result["decisions"] = self.engine.reconcile_decisions(
+            result,
+            segments,
+            content_type=content_type,
+        )
+        return result
+
+    def _upgrade_document_discussion_threads(
+        self,
+        document: Any,
+        segments: list[dict[str, Any]],
+        *,
+        content_type: ContentType,
+    ) -> dict[str, Any] | None:
+        """Add the new focused meeting structure without rerunning an accepted main note."""
+
+        if not isinstance(document, dict) or "discussion_threads" in document:
+            return None
+        upgraded = {key: value for key, value in document.items() if key != "chapters"}
+        upgraded["discussion_threads"] = self.engine.synthesize_discussion_threads(
+            segments,
+            content_type=content_type,
+        )
+        upgraded["decisions"] = self.engine.reconcile_decisions(
+            upgraded,
+            segments,
+            content_type=content_type,
+        )
+        return upgraded
+
+    def _refresh_document_discussion_state(
+        self,
+        document: Any,
+        segments: list[dict[str, Any]],
+        *,
+        content_type: ContentType,
+    ) -> dict[str, Any] | None:
+        """Refresh only discussion-sensitive fields of an accepted main document."""
+
+        if not isinstance(document, dict):
+            return None
+        refreshed = {key: value for key, value in document.items() if key != "chapters"}
+        refreshed["discussion_threads"] = self.engine.synthesize_discussion_threads(
+            segments,
+            content_type=content_type,
+        )
+        refreshed["decisions"] = self.engine.reconcile_decisions(
+            refreshed,
+            segments,
+            content_type=content_type,
+        )
+        return refreshed
+
     def run(self, job_id: str, *, force: bool = False) -> StructuringResult:
         if not isinstance(force, bool):
             raise InvalidJobRequest("force must be a boolean.")
@@ -599,72 +943,8 @@ class StructuringExecutor:
                     resource_report=resource_report,
                 )
 
-            speaker_count = len(
-                {segment.speaker_id for segment in transcribed if segment.speaker_id}
-            )
-            segment_payload = _segment_payload(transcribed)
             started = time.monotonic()
             unavailable_reasons: list[str] = []
-            try:
-                classification = _validate_classification(
-                    self.engine.classify(
-                        segment_payload,
-                        speaker_count=speaker_count,
-                    )
-                )
-            except Exception as exc:
-                unavailable_reasons.append(type(exc).__name__)
-                classification = ContentClassification(
-                    type=ContentType.GENERIC,
-                    traits=(),
-                    confidence=0.0,
-                )
-            batches = _build_batches(
-                transcribed,
-                max_chars=self._batch_max_chars,
-            )
-            batch_results: list[dict[str, Any]] = []
-            valid_segment_ids = {segment.segment_id for segment in segments}
-            for index, batch in enumerate(batches):
-                batch_error: str | None = None
-                batch_payload = _segment_payload(batch)
-                try:
-                    batch_findings = _validate_findings(
-                        self.engine.extract_batch(
-                            batch_payload,
-                            content_type=classification.type,
-                        ),
-                        segment_ids=valid_segment_ids,
-                    )
-                except Exception as exc:
-                    batch_error = type(exc).__name__
-                    unavailable_reasons.append(batch_error)
-                    batch_findings = ()
-                batch_results.append(
-                    {
-                        "batch_index": index,
-                        "segment_ids": [segment.segment_id for segment in batch],
-                        "findings": [finding.to_dict() for finding in batch_findings],
-                        "unavailable_reason_code": batch_error,
-                    }
-                )
-            findings = _merge_findings(batch_results)
-            document: dict[str, Any] | None = None
-            document_error: str | None = None
-            if findings:
-                try:
-                    finding_payload = [finding.to_dict() for finding in findings]
-                    document = _validate_document(
-                        self.engine.synthesize_document(
-                            finding_payload,
-                            _document_evidence_payload(transcribed, findings),
-                            content_type=classification.type,
-                        ),
-                        segment_ids=valid_segment_ids,
-                    )
-                except Exception as exc:
-                    document_error = type(exc).__name__
-                    unavailable_reasons.append(document_error)
             transcript_edit_results: list[dict[str, Any]] = []
             editor_batches = _build_batches(
                 transcribed,
@@ -689,12 +969,103 @@ class StructuringExecutor:
                         "unavailable_reason_code": edit_error,
                     }
                 )
+            transcript_edit_map = _transcript_edit_map(transcript_edit_results)
+            segment_payload = _segment_payload(
+                transcribed,
+                transcript_edits=transcript_edit_map,
+            )
+            speaker_ids = {segment.speaker_id for segment in transcribed if segment.speaker_id}
+            segment_texts = {
+                segment.segment_id: transcript_edit_map.get(segment.segment_id, segment.text or "")
+                for segment in transcribed
+            }
+            segment_speakers = {
+                segment.segment_id: segment.speaker_id for segment in transcribed
+            }
+            segment_starts = {segment.segment_id: segment.start_ms for segment in segments}
+            speaker_count = len(speaker_ids)
+            try:
+                classification = _validate_classification(
+                    self.engine.classify(
+                        _classification_sample(segment_payload),
+                        speaker_count=speaker_count,
+                    )
+                )
+            except Exception as exc:
+                unavailable_reasons.append(type(exc).__name__)
+                classification = ContentClassification(
+                    type=ContentType.GENERIC,
+                    traits=(),
+                    confidence=0.0,
+                )
+            batches = _build_batches(
+                transcribed,
+                max_chars=self._batch_max_chars,
+            )
+            batch_results: list[dict[str, Any]] = []
+            valid_segment_ids = {segment.segment_id for segment in segments}
+            for index, batch in enumerate(batches):
+                batch_error: str | None = None
+                batch_payload = _segment_payload(
+                    batch,
+                    transcript_edits=transcript_edit_map,
+                )
+                try:
+                    batch_findings = _validate_findings(
+                        self.engine.extract_batch(
+                            batch_payload,
+                            content_type=classification.type,
+                        ),
+                        segment_ids=valid_segment_ids,
+                    )
+                except Exception as exc:
+                    batch_error = type(exc).__name__
+                    unavailable_reasons.append(batch_error)
+                    batch_findings = ()
+                batch_results.append(
+                    {
+                        "batch_index": index,
+                        "segment_ids": [segment.segment_id for segment in batch],
+                        "findings": [finding.to_dict() for finding in batch_findings],
+                        "unavailable_reason_code": batch_error,
+                    }
+                )
+            findings = _merge_findings(batch_results)
+            document: dict[str, Any] | None = None
+            document_error: str | None = None
+            if transcribed:
+                try:
+                    finding_payload = _synthesis_finding_payload(findings)
+                    synthesis_payload, evidence_aliases = _synthesis_segment_payload(
+                        transcribed,
+                        transcript_edits=transcript_edit_map,
+                    )
+                    document = _validate_document(
+                        _remap_document_evidence(
+                            self._synthesize_document_with_speaker_coverage(
+                                finding_payload,
+                                synthesis_payload,
+                                content_type=classification.type,
+                            ),
+                            aliases=evidence_aliases,
+                        ),
+                        segment_ids=valid_segment_ids,
+                        speaker_ids=speaker_ids,
+                        content_type=classification.type,
+                        segment_texts=segment_texts,
+                        segment_speakers=segment_speakers,
+                        segment_starts=segment_starts,
+                    )
+                except Exception as exc:
+                    document_error = type(exc).__name__
+                    unavailable_reasons.append(document_error)
             unavailable_reason = (
                 ",".join(dict.fromkeys(unavailable_reasons)) if unavailable_reasons else None
             )
             elapsed_seconds = time.monotonic() - started
             raw_payload = {
                 "schema_version": STRUCTURING_RAW_SCHEMA_VERSION,
+                "prompt_version": NOTE_PROMPT_VERSION,
                 "model_id": self.engine.model_id,
                 "normalized_sha256": plan.normalized_sha256,
                 "segments_sha256": segments_sha256,
@@ -718,6 +1089,7 @@ class StructuringExecutor:
                 checkpoint_key=STRUCTURING_CHECKPOINT_KEY,
                 payload={
                     "schema_version": STRUCTURING_SCHEMA_VERSION,
+                    "prompt_version": NOTE_PROMPT_VERSION,
                     "model_id": self.engine.model_id,
                     "normalized_sha256": plan.normalized_sha256,
                     "segments_sha256": segments_sha256,
@@ -804,8 +1176,8 @@ class StructuringExecutor:
             raise StructuringFailed("Document re-synthesis requires structuring evidence.")
         payload = evidence.payload
         if (
-            payload.get("schema_version") != STRUCTURING_SCHEMA_VERSION
-            or payload.get("model_id") != self.engine.model_id
+            payload.get("schema_version")
+            not in {STRUCTURING_SCHEMA_VERSION, *LEGACY_STRUCTURING_SCHEMA_VERSIONS}
             or payload.get("normalized_sha256") != plan.normalized_sha256
             or payload.get("segments_sha256") != segments_sha256
             or not isinstance(payload.get("raw_relative_path"), str)
@@ -842,18 +1214,71 @@ class StructuringExecutor:
             raise StructuringFailed("Document re-synthesis evidence is incomplete.")
         classification = _validate_classification(raw_payload["classification"])
         findings = _merge_findings(raw_payload["batch_results"])
-        if not findings:
-            raise StructuringFailed("Document re-synthesis requires supported findings.")
 
         transcribed = [segment for segment in segments if segment.text]
+        transcript_edit_map = _transcript_edit_map(
+            raw_payload.get("transcript_edit_results", [])
+        )
+        speaker_ids = {segment.speaker_id for segment in transcribed if segment.speaker_id}
+        segment_texts = {
+            segment.segment_id: transcript_edit_map.get(segment.segment_id, segment.text or "")
+            for segment in transcribed
+        }
+        segment_speakers = {
+            segment.segment_id: segment.speaker_id for segment in transcribed
+        }
+        segment_starts = {segment.segment_id: segment.start_ms for segment in segments}
+        synthesis_payload, evidence_aliases = _synthesis_segment_payload(
+            transcribed,
+            transcript_edits=transcript_edit_map,
+        )
         started = time.monotonic()
-        document = _validate_document(
-            self.engine.synthesize_document(
-                [finding.to_dict() for finding in findings],
-                _document_evidence_payload(transcribed, findings),
+        if (
+            raw_payload.get("prompt_version")
+            in {
+                "2026-08-01.13",
+                "2026-08-01.14",
+                "2026-08-01.15",
+                "2026-08-01.16",
+                "2026-08-01.17",
+                "2026-08-01.18",
+            }
+            and isinstance(raw_payload.get("document"), dict)
+        ):
+            candidate = {
+                key: value
+                for key, value in raw_payload["document"].items()
+                if key != "chapters"
+            }
+        elif raw_payload.get("prompt_version") != NOTE_PROMPT_VERSION:
+            candidate = self._refresh_document_discussion_state(
+                raw_payload.get("document"),
+                synthesis_payload,
                 content_type=classification.type,
+            )
+        else:
+            candidate = self._upgrade_document_discussion_threads(
+                raw_payload.get("document"),
+                synthesis_payload,
+                content_type=classification.type,
+            )
+        if candidate is None:
+            candidate = self._synthesize_document_with_speaker_coverage(
+                _synthesis_finding_payload(findings),
+                synthesis_payload,
+                content_type=classification.type,
+            )
+        document = _validate_document(
+            _remap_document_evidence(
+                candidate,
+                aliases=evidence_aliases,
             ),
             segment_ids={segment.segment_id for segment in segments},
+            speaker_ids=speaker_ids,
+            content_type=classification.type,
+            segment_texts=segment_texts,
+            segment_speakers=segment_speakers,
+            segment_starts=segment_starts,
         )
         elapsed_seconds = time.monotonic() - started
         unavailable_reasons = [
@@ -863,6 +1288,9 @@ class StructuringExecutor:
             if result.get("unavailable_reason_code")
         ]
         raw_payload["document"] = document
+        raw_payload["schema_version"] = STRUCTURING_RAW_SCHEMA_VERSION
+        raw_payload["prompt_version"] = NOTE_PROMPT_VERSION
+        raw_payload["model_id"] = self.engine.model_id
         raw_payload["document_unavailable_reason_code"] = None
         raw_payload["unavailable_reason_code"] = (
             ",".join(dict.fromkeys(unavailable_reasons)) if unavailable_reasons else None
@@ -878,6 +1306,9 @@ class StructuringExecutor:
         checkpoint_payload.update(
             {
                 "document_available": True,
+                "schema_version": STRUCTURING_SCHEMA_VERSION,
+                "prompt_version": NOTE_PROMPT_VERSION,
+                "model_id": self.engine.model_id,
                 "unavailable_reason_code": raw_payload["unavailable_reason_code"],
                 "raw_relative_path": raw_relative_path,
                 "raw_sha256": raw_sha256,
@@ -1182,40 +1613,136 @@ class StructuringExecutor:
         return payload
 
 
-def _segment_payload(segments: list[TranscriptSegment]) -> list[dict[str, Any]]:
+def _segment_payload(
+    segments: list[TranscriptSegment],
+    *,
+    transcript_edits: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
+    edits = transcript_edits or {}
     return [
         {
             "segment_id": segment.segment_id,
             "start_ms": segment.start_ms,
             "end_ms": segment.end_ms,
             "speaker_id": segment.speaker_id,
-            "text": segment.text,
+            "text": edits.get(segment.segment_id, segment.text),
         }
         for segment in segments
     ]
 
 
-def _document_evidence_payload(
+def _synthesis_segment_payload(
     segments: list[TranscriptSegment],
-    findings: tuple[Finding, ...],
-) -> list[dict[str, Any]]:
-    evidence_ids = {
-        segment_id
+    *,
+    transcript_edits: dict[str, str] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    """Use short evidence aliases to reduce long-context input and structured output."""
+
+    edits = transcript_edits or {}
+    aliases: dict[str, str] = {}
+    payload: list[dict[str, Any]] = []
+    for index, segment in enumerate(segments, start=1):
+        alias = f"s{index:04d}"
+        aliases[alias] = segment.segment_id
+        payload.append(
+            {
+                "segment_id": alias,
+                "start_ms": segment.start_ms,
+                "speaker_id": segment.speaker_id,
+                "text": edits.get(segment.segment_id, segment.text),
+            }
+        )
+    return payload, aliases
+
+
+def _substantive_speaker_ids_from_payload(
+    segments: list[dict[str, Any]],
+) -> set[str]:
+    character_counts: dict[str, int] = {}
+    for segment in segments:
+        speaker_id = segment.get("speaker_id")
+        if not isinstance(speaker_id, str) or not speaker_id:
+            continue
+        character_counts[speaker_id] = character_counts.get(speaker_id, 0) + len(
+            str(segment.get("text") or "")
+        )
+    return {
+        speaker_id
+        for speaker_id, character_count in character_counts.items()
+        if character_count >= 500
+    }
+
+
+def _remap_document_evidence(value: Any, *, aliases: dict[str, str]) -> Any:
+    if isinstance(value, list):
+        return [_remap_document_evidence(item, aliases=aliases) for item in value]
+    if not isinstance(value, dict):
+        return value
+    remapped: dict[str, Any] = {}
+    for key, item in value.items():
+        if key == "evidence" and isinstance(item, list):
+            remapped[key] = [aliases.get(segment_id, segment_id) for segment_id in item]
+        else:
+            remapped[key] = _remap_document_evidence(item, aliases=aliases)
+    return remapped
+
+
+def _transcript_edit_map(batch_results: Any) -> dict[str, str]:
+    edits: dict[str, str] = {}
+    if not isinstance(batch_results, list):
+        return edits
+    for batch in batch_results:
+        if not isinstance(batch, dict):
+            continue
+        for item in batch.get("transcript_edits", []):
+            if (
+                isinstance(item, dict)
+                and isinstance(item.get("segment_id"), str)
+                and isinstance(item.get("text"), str)
+                and item["text"].strip()
+            ):
+                edits[item["segment_id"]] = item["text"].strip()
+    return edits
+
+
+def _synthesis_finding_payload(findings: tuple[Finding, ...]) -> list[dict[str, Any]]:
+    """Keep candidate hints compact because the final model also receives the full transcript."""
+
+    return [
+        {
+            "kind": finding.kind.value,
+            "text": finding.text,
+            "evidence": list(finding.evidence),
+        }
         for finding in findings
         if not finding.unsupported
-        for segment_id in finding.evidence
-    }
-    return [
-        {
-            "segment_id": segment.segment_id,
-            "start_ms": segment.start_ms,
-            "end_ms": segment.end_ms,
-            "speaker_id": segment.speaker_id,
-            "text": (segment.text or "")[:500],
-        }
-        for segment in segments
-        if segment.segment_id in evidence_ids
     ]
+
+
+def _classification_sample(
+    segments: list[dict[str, Any]],
+    *,
+    max_characters: int = 4000,
+) -> list[dict[str, Any]]:
+    """Keep opening, middle and closing context without classifying the full transcript."""
+
+    if sum(len(str(item.get("text") or "")) for item in segments) <= max_characters:
+        return segments
+    candidate_indices = list(range(min(6, len(segments))))
+    midpoint = len(segments) // 2
+    candidate_indices.extend(range(max(0, midpoint - 3), min(len(segments), midpoint + 3)))
+    candidate_indices.extend(range(max(0, len(segments) - 6), len(segments)))
+    sampled: list[dict[str, Any]] = []
+    remaining = max_characters
+    for index in dict.fromkeys(candidate_indices):
+        item = dict(segments[index])
+        text = str(item.get("text") or "")
+        if not text or remaining <= 0:
+            continue
+        item["text"] = text[:remaining]
+        remaining -= len(item["text"])
+        sampled.append(item)
+    return sampled
 
 
 def _build_batches(
@@ -1366,19 +1893,26 @@ def _validate_document(
     raw: Any,
     *,
     segment_ids: set[str],
+    speaker_ids: set[str],
+    content_type: ContentType,
+    segment_texts: dict[str, str],
+    segment_speakers: dict[str, str | None],
+    segment_starts: dict[str, int],
 ) -> dict[str, Any]:
     if not isinstance(raw, dict):
         raise StructuringFailed("The structuring engine did not return a document.")
     expected_keys = {
         "title",
         "summary",
+        "context",
         "highlights",
         "topics",
+        "discussion_threads",
+        "speaker_summaries",
         "decisions",
         "actions",
         "risks",
         "open_questions",
-        "chapters",
     }
     if set(raw) != expected_keys:
         raise StructuringFailed("The structured document has invalid fields.")
@@ -1392,26 +1926,76 @@ def _validate_document(
         segment_ids=segment_ids,
         field="summary",
     )
+    raw_context = raw.get("context")
+    if not isinstance(raw_context, list) or len(raw_context) > 5:
+        raise StructuringFailed("The structured document has invalid context.")
+    context: list[dict[str, Any]] = []
+    context_kinds = {
+        "purpose",
+        "participant",
+        "organization",
+        "relationship",
+        "constraint",
+        "background",
+    }
+    for index, item in enumerate(raw_context):
+        if not isinstance(item, dict) or set(item) != {
+            "kind",
+            "title",
+            "text",
+            "evidence",
+        }:
+            raise StructuringFailed("The structured document has invalid context.")
+        kind = item.get("kind")
+        if kind not in context_kinds:
+            raise StructuringFailed("The structured document has an invalid context kind.")
+        context.append(
+            {
+                "kind": kind,
+                "title": _validate_document_text(
+                    item.get("title"), field=f"context[{index}].title", maximum=120
+                ),
+                "text": _validate_document_text(
+                    item.get("text"),
+                    field=f"context[{index}].text",
+                    maximum=MAX_DOCUMENT_TEXT_CHARACTERS,
+                ),
+                "evidence": _validate_evidence(
+                    item.get("evidence"),
+                    segment_ids=segment_ids,
+                    field=f"context[{index}].evidence",
+                ),
+            }
+        )
+    if content_type is ContentType.MEETING and len(context) < 2:
+        raise StructuringFailed("The meeting document has too little background context.")
     highlights = _validate_evidence_text_list(
-        raw.get("highlights"), segment_ids=segment_ids, field="highlights", maximum=8
+        raw.get("highlights"), segment_ids=segment_ids, field="highlights", maximum=6
     )
-    if len(highlights) < 5:
+    if len(highlights) < 3:
         raise StructuringFailed("The structured document has too few highlights.")
     decisions = _validate_evidence_text_list(
-        raw.get("decisions"), segment_ids=segment_ids, field="decisions", maximum=15
+        raw.get("decisions"), segment_ids=segment_ids, field="decisions", maximum=10
     )
+    decisions = [
+        decision
+        for decision in decisions
+        if _decision_has_confirmation_evidence(decision["evidence"], segment_texts)
+    ]
+    if not decisions:
+        summary["text"] = _remove_unsupported_decision_claims(summary["text"])
     risks = _validate_evidence_text_list(
-        raw.get("risks"), segment_ids=segment_ids, field="risks", maximum=15
+        raw.get("risks"), segment_ids=segment_ids, field="risks", maximum=10
     )
     open_questions = _validate_evidence_text_list(
         raw.get("open_questions"),
         segment_ids=segment_ids,
         field="open_questions",
-        maximum=15,
+        maximum=10,
     )
 
     raw_topics = raw.get("topics")
-    if not isinstance(raw_topics, list) or not 5 <= len(raw_topics) <= 10:
+    if not isinstance(raw_topics, list) or not 3 <= len(raw_topics) <= 6:
         raise StructuringFailed("The structured document has invalid topics.")
     topics: list[dict[str, Any]] = []
     for index, item in enumerate(raw_topics):
@@ -1436,7 +2020,7 @@ def _validate_document(
                     item.get("details"),
                     segment_ids=segment_ids,
                     field=f"topics[{index}].details",
-                    maximum=8,
+                    maximum=2,
                 ),
                 "evidence": _validate_evidence(
                     item.get("evidence"),
@@ -1446,8 +2030,204 @@ def _validate_document(
             }
         )
 
+    raw_discussion_threads = raw.get("discussion_threads")
+    if not isinstance(raw_discussion_threads, list) or len(raw_discussion_threads) > 6:
+        raise StructuringFailed("The structured document has invalid discussion threads.")
+    discussion_threads: list[dict[str, Any]] = []
+    for index, item in enumerate(raw_discussion_threads):
+        if not isinstance(item, dict) or set(item) != {
+            "title",
+            "initial_position",
+            "developments",
+            "current_direction",
+            "status",
+        }:
+            raise StructuringFailed("The structured document has an invalid discussion thread.")
+        thread_title = _validate_document_text(
+            item.get("title"),
+            field=f"discussion_threads[{index}].title",
+            maximum=120,
+        )
+        initial_position = _validate_evidence_text(
+            item.get("initial_position"),
+            segment_ids=segment_ids,
+            field=f"discussion_threads[{index}].initial_position",
+        )
+        raw_developments = item.get("developments")
+        if (
+            not isinstance(raw_developments, list)
+            or not raw_developments
+            or len(raw_developments) > 3
+        ):
+            raise StructuringFailed("The structured document has invalid developments.")
+        developments = [
+            _validate_evidence_text(
+                development,
+                segment_ids=segment_ids,
+                field=f"discussion_threads[{index}].developments[{development_index}]",
+            )
+            for development_index, development in enumerate(raw_developments)
+        ]
+        current_direction = _validate_evidence_text(
+            item.get("current_direction"),
+            segment_ids=segment_ids,
+            field=f"discussion_threads[{index}].current_direction",
+        )
+        status = item.get("status")
+        if status not in {"confirmed", "tentative", "open"}:
+            raise StructuringFailed("The structured document has an invalid discussion status.")
+
+        initial_latest = max(
+            segment_starts[segment_id] for segment_id in initial_position["evidence"]
+        )
+        prior_latest = initial_latest
+        for development in developments:
+            development_latest = max(
+                segment_starts[segment_id] for segment_id in development["evidence"]
+            )
+            if development_latest <= prior_latest:
+                raise StructuringFailed(
+                    "The discussion developments are not in transcript order.",
+                    details={
+                        "thread_index": index,
+                        "prior_latest_ms": prior_latest,
+                        "development_latest_ms": development_latest,
+                        "development_evidence": development["evidence"],
+                    },
+                )
+            prior_latest = development_latest
+        current_direction["evidence"] = _extend_with_latest_topic_evidence(
+            title=thread_title,
+            initial_position=initial_position,
+            developments=developments,
+            current_direction=current_direction,
+            segment_texts=segment_texts,
+            segment_starts=segment_starts,
+            after_ms=initial_latest,
+        )
+        current_direction["text"] = _append_evidence_acronyms(
+            current_direction["text"],
+            current_direction["evidence"],
+            segment_texts,
+        )
+        current_latest = max(
+            segment_starts[segment_id] for segment_id in current_direction["evidence"]
+        )
+        if current_latest <= initial_latest:
+            raise StructuringFailed(
+                "The discussion current direction does not follow the initial position.",
+                details={
+                    "thread_index": index,
+                    "initial_latest_ms": initial_latest,
+                    "prior_latest_ms": prior_latest,
+                    "current_latest_ms": current_latest,
+                    "current_evidence": current_direction["evidence"],
+                },
+            )
+        discussion_threads.append(
+            {
+                "title": thread_title,
+                "initial_position": initial_position,
+                "developments": developments,
+                "current_direction": current_direction,
+                "status": status,
+            }
+        )
+    discussion_threads = [
+        thread
+        for thread in _unique_discussion_threads(discussion_threads)
+        if _discussion_has_explicit_change(thread, segment_texts)
+    ]
+    highlights = _filter_superseded_highlights(
+        highlights,
+        discussion_threads,
+        segment_starts,
+    )
+
+    raw_speaker_summaries = raw.get("speaker_summaries")
+    if not isinstance(raw_speaker_summaries, list) or len(raw_speaker_summaries) > 8:
+        raise StructuringFailed("The structured document has invalid speaker summaries.")
+    speaker_summaries: list[dict[str, Any]] = []
+    seen_speakers: set[str] = set()
+    for index, item in enumerate(raw_speaker_summaries):
+        if not isinstance(item, dict) or set(item) != {
+            "speaker_id",
+            "display_name",
+            "affiliation",
+            "role",
+            "summary",
+            "evidence",
+        }:
+            raise StructuringFailed("The structured document has an invalid speaker summary.")
+        speaker_id = item.get("speaker_id")
+        if (
+            not isinstance(speaker_id, str)
+            or speaker_id not in speaker_ids
+            or speaker_id in seen_speakers
+        ):
+            raise StructuringFailed("The structured document has an invalid speaker identity.")
+        seen_speakers.add(speaker_id)
+        speaker_evidence = _validate_evidence(
+            item.get("evidence"),
+            segment_ids=segment_ids,
+            field=f"speaker_summaries[{index}].evidence",
+        )
+        if not any(
+            segment_speakers.get(segment_id) == speaker_id
+            for segment_id in speaker_evidence
+        ):
+            raise StructuringFailed("A speaker summary lacks the participant's own statement.")
+        speaker_summaries.append(
+            {
+                "speaker_id": speaker_id,
+                "display_name": _validate_optional_document_text(
+                    item.get("display_name"),
+                    field=f"speaker_summaries[{index}].display_name",
+                    maximum=200,
+                ),
+                "affiliation": _validate_optional_document_text(
+                    item.get("affiliation"),
+                    field=f"speaker_summaries[{index}].affiliation",
+                    maximum=300,
+                ),
+                "role": _validate_optional_document_text(
+                    item.get("role"),
+                    field=f"speaker_summaries[{index}].role",
+                    maximum=300,
+                ),
+                "summary": _validate_document_text(
+                    item.get("summary"),
+                    field=f"speaker_summaries[{index}].summary",
+                    maximum=MAX_DOCUMENT_TEXT_CHARACTERS,
+                ),
+                "evidence": speaker_evidence,
+            }
+        )
+    if (
+        content_type is ContentType.MEETING
+        and len(speaker_ids) > 1
+        and len(speaker_summaries) < 2
+    ):
+        raise StructuringFailed("The meeting document has too few speaker summaries.")
+    if content_type is ContentType.MEETING:
+        speaker_character_counts: dict[str, int] = {}
+        for segment_id, speaker_id in segment_speakers.items():
+            if speaker_id:
+                speaker_character_counts[speaker_id] = speaker_character_counts.get(
+                    speaker_id, 0
+                ) + len(segment_texts.get(segment_id, ""))
+        substantive_speakers = {
+            speaker_id
+            for speaker_id, character_count in speaker_character_counts.items()
+            if character_count >= 500
+        }
+        if not substantive_speakers.issubset(seen_speakers):
+            raise StructuringFailed(
+                "The meeting document omits a substantive participant's viewpoint."
+            )
+
     raw_actions = raw.get("actions")
-    if not isinstance(raw_actions, list) or len(raw_actions) > 15:
+    if not isinstance(raw_actions, list) or len(raw_actions) > 10:
         raise StructuringFailed("The structured document has invalid actions.")
     actions: list[dict[str, Any]] = []
     for index, item in enumerate(raw_actions):
@@ -1458,57 +2238,67 @@ def _validate_document(
             "evidence",
         }:
             raise StructuringFailed("The structured document has an invalid action.")
+        owner = _validate_optional_document_text(
+            item.get("owner"), field=f"actions[{index}].owner", maximum=200
+        )
+        deadline = _validate_optional_document_text(
+            item.get("deadline"),
+            field=f"actions[{index}].deadline",
+            maximum=200,
+        )
+        action_evidence = _validate_evidence(
+            item.get("evidence"),
+            segment_ids=segment_ids,
+            field=f"actions[{index}].evidence",
+        )
+        if owner and not _literal_is_grounded(owner, action_evidence, segment_texts):
+            owner = ""
+        if deadline and not _literal_is_grounded(deadline, action_evidence, segment_texts):
+            deadline = ""
         actions.append(
             {
                 "task": _validate_document_text(
                     item.get("task"), field=f"actions[{index}].task", maximum=1000
                 ),
-                "owner": _validate_optional_document_text(
-                    item.get("owner"), field=f"actions[{index}].owner", maximum=200
-                ),
-                "deadline": _validate_optional_document_text(
-                    item.get("deadline"),
-                    field=f"actions[{index}].deadline",
-                    maximum=200,
-                ),
-                "evidence": _validate_evidence(
-                    item.get("evidence"),
-                    segment_ids=segment_ids,
-                    field=f"actions[{index}].evidence",
-                ),
+                "owner": owner,
+                "deadline": deadline,
+                "evidence": action_evidence,
             }
         )
 
-    raw_chapters = raw.get("chapters")
-    if not isinstance(raw_chapters, list) or not 6 <= len(raw_chapters) <= 15:
-        raise StructuringFailed("The structured document has invalid chapters.")
-    chapters: list[dict[str, Any]] = []
-    for index, item in enumerate(raw_chapters):
-        if not isinstance(item, dict) or set(item) != {"title", "summary", "evidence"}:
-            raise StructuringFailed("The structured document has an invalid chapter.")
-        chapters.append(
-            {
-                "title": _validate_document_text(
-                    item.get("title"), field=f"chapters[{index}].title", maximum=120
-                ),
-                "summary": _validate_document_text(
-                    item.get("summary"),
-                    field=f"chapters[{index}].summary",
-                    maximum=MAX_DOCUMENT_TEXT_CHARACTERS,
-                ),
-                "evidence": _validate_evidence(
-                    item.get("evidence"),
-                    segment_ids=segment_ids,
-                    field=f"chapters[{index}].evidence",
-                ),
-            }
-        )
+    categorized_texts = {
+        "decisions": {_normalized_document_item(item["text"]) for item in decisions},
+        "actions": {_normalized_document_item(item["task"]) for item in actions},
+        "risks": {_normalized_document_item(item["text"]) for item in risks},
+        "open_questions": {
+            _normalized_document_item(item["text"]) for item in open_questions
+        },
+    }
+    category_names = list(categorized_texts)
+    if any(
+        categorized_texts[left] & categorized_texts[right]
+        for index, left in enumerate(category_names)
+        for right in category_names[index + 1 :]
+    ):
+        raise StructuringFailed("The structured document repeats an item across categories.")
+
+    chapters = [
+        {
+            "title": topic["title"],
+            "summary": topic["summary"],
+            "evidence": topic["evidence"],
+        }
+        for topic in topics
+    ]
 
     return {
         "title": title,
         "summary": summary,
+        "context": context,
         "highlights": highlights,
         "topics": topics,
+        "discussion_threads": discussion_threads,
+        "speaker_summaries": speaker_summaries,
         "decisions": decisions,
         "actions": actions,
         "risks": risks,
@@ -1527,6 +2317,228 @@ def _validate_optional_document_text(value: Any, *, field: str, maximum: int) ->
     if not isinstance(value, str) or len(value) > maximum:
         raise StructuringFailed(f"The structured document has invalid {field} text.")
     return value.strip()
+
+
+def _literal_is_grounded(
+    value: str,
+    evidence: list[str],
+    segment_texts: dict[str, str],
+) -> bool:
+    needle = "".join(value.split()).casefold()
+    haystack = "".join(
+        "".join(segment_texts.get(segment_id, "").split()) for segment_id in evidence
+    ).casefold()
+    return bool(needle) and needle in haystack
+
+
+def _normalized_document_item(value: str) -> str:
+    return "".join(value.strip().rstrip("。；;！？!?").split()).casefold()
+
+
+def _decision_has_confirmation_evidence(
+    evidence: list[str],
+    segment_texts: dict[str, str],
+) -> bool:
+    transcript = "".join(segment_texts.get(segment_id, "") for segment_id in evidence)
+    markers = (
+        "决定",
+        "确定",
+        "确认",
+        "同意",
+        "达成",
+        "敲定",
+        "定下来",
+        "就按",
+        "先从",
+        "好，就",
+        "没问题",
+    )
+    return any(marker in transcript for marker in markers)
+
+
+def _remove_unsupported_decision_claims(text: str) -> str:
+    unsupported_markers = (
+        "最终确定",
+        "会议决定",
+        "双方决定",
+        "明确决定",
+        "明确确定",
+        "达成共识",
+        "达成初步共识",
+    )
+    sentences = re.split(r"(?<=[。！？!?])", text)
+    retained = [
+        sentence
+        for sentence in sentences
+        if sentence.strip()
+        and not any(marker in sentence for marker in unsupported_markers)
+    ]
+    result = "".join(retained).strip()
+    return result or text
+
+
+def _extend_with_latest_topic_evidence(
+    *,
+    title: str,
+    initial_position: dict[str, Any],
+    developments: list[dict[str, Any]],
+    current_direction: dict[str, Any],
+    segment_texts: dict[str, str],
+    segment_starts: dict[str, int],
+    after_ms: int,
+) -> list[str]:
+    source = " ".join(
+        [
+            title,
+            initial_position["text"],
+            *(development["text"] for development in developments),
+            current_direction["text"],
+        ]
+    )
+    anchors = _discussion_topic_anchors(source)
+    if not anchors:
+        return current_direction["evidence"]
+    candidate: str | None = None
+    candidate_start = -1
+    for segment_id, text in segment_texts.items():
+        start_ms = segment_starts.get(segment_id, -1)
+        if start_ms <= after_ms or start_ms <= candidate_start:
+            continue
+        normalized_text = text.casefold()
+        score = sum(anchor in normalized_text for anchor in anchors)
+        if score >= 3:
+            candidate = segment_id
+            candidate_start = start_ms
+    evidence = list(dict.fromkeys([*current_direction["evidence"], candidate]))
+    evidence = [segment_id for segment_id in evidence if segment_id is not None]
+    return sorted(evidence, key=segment_starts.__getitem__)[-MAX_DOCUMENT_EVIDENCE_ITEMS:]
+
+
+def _discussion_topic_anchors(value: str) -> set[str]:
+    anchors = {
+        token.casefold()
+        for token in re.findall(r"[A-Za-z][A-Za-z0-9+-]{1,}", value)
+    }
+    stop_anchors = {
+        "一个",
+        "这个",
+        "通过",
+        "进行",
+        "提出",
+        "强调",
+        "实现",
+        "方式",
+        "当前",
+        "方向",
+        "会议",
+        "组织",
+        "能力",
+        "快速",
+    }
+    for run in re.findall(r"[\u4e00-\u9fff]{2,}", value):
+        anchors.update(
+            run[index : index + 2]
+            for index in range(len(run) - 1)
+            if run[index : index + 2] not in stop_anchors
+        )
+    return anchors
+
+
+def _append_evidence_acronyms(
+    text: str,
+    evidence: list[str],
+    segment_texts: dict[str, str],
+) -> str:
+    transcript = " ".join(segment_texts.get(segment_id, "") for segment_id in evidence)
+    acronyms = sorted(
+        {
+            acronym
+            for acronym in re.findall(
+                r"(?<![A-Za-z0-9])[A-Z][A-Z0-9-]{1,9}(?![A-Za-z0-9])",
+                transcript,
+            )
+            if acronym != "AI" and acronym not in text
+        }
+    )
+    if not acronyms:
+        return text
+    suffix = "、".join(acronyms)
+    return _validate_document_text(
+        f"{text}（涉及{suffix}）",
+        field="discussion current direction",
+        maximum=MAX_DOCUMENT_TEXT_CHARACTERS,
+    )
+
+
+def _unique_discussion_threads(
+    threads: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    unique: list[dict[str, Any]] = []
+    seen: set[tuple[tuple[str, ...], str]] = set()
+    for thread in threads:
+        key = (
+            tuple(thread["initial_position"]["evidence"]),
+            _normalized_document_item(thread["current_direction"]["text"]),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(thread)
+    return unique
+
+
+def _discussion_has_explicit_change(
+    thread: dict[str, Any],
+    segment_texts: dict[str, str],
+) -> bool:
+    evidence = [
+        segment_id
+        for development in thread["developments"]
+        for segment_id in development["evidence"]
+    ]
+    transcript = "".join(segment_texts.get(segment_id, "") for segment_id in evidence)
+    markers = (
+        "而不是",
+        "不只是",
+        "不能只",
+        "改为",
+        "调整为",
+        "转向",
+        "弱化",
+        "优先而非",
+        "先从",
+    )
+    return any(marker in transcript for marker in markers)
+
+
+def _filter_superseded_highlights(
+    highlights: list[dict[str, Any]],
+    threads: list[dict[str, Any]],
+    segment_starts: dict[str, int],
+) -> list[dict[str, Any]]:
+    retained: list[dict[str, Any]] = []
+    for highlight in highlights:
+        highlight_latest = max(
+            segment_starts[segment_id] for segment_id in highlight["evidence"]
+        )
+        superseded = False
+        for thread in threads:
+            first_change = min(
+                segment_starts[segment_id]
+                for segment_id in thread["developments"][0]["evidence"]
+            )
+            if highlight_latest >= first_change:
+                continue
+            anchors = _discussion_topic_anchors(
+                thread["title"] + " " + thread["initial_position"]["text"]
+            )
+            score = sum(anchor in highlight["text"].casefold() for anchor in anchors)
+            if score >= 3:
+                superseded = True
+                break
+        if not superseded:
+            retained.append(highlight)
+    return retained
 
 
 def _validate_evidence_text_list(
@@ -1571,7 +2583,7 @@ def _validate_evidence(
     if (
         not isinstance(value, list)
         or not value
-        or len(value) > MAX_DOCUMENT_ITEMS
+        or len(value) > MAX_DOCUMENT_EVIDENCE_ITEMS
         or any(not isinstance(item, str) or item not in segment_ids for item in value)
     ):
         raise StructuringFailed(f"The structured document has invalid {field}.")

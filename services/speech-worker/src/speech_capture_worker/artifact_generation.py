@@ -548,10 +548,18 @@ def _build_note_markdown(
             ">",
             "> 依据：" + _evidence_links(structured["summary"]["evidence"], block_ids, segment_map),
             "",
-            "## 核心结论",
-            "",
         ]
     )
+    if structured["context"]:
+        lines.extend(["## 背景与参与方", ""])
+        for item in structured["context"]:
+            lines.append(
+                f"- **{item['title']}**：{item['text']} "
+                f"（{_evidence_links(item['evidence'], block_ids, segment_map)}）"
+            )
+        lines.append("")
+
+    lines.extend(["## 核心结论", ""])
     if structured["highlights"]:
         for item in _unique_evidence_items(structured["highlights"]):
             lines.append(
@@ -581,6 +589,69 @@ def _build_note_markdown(
             lines.append("")
     else:
         lines.extend(["暂无可靠的主题归纳。", ""])
+
+    if structured["discussion_threads"]:
+        status_labels = {
+            "confirmed": "已确认",
+            "tentative": "暂定方向",
+            "open": "仍待确认",
+        }
+        lines.extend(["## 讨论演变与当前方向", ""])
+        for thread in structured["discussion_threads"]:
+            initial_evidence = _evidence_links(
+                thread["initial_position"]["evidence"], block_ids, segment_map
+            )
+            lines.extend(
+                [
+                    f"### {thread['title']}",
+                    "",
+                    "- **最初建议**："
+                    + thread["initial_position"]["text"]
+                    + " "
+                    + f"（{initial_evidence}）",
+                ]
+            )
+            for development in thread["developments"]:
+                lines.append(
+                    "- **后续修正**："
+                    + development["text"]
+                    + " "
+                    + f"（{_evidence_links(development['evidence'], block_ids, segment_map)}）"
+                )
+            current_evidence = _evidence_links(
+                thread["current_direction"]["evidence"], block_ids, segment_map
+            )
+            lines.extend(
+                [
+                    "- **当前方向**："
+                    + thread["current_direction"]["text"]
+                    + " "
+                    + f"（{current_evidence}）",
+                    f"- **状态**：{status_labels[thread['status']]}",
+                    "",
+                ]
+            )
+
+    if structured["speaker_summaries"]:
+        lines.extend(["## 参与者与各方观点", ""])
+        for speaker in structured["speaker_summaries"]:
+            identity = speaker["display_name"] or speaker["speaker_id"]
+            descriptors = [
+                value for value in (speaker["affiliation"], speaker["role"]) if value
+            ]
+            if descriptors:
+                identity += f"（{' · '.join(descriptors)}）"
+            lines.extend(
+                [
+                    f"### {identity}",
+                    "",
+                    speaker["summary"]
+                    + " "
+                    + f"（{_evidence_links(speaker['evidence'], block_ids, segment_map)}）",
+                    "",
+                ]
+            )
+            lines.append("")
 
     if structured["decisions"]:
         lines.extend(["## 已确认的决定", ""])
@@ -702,8 +773,11 @@ def _usable_document(value: Any) -> dict[str, Any] | None:
     required = {
         "title",
         "summary",
+        "context",
         "highlights",
         "topics",
+        "discussion_threads",
+        "speaker_summaries",
         "decisions",
         "actions",
         "risks",
@@ -748,10 +822,13 @@ def _fallback_document(*, source_title: str, findings: list[Any]) -> dict[str, A
     return {
         "title": source_title,
         "summary": {"text": summary_text, "evidence": evidence},
+        "context": [],
         "highlights": [
             {"text": finding.text, "evidence": list(finding.evidence)} for finding in overview
         ],
         "topics": topics,
+        "discussion_threads": [],
+        "speaker_summaries": [],
         "decisions": [
             {"text": item.text, "evidence": list(item.evidence)}
             for item in by_kind.get("decision", [])

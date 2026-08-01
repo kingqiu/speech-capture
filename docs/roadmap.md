@@ -45,6 +45,8 @@ Status: in progress. Durable storage, resumable verified intake, one-active-job 
 - job queue and resource preflight;
 - progressive transcript snapshot and event contract;
 - content detection and structured output;
+- optional per-recording free-form context for post-ASR cleanup and synthesis, with
+  transcript evidence remaining authoritative;
 - publication protocol and atomic-package fixtures;
 - transcript corrections and protected human sections;
 - basic Worker Manager setup.
@@ -70,7 +72,7 @@ Exit condition: the project owner approves the task workbench, progressive trans
 
 Goal: implement the approved same-Mac plugin workflow.
 
-- Obsidian source selection and submission;
+- Obsidian source selection, optional free-form context, and submission;
 - Worker selection and local connection states;
 - upload, verification, queue, and job controls;
 - progressive transcript preview;

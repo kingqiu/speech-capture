@@ -125,6 +125,20 @@ class FakeStructuringEngine:
         return {
             "title": "端到端测试会议",
             "summary": {"text": text, "evidence": evidence},
+            "context": [
+                {
+                    "kind": "purpose",
+                    "title": "会议目的",
+                    "text": text,
+                    "evidence": evidence,
+                },
+                {
+                    "kind": "background",
+                    "title": "会议背景",
+                    "text": text,
+                    "evidence": evidence,
+                },
+            ],
             "highlights": [
                 {"text": f"{text}{index}", "evidence": evidence} for index in range(5)
             ],
@@ -137,15 +151,18 @@ class FakeStructuringEngine:
                 }
                 for index in range(5)
             ],
+            "speaker_summaries": [],
             "decisions": [],
             "actions": [],
             "risks": [],
             "open_questions": [],
-            "chapters": [
-                {"title": f"测试主题{index}", "summary": text, "evidence": evidence}
-                for index in range(6)
-            ],
         }
+
+    def synthesize_discussion_threads(self, segments, *, content_type):
+        return []
+
+    def reconcile_decisions(self, document, segments, *, content_type):
+        return list(document.get("decisions", []))
 
     def polish_transcript_batch(self, segments):
         return [

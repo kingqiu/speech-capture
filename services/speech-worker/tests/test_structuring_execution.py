@@ -32,6 +32,7 @@ from speech_capture_worker.structuring_execution import (
     OllamaStructuringEngine,
     StructuringExecutor,
     StructuringOutcome,
+    _validate_document,
 )
 
 
@@ -143,7 +144,10 @@ class FakeStructuringEngine:
         self.classify_calls = 0
         self.extract_calls = 0
         self.synthesize_calls = 0
+        self.speaker_supplement_calls = 0
         self.polish_calls = 0
+        self.extract_inputs = []
+        self.synthesize_inputs = []
 
     def classify(self, segments, *, speaker_count):
         self.classify_calls += 1
@@ -153,19 +157,39 @@ class FakeStructuringEngine:
 
     def extract_batch(self, segments, *, content_type):
         self.extract_calls += 1
+        self.extract_inputs.append([dict(item) for item in segments])
         if self.error is not None:
             raise self.error
         return [dict(finding) for finding in self.findings]
 
     def synthesize_document(self, findings, segments, *, content_type):
         self.synthesize_calls += 1
+        self.synthesize_inputs.append([dict(item) for item in segments])
         if self.error is not None:
             raise self.error
-        evidence = list(findings[0]["evidence"])
-        text = findings[0]["text"]
+        evidence = (
+            list(findings[0]["evidence"])
+            if findings
+            else [segments[0]["segment_id"]]
+        )
+        text = findings[0]["text"] if findings else "从完整逐字稿生成的笔记。"
         return {
             "title": "结构提炼测试会议",
             "summary": {"text": text, "evidence": evidence},
+            "context": [
+                {
+                    "kind": "purpose",
+                    "title": "会议目的",
+                    "text": text,
+                    "evidence": evidence,
+                },
+                {
+                    "kind": "background",
+                    "title": "会议背景",
+                    "text": text,
+                    "evidence": evidence,
+                },
+            ],
             "highlights": [
                 {"text": f"{text}{index}", "evidence": evidence} for index in range(5)
             ],
@@ -178,15 +202,40 @@ class FakeStructuringEngine:
                 }
                 for index in range(5)
             ],
+            "speaker_summaries": [],
             "decisions": [],
             "actions": [],
             "risks": [],
             "open_questions": [],
-            "chapters": [
-                {"title": f"主要议题{index}", "summary": text, "evidence": evidence}
-                for index in range(6)
-            ],
         }
+
+    def synthesize_speaker_summaries(
+        self, segments, *, speaker_ids, content_type
+    ):
+        self.speaker_supplement_calls += 1
+        return [
+            {
+                "speaker_id": speaker_id,
+                "display_name": "",
+                "affiliation": "",
+                "role": "",
+                "summary": f"{speaker_id} 的核心观点。",
+                "evidence": [
+                    next(
+                        item["segment_id"]
+                        for item in segments
+                        if item["speaker_id"] == speaker_id
+                    )
+                ],
+            }
+            for speaker_id in speaker_ids
+        ]
+
+    def synthesize_discussion_threads(self, segments, *, content_type):
+        return []
+
+    def reconcile_decisions(self, document, segments, *, content_type):
+        return list(document.get("decisions", []))
 
     def polish_transcript_batch(self, segments):
         self.polish_calls += 1
@@ -301,6 +350,19 @@ def test_structuring_classifies_and_extracts_evidence_linked_findings(tmp_path) 
         assert engine.extract_calls >= 1
         assert engine.synthesize_calls == 1
         assert engine.polish_calls >= 1
+        assert all(
+            item["text"].endswith("。")
+            for batch in engine.extract_inputs
+            for item in batch
+        )
+        assert len(engine.synthesize_inputs[0]) == len(
+            [segment for segment in snapshot.stable_segments if segment.text]
+        )
+        assert all(
+            item["segment_id"].startswith("s") for item in engine.synthesize_inputs[0]
+        )
+        assert all(item["text"].endswith("。") for item in engine.synthesize_inputs[0])
+        assert raw["prompt_version"] == "2026-08-01.19"
         assert raw["document"]["title"] == "结构提炼测试会议"
         assert sum(
             len(batch["transcript_edits"])
@@ -376,6 +438,7 @@ def test_document_can_be_resynthesized_without_reextracting_batches(tmp_path) ->
             boundary_preflight=preflight(),
         ).run(job.job_id)
         engine = FakeStructuringEngine(findings=findings)
+        engine.model_id = "fake/faster-structuring"
 
         result = StructuringExecutor(
             store,
@@ -389,6 +452,12 @@ def test_document_can_be_resynthesized_without_reextracting_batches(tmp_path) ->
         assert engine.classify_calls == 0
         assert engine.extract_calls == 0
         assert engine.polish_calls == 0
+        checkpoint = next(
+            item
+            for item in store.list_checkpoints(job.job_id, stage="structuring")
+            if item.checkpoint_key == "structuring_result"
+        )
+        assert checkpoint.payload["model_id"] == "fake/faster-structuring"
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")
@@ -523,6 +592,18 @@ def test_structuring_degrades_findings_without_transcript_evidence(tmp_path) -> 
         assert result.content_type is ContentType.MEETING
         assert result.finding_count == 0
         assert result.unavailable_reason_code == "StructuringFailed"
+        assert engine.synthesize_calls == 1
+        checkpoint = next(
+            item
+            for item in store.list_checkpoints(job.job_id, stage="structuring")
+            if item.checkpoint_key == "structuring_result"
+        )
+        raw = json.loads(
+            (store.data_directory / checkpoint.payload["raw_relative_path"]).read_text(
+                "utf-8"
+            )
+        )
+        assert raw["document"]["title"] == "结构提炼测试会议"
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")
@@ -545,6 +626,112 @@ def test_structuring_requires_a_structuring_job(tmp_path) -> None:
                 FakeStructuringEngine(),
                 boundary_preflight=preflight(),
             ).run(job.job_id)
+
+
+def test_discussion_thread_enforces_transcript_order_and_deduplicates() -> None:
+    segment_ids = {"seg_initial", "seg_correction", "seg_current"}
+    evidence = ["seg_initial"]
+    document = {
+        "title": "方案讨论会议",
+        "summary": {
+            "text": "讨论了业务切入口。会议最终确定采用旧方案。",
+            "evidence": evidence,
+        },
+        "context": [
+            {
+                "kind": "purpose",
+                "title": "会议目的",
+                "text": "讨论业务切入口。",
+                "evidence": evidence,
+            },
+            {
+                "kind": "background",
+                "title": "会议背景",
+                "text": "团队需要确定试点方向。",
+                "evidence": evidence,
+            },
+        ],
+        "highlights": [
+            {"text": "销售预测和计划排程作为初始重点场景。", "evidence": evidence},
+            {"text": "核心信息1", "evidence": evidence},
+            {"text": "核心信息2", "evidence": evidence},
+        ],
+        "topics": [
+            {
+                "title": f"议题{index}",
+                "summary": "讨论业务方向。",
+                "details": [],
+                "evidence": evidence,
+            }
+            for index in range(3)
+        ],
+        "discussion_threads": [
+            {
+                "title": "试点切入口",
+                "initial_position": {
+                    "text": "最初建议从销售预测切入。",
+                    "evidence": ["seg_initial"],
+                },
+                "developments": [
+                    {
+                        "text": "随后明确不能只做销售预测。",
+                        "evidence": ["seg_correction"],
+                    }
+                ],
+                "current_direction": {
+                    "text": "当前方向转向计划排程。",
+                    "evidence": ["seg_initial", "seg_current"],
+                },
+                "status": "tentative",
+            }
+        ],
+        "speaker_summaries": [],
+        "decisions": [
+            {
+                "text": "把最初建议误写成已经决定。",
+                "evidence": ["seg_initial"],
+            }
+        ],
+        "actions": [],
+        "risks": [],
+        "open_questions": [],
+    }
+    validation_kwargs = {
+        "segment_ids": segment_ids,
+        "speaker_ids": set(),
+        "content_type": ContentType.MEETING,
+        "segment_texts": {
+            "seg_initial": "最初建议从销售预测切入。",
+            "seg_correction": "随后明确不能只做销售预测。",
+            "seg_current": "当前转向APS计划排程。",
+        },
+        "segment_speakers": {segment_id: None for segment_id in segment_ids},
+        "segment_starts": {
+            "seg_initial": 1_000,
+            "seg_correction": 2_000,
+            "seg_current": 3_000,
+        },
+    }
+    document["discussion_threads"].append(
+        json.loads(json.dumps(document["discussion_threads"][0], ensure_ascii=False))
+    )
+
+    validated = _validate_document(document, **validation_kwargs)
+    assert validated["discussion_threads"][0]["status"] == "tentative"
+    assert len(validated["discussion_threads"]) == 1
+    assert validated["decisions"] == []
+    assert "最终确定" not in validated["summary"]["text"]
+    assert len(validated["highlights"]) == 2
+    assert "APS" in validated["discussion_threads"][0]["current_direction"]["text"]
+
+    out_of_order = json.loads(json.dumps(document, ensure_ascii=False))
+    out_of_order["discussion_threads"][0]["current_direction"]["evidence"] = [
+        "seg_initial"
+    ]
+    repaired = _validate_document(out_of_order, **validation_kwargs)
+    assert repaired["discussion_threads"][0]["current_direction"]["evidence"][-1] == (
+        "seg_current"
+    )
 
 
 def test_ollama_engine_requires_valid_model_name() -> None:

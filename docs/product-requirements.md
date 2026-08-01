@@ -84,13 +84,22 @@ The original source file is never modified or deleted by Speech Capture.
 - Proper nouns, product names, and necessary quotations retain their original form.
 - Full translation is a separate optional artifact and is disabled by default.
 
-### 4.5 Terminology
+### 4.5 Optional recording context
 
-- A Vault-level glossary stores confirmed names and domain terms.
-- A job-level glossary supplements it for a specific recording.
-- Terms extracted from note context are suggestions and require confirmation.
-- The exact vocabulary context sent to ASR is recorded in the job provenance.
-- User corrections may be promoted to the glossary only after explicit confirmation.
+- Submission provides one optional free-form background field without requiring a fixed
+  sentence count, paragraph shape, participant list, or other structured form.
+- The user may provide incomplete context such as the topic, organization names,
+  participant relationships, domain terms, or anything else they happen to know.
+- Raw ASR evidence is produced and preserved independently. The supplied context is used
+  only during downstream transcript cleanup, content interpretation, and structured-note
+  synthesis.
+- Supplied context is a reference, not transcript evidence. It may help normalize a
+  phonetically compatible proper noun, but it cannot create a decision, action, claim, or
+  other meeting fact that is not supported by the transcript.
+- When supplied context conflicts with transcript evidence, the pipeline preserves the
+  evidence, avoids forced replacement, and keeps unresolved ambiguity explicit.
+- V1 does not require users to build or maintain a Vault-wide terminology dictionary.
+  A terminology-learning workflow remains a later quality extension.
 
 ### 4.6 Progressive experience
 
@@ -124,6 +133,8 @@ Important generated statements link to stable transcript evidence.
 - Users may correct text, terminology, speaker names, speaker attribution, and paragraph boundaries.
 - Corrections are recorded separately from raw evidence.
 - Summaries can be regenerated from the corrected transcript.
+- Users may revise the optional recording context and rerun downstream cleanup and note
+  synthesis without overwriting immutable raw ASR evidence.
 - User-owned sections such as `我的补充` are protected from regeneration.
 - A changed generated section creates a new revision rather than silently replacing user edits.
 
