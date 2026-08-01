@@ -81,6 +81,12 @@ The Worker core already enforces this attempt-level boundary before final packag
 
 `transcript.md` is the readable, correctable record.
 
+The human-facing transcript uses a faithful editorial layer for punctuation and obvious
+speech disfluency cleanup. The original ASR text remains available as `raw_text` in
+`speech-record.json`. Non-speech ranges and clear sub-second recognition hallucinations are
+kept in machine evidence but omitted from the reading surface; significant inaudible ranges
+remain explicit.
+
 Each stable segment contains:
 
 - start and end time;
@@ -114,17 +120,18 @@ Generated sections can be refreshed from the reviewed transcript. User-owned sec
 
 ## 5. Main note structure
 
-Every note contains a common core:
+Every note contains a content-first common core:
 
 ```text
 Properties
-Title and status
-One-minute overview
-Key information
-Evidence-linked details
-People and terminology
-Uncertainties and omissions
-Source and processing provenance
+Title
+Narrative content summary
+Core conclusions
+Thematic discussion with evidence-linked details
+Decisions and action items when present
+Risks and unresolved questions when present
+Time-ordered chapter navigation
+Recording information and folded uncertainties
 My additions
 ```
 

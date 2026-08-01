@@ -46,6 +46,7 @@ tmp/
 **/test-data-private/
 **/tests/fixtures/private/
 **/tests/output/
+reference/
 
 # Editors
 .idea/

@@ -133,6 +133,45 @@ class FakeStructuringEngine:
     def extract_batch(self, segments, *, content_type):
         return [dict(finding) for finding in self.findings]
 
+    def synthesize_document(self, findings, segments, *, content_type):
+        evidence = list(findings[0]["evidence"])
+        text = findings[0]["text"]
+        actions = []
+        decisions = []
+        if findings[0]["kind"] == "action_item":
+            actions.append({"task": text, "owner": "", "deadline": "", "evidence": evidence})
+        if findings[0]["kind"] == "decision":
+            decisions.append({"text": text, "evidence": evidence})
+        return {
+            "title": "平台规划会议",
+            "summary": {"text": text, "evidence": evidence},
+            "highlights": [
+                {"text": f"{text}{index}", "evidence": evidence} for index in range(5)
+            ],
+            "topics": [
+                {
+                    "title": f"平台规划{index}",
+                    "summary": text,
+                    "details": [{"text": text, "evidence": evidence}],
+                    "evidence": evidence,
+                }
+                for index in range(5)
+            ],
+            "decisions": decisions,
+            "actions": actions,
+            "risks": [],
+            "open_questions": [],
+            "chapters": [
+                {"title": f"平台规划{index}", "summary": text, "evidence": evidence}
+                for index in range(6)
+            ],
+        }
+
+    def polish_transcript_batch(self, segments):
+        return [
+            {"segment_id": item["segment_id"], "text": item["text"] + "。"} for item in segments
+        ]
+
 
 def create_quality_check_job(
     store: JobStore,
@@ -249,10 +288,13 @@ def test_artifact_generation_writes_four_files_and_advances_to_processed(
         assert transcript.startswith("## ")
         assert "^sp-" in transcript
         assert speech_record["content"]["type"] == "meeting"
+        assert speech_record["document"]["title"] == "平台规划会议"
         assert speech_record["segments"]
+        assert speech_record["segments"][0]["raw_text"]
         assert speech_record["findings"][0]["evidence"]
         assert "## 我的补充" in note
-        assert "## 关键信息" in note
+        assert "## 议题与讨论" in note
+        assert "[[transcript#^sp-" in note
         assert result.speech_id == speech_record["speech_id"]
 
 
@@ -315,9 +357,9 @@ def test_processed_job_can_restructure_and_regenerate_useful_note(tmp_path) -> N
     assert regenerated.outcome is ArtifactOutcome.REGENERATED
     assert regenerated.job.state is JobState.PROCESSED
     assert regenerated.manifest_sha256 != first.manifest_sha256
-    assert "## 一分钟总览" in note
+    assert "> [!abstract] 内容总结" in note
     assert "重新生成后的有效结论。" in note
-    assert "证据：^sp-" in note
+    assert "[[transcript#^sp-" in note
     assert manifest["structuring_checkpoint_generation"] == 2
 
 

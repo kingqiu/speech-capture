@@ -29,7 +29,7 @@ from speech_capture_worker.domain import (
     ModelProfile,
     UploadCreateRequest,
 )
-from speech_capture_worker.errors import UploadStorageError, WorkerCoreError
+from speech_capture_worker.errors import InvalidJobRequest, UploadStorageError, WorkerCoreError
 from speech_capture_worker.forced_alignment import (
     ForcedAlignmentExecutor,
     ForcedAlignmentOutcome,
@@ -422,9 +422,24 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Ollama model name for classification and extraction.",
     )
     run_structuring.add_argument(
+        "--editor-model",
+        default="qwen3:8b",
+        help="Ollama model name for faithful transcript punctuation and cleanup.",
+    )
+    run_structuring.add_argument(
         "--force",
         action="store_true",
         help="Recompute structuring evidence for a quality-check or processed job.",
+    )
+    run_structuring.add_argument(
+        "--document-only",
+        action="store_true",
+        help="Re-synthesize only the global note from durable extracted findings.",
+    )
+    run_structuring.add_argument(
+        "--transcript-edits-only",
+        action="store_true",
+        help="Retry only failed transcript-edit batches with smaller contexts.",
     )
 
     generate_artifacts = subparsers.add_parser(
@@ -804,10 +819,23 @@ def _dispatch(args: argparse.Namespace) -> int:
             _write_json(result.to_dict())
             return 2 if result.outcome is DiarizationOutcome.SAFE_PAUSED else 0
         if args.command == "run-structuring":
-            result = StructuringExecutor(
+            executor = StructuringExecutor(
                 store,
-                OllamaStructuringEngine(model=args.model),
-            ).run(args.job_id, force=args.force)
+                OllamaStructuringEngine(
+                    model=args.model,
+                    editor_model=args.editor_model,
+                ),
+            )
+            if args.document_only and args.transcript_edits_only:
+                raise InvalidJobRequest(
+                    "Choose either --document-only or --transcript-edits-only."
+                )
+            if args.document_only:
+                result = executor.resynthesize_document(args.job_id)
+            elif args.transcript_edits_only:
+                result = executor.repair_transcript_edits(args.job_id)
+            else:
+                result = executor.run(args.job_id, force=args.force)
             _write_json(result.to_dict())
             return 2 if result.outcome is StructuringOutcome.SAFE_PAUSED else 0
         if args.command == "generate-artifacts":

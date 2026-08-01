@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import shutil
 import wave
 
@@ -123,7 +124,14 @@ class FakeAsrEngine:
 class FakeStructuringEngine:
     model_id = "fake/structuring"
 
-    def __init__(self, *, classification=None, findings=None, error=None):
+    def __init__(
+        self,
+        *,
+        classification=None,
+        findings=None,
+        error=None,
+        polish_error=None,
+    ):
         self.classification = classification or {
             "type": "meeting",
             "traits": ["multi_speaker", "action_oriented"],
@@ -131,8 +139,11 @@ class FakeStructuringEngine:
         }
         self.findings = findings or []
         self.error = error
+        self.polish_error = polish_error
         self.classify_calls = 0
         self.extract_calls = 0
+        self.synthesize_calls = 0
+        self.polish_calls = 0
 
     def classify(self, segments, *, speaker_count):
         self.classify_calls += 1
@@ -145,6 +156,47 @@ class FakeStructuringEngine:
         if self.error is not None:
             raise self.error
         return [dict(finding) for finding in self.findings]
+
+    def synthesize_document(self, findings, segments, *, content_type):
+        self.synthesize_calls += 1
+        if self.error is not None:
+            raise self.error
+        evidence = list(findings[0]["evidence"])
+        text = findings[0]["text"]
+        return {
+            "title": "结构提炼测试会议",
+            "summary": {"text": text, "evidence": evidence},
+            "highlights": [
+                {"text": f"{text}{index}", "evidence": evidence} for index in range(5)
+            ],
+            "topics": [
+                {
+                    "title": f"主要议题{index}",
+                    "summary": text,
+                    "details": [{"text": text, "evidence": evidence}],
+                    "evidence": evidence,
+                }
+                for index in range(5)
+            ],
+            "decisions": [],
+            "actions": [],
+            "risks": [],
+            "open_questions": [],
+            "chapters": [
+                {"title": f"主要议题{index}", "summary": text, "evidence": evidence}
+                for index in range(6)
+            ],
+        }
+
+    def polish_transcript_batch(self, segments):
+        self.polish_calls += 1
+        if self.error is not None:
+            raise self.error
+        if self.polish_error is not None:
+            raise self.polish_error
+        return [
+            {"segment_id": item["segment_id"], "text": item["text"] + "。"} for item in segments
+        ]
 
 
 def create_structuring_job(
@@ -230,6 +282,14 @@ def test_structuring_classifies_and_extracts_evidence_linked_findings(tmp_path) 
             boundary_preflight=preflight(),
         ).run(job.job_id)
         checkpoints = store.list_checkpoints(job.job_id, stage="structuring")
+        evidence = next(
+            checkpoint
+            for checkpoint in checkpoints
+            if checkpoint.checkpoint_key == "structuring_result"
+        )
+        raw = json.loads(
+            (store.data_directory / evidence.payload["raw_relative_path"]).read_text("utf-8")
+        )
 
         assert result.outcome is StructuringOutcome.COMPLETED
         assert result.job.state is JobState.QUALITY_CHECK
@@ -239,10 +299,14 @@ def test_structuring_classifies_and_extracts_evidence_linked_findings(tmp_path) 
         assert result.batch_count >= 1
         assert engine.classify_calls == 1
         assert engine.extract_calls >= 1
-        assert any(
-            checkpoint.checkpoint_key == "structuring_result"
-            for checkpoint in checkpoints
-        )
+        assert engine.synthesize_calls == 1
+        assert engine.polish_calls >= 1
+        assert raw["document"]["title"] == "结构提炼测试会议"
+        assert sum(
+            len(batch["transcript_edits"])
+            for batch in raw["transcript_edit_results"]
+        ) == len(snapshot.stable_segments)
+        assert any(checkpoint.checkpoint_key == "structuring_result" for checkpoint in checkpoints)
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")
@@ -286,6 +350,89 @@ def test_structuring_is_idempotent_after_restart(tmp_path) -> None:
         assert result.outcome is StructuringOutcome.ALREADY_COMPLETED
         assert result.job.state is JobState.QUALITY_CHECK
         assert engine.classify_calls == 0
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")
+def test_document_can_be_resynthesized_without_reextracting_batches(tmp_path) -> None:
+    with JobStore(
+        tmp_path / "worker.sqlite3",
+        source_probe=source_probe_for(95),
+    ) as store:
+        job = create_structuring_job(
+            store,
+            duration_seconds=95,
+            suffix="document-only",
+        )
+        segment_id = store.get_job_snapshot(job.job_id).stable_segments[0].segment_id
+        findings = [{
+            "kind": "topic",
+            "text": "平台规划。",
+            "evidence": [segment_id],
+            "confidence": 0.9,
+        }]
+        StructuringExecutor(
+            store,
+            FakeStructuringEngine(findings=findings),
+            boundary_preflight=preflight(),
+        ).run(job.job_id)
+        engine = FakeStructuringEngine(findings=findings)
+
+        result = StructuringExecutor(
+            store,
+            engine,
+            boundary_preflight=preflight(),
+        ).resynthesize_document(job.job_id)
+
+        assert result.outcome is StructuringOutcome.REGENERATED
+        assert result.evidence_checkpoint_generation == 2
+        assert engine.synthesize_calls == 1
+        assert engine.classify_calls == 0
+        assert engine.extract_calls == 0
+        assert engine.polish_calls == 0
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")
+def test_failed_transcript_edits_can_be_repaired_without_reextracting(tmp_path) -> None:
+    with JobStore(
+        tmp_path / "worker.sqlite3",
+        source_probe=source_probe_for(95),
+    ) as store:
+        job = create_structuring_job(
+            store,
+            duration_seconds=95,
+            suffix="edit-repair",
+        )
+        segment_id = store.get_job_snapshot(job.job_id).stable_segments[0].segment_id
+        findings = [{
+            "kind": "topic",
+            "text": "平台规划。",
+            "evidence": [segment_id],
+            "confidence": 0.9,
+        }]
+        first = StructuringExecutor(
+            store,
+            FakeStructuringEngine(
+                findings=findings,
+                polish_error=RuntimeError("edit failed"),
+            ),
+            boundary_preflight=preflight(),
+        ).run(job.job_id)
+        assert first.unavailable_reason_code == "RuntimeError"
+        engine = FakeStructuringEngine(findings=findings)
+
+        result = StructuringExecutor(
+            store,
+            engine,
+            boundary_preflight=preflight(),
+        ).repair_transcript_edits(job.job_id)
+
+        assert result.outcome is StructuringOutcome.REGENERATED
+        assert result.evidence_checkpoint_generation == 2
+        assert result.unavailable_reason_code is None
+        assert engine.synthesize_calls == 0
+        assert engine.classify_calls == 0
+        assert engine.extract_calls == 0
+        assert engine.polish_calls >= 1
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")

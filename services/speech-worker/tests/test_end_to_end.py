@@ -119,6 +119,39 @@ class FakeStructuringEngine:
             }
         ]
 
+    def synthesize_document(self, findings, segments, *, content_type):
+        evidence = list(findings[0]["evidence"])
+        text = findings[0]["text"]
+        return {
+            "title": "端到端测试会议",
+            "summary": {"text": text, "evidence": evidence},
+            "highlights": [
+                {"text": f"{text}{index}", "evidence": evidence} for index in range(5)
+            ],
+            "topics": [
+                {
+                    "title": f"测试主题{index}",
+                    "summary": text,
+                    "details": [{"text": text, "evidence": evidence}],
+                    "evidence": evidence,
+                }
+                for index in range(5)
+            ],
+            "decisions": [],
+            "actions": [],
+            "risks": [],
+            "open_questions": [],
+            "chapters": [
+                {"title": f"测试主题{index}", "summary": text, "evidence": evidence}
+                for index in range(6)
+            ],
+        }
+
+    def polish_transcript_batch(self, segments):
+        return [
+            {"segment_id": item["segment_id"], "text": item["text"] + "。"} for item in segments
+        ]
+
 
 def ready_preflight(*_, **__) -> ResourceReport:
     return ResourceReport(
@@ -183,10 +216,7 @@ def intake_and_transcribe(store: JobStore, runtime) -> tuple[str, int]:
     assert finalized.job.state is JobState.DIARIZING
     assert finalized.report.ready_for_diarization is True
     assert finalized.report.unresolved_duration_ms == 0
-    assert (
-        finalized.report.aligned_transcribed_segment_count
-        == finalized.report.segment_count
-    )
+    assert finalized.report.aligned_transcribed_segment_count == finalized.report.segment_count
     return job_id, batch.total_chunks
 
 
