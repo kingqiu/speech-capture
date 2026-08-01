@@ -42,6 +42,10 @@ from speech_capture_worker.gap_analysis import (
     DefiniteSilenceMaterializer,
     TranscriptGapAnalyzer,
 )
+from speech_capture_worker.gap_retranscription import (
+    GapRetranscriptionExecutor,
+    GapRetranscriptionOutcome,
+)
 from speech_capture_worker.gap_review import ReviewedGapMaterializer
 from speech_capture_worker.gap_speech_activity import (
     GapSpeechActivityAnalyzer,
@@ -425,6 +429,14 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_data_dir(generate_artifacts)
     generate_artifacts.add_argument("job_id")
 
+    retranscribe_gaps = subparsers.add_parser(
+        "retranscribe-gaps",
+        help="Re-transcribe VAD-identified speech gaps with raw evidence.",
+    )
+    _add_data_dir(retranscribe_gaps)
+    retranscribe_gaps.add_argument("job_id")
+    retranscribe_gaps.add_argument("--max-attempts", type=int, default=3)
+
     list_asr_attempts = subparsers.add_parser(
         "list-asr-attempts",
         help="List safe raw-attempt metadata without transcript content.",
@@ -792,6 +804,15 @@ def _dispatch(args: argparse.Namespace) -> int:
             result = ArtifactGenerator(store).generate(args.job_id)
             _write_json(result.to_dict())
             return 0
+        if args.command == "retranscribe-gaps":
+            job = store.get_job(args.job_id)
+            result = GapRetranscriptionExecutor(
+                store,
+                MlxQwenAsrEngine(model_profile=job.model_profile),
+                max_attempts=args.max_attempts,
+            ).run(args.job_id)
+            _write_json(result.to_dict())
+            return 2 if result.outcome is GapRetranscriptionOutcome.SAFE_PAUSED else 0
         if args.command == "list-asr-attempts":
             attempts = store.list_asr_attempts(
                 args.job_id,

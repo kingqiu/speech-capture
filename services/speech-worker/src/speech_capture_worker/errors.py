@@ -141,3 +141,7 @@ class StructuringFailed(WorkerCoreError):
 
 class ArtifactGenerationFailed(WorkerCoreError):
     code = "ARTIFACT_GENERATION_FAILED"
+
+
+class GapRetranscriptionFailed(WorkerCoreError):
+    code = "GAP_RETRANSCRIPTION_FAILED"

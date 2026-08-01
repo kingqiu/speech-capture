@@ -906,6 +906,7 @@ class JobStore:
         speaker_id: str | None = None,
         speaker_label_status: SpeakerLabelStatus = SpeakerLabelStatus.PENDING,
         error_code: str | None = None,
+        allow_aligning: bool = False,
     ) -> tuple[TranscriptSegment, bool]:
         """Commit one non-overlapping stable timeline outcome idempotently."""
 
@@ -920,6 +921,8 @@ class JobStore:
             raise InvalidJobRequest("timing_status is not supported.")
         if not isinstance(speaker_label_status, SpeakerLabelStatus):
             raise InvalidJobRequest("speaker_label_status is not supported.")
+        if not isinstance(allow_aligning, bool):
+            raise InvalidJobRequest("allow_aligning must be a boolean.")
         self._validate_segment_content(
             outcome=outcome,
             text=text,
@@ -944,9 +947,13 @@ class JobStore:
         fingerprint = hashlib.sha256(_canonical_json(request_payload).encode("utf-8")).hexdigest()
         with self._transaction():
             job = self._row_to_job(self._fetch_job_row(job_id))
-            if job.state is not JobState.TRANSCRIBING:
+            allowed = job.state is JobState.TRANSCRIBING or (
+                allow_aligning and job.state is JobState.ALIGNING
+            )
+            if not allowed:
                 raise InvalidJobRequest(
-                    "Stable transcript outcomes can be committed only while transcribing."
+                    "Stable transcript outcomes can be committed only while "
+                    "transcribing or aligning."
                 )
             duration_ms = self._job_duration_ms(job)
             validate_time_range(start_ms, end_ms, duration_ms=duration_ms)
