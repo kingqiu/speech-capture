@@ -1251,7 +1251,7 @@ FastAPI，并加入设备身份和 Vault 授权。阶段 H 的 Obsidian 前端�
 
 - [x] 定义协议版本和能力协商。
 - [x] 建立 OpenAPI。
-- [ ] 生成 Python 和 TypeScript 类型。
+- [x] 生成 Python 和 TypeScript 类型。
 - [ ] 实现 FastAPI 健康、能力、上传、作业、快照、更新和产物接口。
 - [ ] 实现大文件断点续传。
 - [ ] 实现有限制的轮询或 SSE 更新。
@@ -2558,3 +2558,22 @@ Stage E 已在 `9872f20 Implement atomic Vault publication` 提交并推送到
 
 下一步严格生成 Python 和 TypeScript 类型，再继续正式 API；任何任务、上传、快照、更新或产物
 接口都必须先落好认证边界。不得提前进入阶段 G 或阶段 H 前端。
+
+---
+
+## 46. 2026-08-02 Stage F 跨语言协议类型
+
+阶段 F 第三个工作项已经完成：
+
+- `packages/protocol/scripts/generate_types.py` 从固定 OpenAPI 3.1 文档确定性生成 Python 和
+  TypeScript wire types，不引入 Node 工程或额外生成器运行时；
+- Python 输出使用 `TypedDict`、`Literal`、`NotRequired`，TypeScript 输出使用只读
+  `interface`、联合类型和 `ReadonlyArray`；两者保持原始 JSON 字段名；
+- 输出嵌入源 OpenAPI SHA-256 和协议版本，`--check` 为 CI 提供只读漂移门禁；
+- 新增 5 项测试覆盖重复生成、篡改检测、版本、枚举、必填/可选字段和跨语言 wire 语义；
+- 当前全套 `341` 项测试以及 Ruff、`compileall`、OpenAPI/类型同步和 `git diff --check`
+  全部通过；私有数据未进入生成输入或 Git 范围。
+
+下一步严格实现正式 FastAPI 接口。已有三个发现接口可保持公开；上传、作业、快照、更新和产物
+涉及私人内容，必须先建立统一认证依赖及其拒绝测试，再逐组接入现有持久化核心。不得提前进入
+阶段 G 或阶段 H 前端。

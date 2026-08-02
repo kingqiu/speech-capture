@@ -373,6 +373,14 @@ The plugin and Worker exchange:
 
 A compatible older feature set may continue. An incompatible client is blocked before upload with a clear upgrade instruction.
 
+The checked-in OpenAPI document is also the sole source for generated wire types:
+
+- `packages/protocol/generated/python/speech_capture_protocol.py`;
+- `packages/protocol/generated/typescript/speech-capture-protocol.ts`.
+
+Both outputs embed the source OpenAPI SHA-256. `packages/protocol/scripts/generate_types.py --check` fails when
+the schema and either language output drift apart.
+
 ## 12. Provider independence
 
 No endpoint assumes Google Drive or another sync provider.
