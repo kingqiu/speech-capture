@@ -1249,8 +1249,8 @@ FastAPI，并加入设备身份和 Vault 授权。阶段 H 的 Obsidian 前端�
 
 #### 工作项
 
-- [ ] 定义协议版本和能力协商。
-- [ ] 建立 OpenAPI。
+- [x] 定义协议版本和能力协商。
+- [x] 建立 OpenAPI。
 - [ ] 生成 Python 和 TypeScript 类型。
 - [ ] 实现 FastAPI 健康、能力、上传、作业、快照、更新和产物接口。
 - [ ] 实现大文件断点续传。
@@ -2542,3 +2542,19 @@ Stage E 已在 `9872f20 Implement atomic Vault publication` 提交并推送到
 `origin/agent/worker-core`，私有 runtime、reference、音频和生成数据未进入 Git。项目所有者
 随后明确确认继续，下一步严格进入阶段 F：先定义协议版本与能力协商，再建立 OpenAPI；不提前
 进入阶段 G 或阶段 H 前端。
+
+---
+
+## 45. 2026-08-02 Stage F 协议版本、能力协商与首版 OpenAPI
+
+阶段 F 前两个工作项已经完成，没有进入设备配对、远程访问或前端：
+
+- 定义协议 `1.0.0`、artifact schema `1.6.0` 的版本范围和明确兼容原因；
+- 能力协商支持未来客户端提出当前 Worker 未知的能力名称，并以稳定缺失能力响应拒绝上传；
+- FastAPI 首版仅提供健康、能力和协商三个不含私人数据的发现接口；
+- OpenAPI 3.1 固定生成到 `packages/protocol/openapi.json`，路径与 operation ID 已由契约测试锁定；
+- 全套 `336` 项测试、Ruff、`compileall`、`git diff --check` 通过，规范文件重复生成哈希一致；
+- 私有音频、逐字稿、Note、runtime、reference 和测试输出继续由 Git 忽略。
+
+下一步严格生成 Python 和 TypeScript 类型，再继续正式 API；任何任务、上传、快照、更新或产物
+接口都必须先落好认证边界。不得提前进入阶段 G 或阶段 H 前端。

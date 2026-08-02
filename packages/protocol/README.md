@@ -1,15 +1,13 @@
 # Speech Capture Protocol
 
-Status: contract direction only; schemas and generated types have not been added.
+This directory contains the versioned Worker protocol artifacts shared with future clients.
 
-This package will be the compatibility boundary between the Obsidian plugin and Speech Worker. It will contain:
+- `openapi.json` is generated from the FastAPI schemas and checked into Git.
+- Protocol and artifact compatibility are negotiated before upload.
+- Generated Python and TypeScript types will be added in the next Stage F work item.
 
-- versioned OpenAPI documents;
-- artifact JSON Schemas;
-- stable job-state and error-code enums;
-- generated TypeScript and Python types;
-- compatibility fixtures and contract tests.
+Regenerate the canonical OpenAPI document from the repository root:
 
-The protocol must remain independent from Obsidian sync, Google Drive, Tailscale, and individual model providers.
-
-See the [Worker API direction](../../docs/worker-api.md) and [data model](../../docs/data-model-and-output.md).
+```bash
+services/speech-worker/.venv/bin/python services/speech-worker/scripts/export_openapi.py
+```

@@ -22,11 +22,14 @@ It gives the plugin one consistent interface for local and remote processing whi
 
 ## 3. Planned resources
 
-The exact OpenAPI schema will be produced during implementation. The design baseline reserves these resource groups:
+The canonical implemented schema is checked in at `packages/protocol/openapi.json`. The first Stage F slice only
+implements the three non-private discovery endpoints below; all other resource groups remain reserved until their
+authentication and authorization boundaries are implemented.
 
 ```text
 GET    /v1/health
 GET    /v1/capabilities
+POST   /v1/capabilities/negotiate
 
 POST   /v1/pairing/sessions
 POST   /v1/pairing/confirm
@@ -66,6 +69,9 @@ POST   /v1/diagnostics/export
 ### Local
 
 Local calls still use an application credential. Loopback is not treated as proof of identity.
+
+The initial health, capability, and compatibility-negotiation endpoints contain no job or user content and are the
+only pre-authentication surface. Stateful and private-data endpoints must not be added without credential checks.
 
 ### Remote
 
