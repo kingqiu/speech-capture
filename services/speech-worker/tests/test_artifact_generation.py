@@ -20,10 +20,17 @@ from speech_capture_worker.artifact_generation import (
     ArtifactGenerator,
     ArtifactOutcome,
     _filter_scene_actions,
+    _read_manual_section,
 )
 from speech_capture_worker.asr_execution import AsrChunkExecutor, AsrRunOutcome
+from speech_capture_worker.corrections import CorrectionField
 from speech_capture_worker.domain import JobState, ResourceStatus, UploadCreateRequest
-from speech_capture_worker.errors import ArtifactGenerationFailed, InvalidJobRequest
+from speech_capture_worker.errors import (
+    ArtifactGenerationFailed,
+    InvalidJobRequest,
+    RevisionConflict,
+    UploadStorageError,
+)
 from speech_capture_worker.job_store import JobStore
 from speech_capture_worker.media_probe import MediaProbeResult
 from speech_capture_worker.resources import (
@@ -36,6 +43,7 @@ from speech_capture_worker.resources import (
 from speech_capture_worker.structuring_execution import (
     StructuringExecutor,
 )
+from speech_capture_worker.transcript import SpeakerLabelStatus
 
 
 def wav_bytes(*, duration_seconds: float) -> bytes:
@@ -75,6 +83,20 @@ def test_speech_actions_require_independent_action_evidence() -> None:
 
     assert filtered["actions"] == [{"task": "明确安排", "evidence": ["seg_action"]}]
     assert len(document["actions"]) == 2
+
+
+def test_manual_section_reader_rejects_symlink_and_invalid_utf8(tmp_path) -> None:
+    target = tmp_path / "target.md"
+    target.write_text("## 我的补充\n\n用户内容。\n", "utf-8")
+    symlink = tmp_path / "note-symlink.md"
+    symlink.symlink_to(target)
+    invalid = tmp_path / "note-invalid.md"
+    invalid.write_bytes(b"## \xff\n")
+
+    with pytest.raises(UploadStorageError, match="cannot be a symlink"):
+        _read_manual_section(symlink)
+    with pytest.raises(ArtifactGenerationFailed, match="not valid UTF-8"):
+        _read_manual_section(invalid)
 
 
 def source_probe_for(duration_seconds: float):
@@ -298,6 +320,7 @@ def create_quality_check_job(
     content_type: str = "meeting",
     scene_kind: str | None = None,
     scene_title: str | None = None,
+    speaker_id: str | None = None,
 ):
     content = wav_bytes(duration_seconds=duration_seconds)
     checksum = hashlib.sha256(content).hexdigest()
@@ -334,12 +357,29 @@ def create_quality_check_job(
     assert batch.outcome is AsrRunOutcome.TRANSCRIPTION_COMPLETED
     finalized = TranscriptAlignmentFinalizer(store).finalize(claimed.job_id)
     assert finalized.outcome is AlignmentFinalizationOutcome.READY_FOR_DIARIZATION
-    structuring = store.transition_job(
-        claimed.job_id,
-        JobState.STRUCTURING,
-        expected_revision=finalized.job.revision,
-        reason_code="test_enter_structuring",
-    )
+    if speaker_id is not None:
+        diarizing = finalized.job
+        segment = store.get_job_snapshot(claimed.job_id).stable_segments[0]
+        store.update_transcript_segment_metadata(
+            claimed.job_id,
+            segment.segment_id,
+            expected_revision=segment.revision,
+            speaker_id=speaker_id,
+            speaker_label_status=SpeakerLabelStatus.ANONYMOUS,
+        )
+        structuring = store.transition_job(
+            claimed.job_id,
+            JobState.STRUCTURING,
+            expected_revision=diarizing.revision,
+            reason_code="test_enter_structuring",
+        )
+    else:
+        structuring = store.transition_job(
+            claimed.job_id,
+            JobState.STRUCTURING,
+            expected_revision=finalized.job.revision,
+            reason_code="test_enter_structuring",
+        )
     if not with_structuring:
         return store.transition_job(
             claimed.job_id,
@@ -521,6 +561,184 @@ def test_artifact_generation_is_idempotent_after_restart(tmp_path) -> None:
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")
+def test_regeneration_preserves_manual_note_section_verbatim_and_rehashes_package(
+    tmp_path,
+) -> None:
+    with JobStore(
+        tmp_path / "worker.sqlite3",
+        source_probe=source_probe_for(95),
+    ) as store:
+        job = create_quality_check_job(
+            store,
+            duration_seconds=95,
+            suffix="manual-section",
+        )
+        first = ArtifactGenerator(store).generate(job.job_id)
+        package = store.get_job_stage_directory(job.job_id, stage="artifacts")
+        note_path = package / "note.md"
+        original = note_path.read_text("utf-8")
+        manual_section = (
+            "## 我的补充\n\n"
+            "这是用户手写的判断，必须原样保留。\n\n"
+            "- [ ] 后续核对客户名称\n\n"
+            "> [!note] 私人备注\n"
+            "> 可以包含 Obsidian callout。\n\n"
+            "## 我自己的二级标题\n\n"
+            "这里仍属于终端人工区域。\n"
+        )
+        edited = original.replace("# 平台规划会议", "# 用户不应改写生成区", 1)
+        edited = edited[: edited.index("## 我的补充")] + manual_section
+        note_path.write_text(edited, "utf-8")
+
+        regenerated = ArtifactGenerator(store).generate(job.job_id)
+        note = note_path.read_text("utf-8")
+        evidence_note = (package / "note.evidence.md").read_text("utf-8")
+        manifest = json.loads((package / "artifact-manifest.json").read_text("utf-8"))
+        replayed = ArtifactGenerator(store).generate(job.job_id)
+
+    assert regenerated.outcome is ArtifactOutcome.REGENERATED
+    assert regenerated.manifest_sha256 != first.manifest_sha256
+    assert note.startswith("# 平台规划会议\n")
+    assert note.endswith(manual_section)
+    assert note.count("## 我的补充") == 1
+    assert "私人备注" not in evidence_note
+    assert manifest["files"]["note.md"] == hashlib.sha256(
+        note.encode("utf-8")
+    ).hexdigest()
+    assert replayed.outcome is ArtifactOutcome.ALREADY_GENERATED
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")
+def test_append_only_corrections_regenerate_only_derived_artifacts(tmp_path) -> None:
+    with JobStore(
+        tmp_path / "worker.sqlite3",
+        source_probe=source_probe_for(95),
+    ) as store:
+        job = create_quality_check_job(
+            store,
+            duration_seconds=95,
+            suffix="corrections",
+            speaker_id="speaker_0",
+        )
+        ArtifactGenerator(store).generate(job.job_id)
+        package = store.get_job_stage_directory(job.job_id, stage="artifacts")
+        raw_before = (package / "transcript.raw.json").read_bytes()
+        original_segment = store.get_job_snapshot(job.job_id).stable_segments[0]
+        original_record = json.loads((package / "speech-record.json").read_text("utf-8"))
+        current_text = original_record["segments"][0]["text"]
+        revised_text = current_text.replace("稳定文字", "校订文字")
+
+        current_job = store.get_job(job.job_id)
+        text_correction, created = store.append_correction(
+            job.job_id,
+            field=CorrectionField.TRANSCRIPT_TEXT,
+            target_id=original_segment.segment_id,
+            before=current_text,
+            after=revised_text,
+            author="test-user",
+            idempotency_key="correction-text-1",
+            expected_revision=current_job.revision,
+        )
+        assert created is True
+        replayed, created = store.append_correction(
+            job.job_id,
+            field=CorrectionField.TRANSCRIPT_TEXT,
+            target_id=original_segment.segment_id,
+            before=current_text,
+            after=revised_text,
+            author="test-user",
+            idempotency_key="correction-text-1",
+            expected_revision=current_job.revision,
+        )
+        assert created is False
+        assert replayed.correction_id == text_correction.correction_id
+        with pytest.raises(RevisionConflict):
+            store.append_correction(
+                job.job_id,
+                field=CorrectionField.TRANSCRIPT_TEXT,
+                target_id=original_segment.segment_id,
+                before=revised_text,
+                after=revised_text + "已再次修改。",
+                author="test-user",
+                idempotency_key="correction-text-stale",
+                expected_revision=current_job.revision,
+            )
+
+        current_job = store.get_job(job.job_id)
+        store.append_correction(
+            job.job_id,
+            field=CorrectionField.SPEAKER_DISPLAY_NAME,
+            target_id="speaker_0",
+            before="Speaker 0",
+            after="王总",
+            author="test-user",
+            idempotency_key="correction-speaker-1",
+            expected_revision=current_job.revision,
+        )
+        current_job = store.get_job(job.job_id)
+        store.append_correction(
+            job.job_id,
+            field=CorrectionField.RECORDING_DATE,
+            target_id=None,
+            before=None,
+            after="2026-08-01",
+            author="test-user",
+            idempotency_key="correction-date-1",
+            expected_revision=current_job.revision,
+        )
+
+        regenerated = ArtifactGenerator(store).generate(job.job_id)
+        transcript = (package / "transcript.md").read_text("utf-8")
+        record = json.loads((package / "speech-record.json").read_text("utf-8"))
+        evidence_note = (package / "note.evidence.md").read_text("utf-8")
+        stable_after = store.get_job_snapshot(job.job_id).stable_segments[0]
+        already = ArtifactGenerator(store).generate(job.job_id)
+
+    assert regenerated.outcome is ArtifactOutcome.REGENERATED
+    assert already.outcome is ArtifactOutcome.ALREADY_GENERATED
+    assert (package / "transcript.raw.json").read_bytes() == raw_before
+    assert stable_after.text == original_segment.text
+    assert revised_text in transcript
+    assert "· 王总" in transcript
+    assert record["segments"][0]["text"] == revised_text
+    assert record["segments"][0]["raw_text"] == original_segment.text
+    assert record["dates"]["recording_date"] == "2026-08-01"
+    assert record["speakers"] == [{"display_name": "王总", "speaker_id": "speaker_0"}]
+    assert [item["field"] for item in record["corrections"][-3:]] == [
+        "transcript_text",
+        "speaker_display_name",
+        "recording_date",
+    ]
+    assert "recording_date: 2026-08-01" in evidence_note
+    assert "  - 王总" in evidence_note
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")
+def test_regeneration_refuses_to_overwrite_existing_note_without_manual_boundary(
+    tmp_path,
+) -> None:
+    with JobStore(
+        tmp_path / "worker.sqlite3",
+        source_probe=source_probe_for(95),
+    ) as store:
+        job = create_quality_check_job(
+            store,
+            duration_seconds=95,
+            suffix="missing-manual-boundary",
+        )
+        ArtifactGenerator(store).generate(job.job_id)
+        package = store.get_job_stage_directory(job.job_id, stage="artifacts")
+        note_path = package / "note.md"
+        unsafe_content = "# 用户改写的整篇笔记\n\n没有受保护区域标记。\n"
+        note_path.write_text(unsafe_content, "utf-8")
+
+        with pytest.raises(ArtifactGenerationFailed, match="protected '我的补充' section"):
+            ArtifactGenerator(store).generate(job.job_id)
+
+        assert note_path.read_text("utf-8") == unsafe_content
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")
 def test_processed_job_regenerates_when_artifact_schema_changes(tmp_path) -> None:
     with JobStore(
         tmp_path / "worker.sqlite3",
@@ -538,7 +756,7 @@ def test_processed_job_regenerates_when_artifact_schema_changes(tmp_path) -> Non
             if item.checkpoint_key == "artifacts_generation"
         )
         legacy_payload = dict(checkpoint.payload)
-        legacy_payload["schema_version"] = "1.3.0"
+        legacy_payload["schema_version"] = "1.4.0"
         store.put_checkpoint(
             job.job_id,
             stage="artifacts",

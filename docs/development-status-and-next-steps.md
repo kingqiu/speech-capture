@@ -1189,21 +1189,21 @@ Worker 内部证据与用户侧 Markdown 必须分开。计划生成：
 - [x] 生成带稳定段 ID 的 `transcript.md`。
 - [x] 定义并版本化 `speech-record.json` schema。
 - [x] 实现内容类型对应的 `note.md` 渲染。
-- [ ] 将当前带证据的 `note.md` 拆为纯净 `note.md` 与机器维护的 `note.evidence.md`。
-- [ ] 基于完整校订逐字稿生成与内容类型无关的 `timeline.md`。
-- [ ] 保证 `timeline.md` 覆盖全部有效时间线，且按语义边界而非固定分钟数分段。
-- [ ] 保证最终 Note 仍直接读取完整校订逐字稿；`timeline.md` 只作为覆盖检查和辅助输入，
+- [x] 将当前带证据的 `note.md` 拆为纯净 `note.md` 与机器维护的 `note.evidence.md`。
+- [x] 基于完整校订逐字稿生成与内容类型无关的 `timeline.md`。
+- [x] 保证 `timeline.md` 覆盖全部有效时间线，且按语义边界而非固定分钟数分段。
+- [x] 保证最终 Note 仍直接读取完整校订逐字稿；`timeline.md` 只作为覆盖检查和辅助输入，
   不能成为 Note 的唯一上游。
-- [ ] 为四份用户侧 Markdown 增加内容一致性、证据可达性和重生成回归测试。
+- [x] 为四份用户侧 Markdown 增加内容一致性、证据可达性和重生成回归测试。
 - [x] 生成完整性和质量清单。
 - [x] 加入产物哈希、模型版本和生成版本。
-- [ ] 实现说话人命名修订。
-- [ ] 实现文字纠正记录。
-- [ ] 实现日期纠正。
-- [ ] 实现只重生成总结、不破坏证据。
+- [x] 实现说话人命名修订。
+- [x] 实现文字纠正记录。
+- [x] 实现日期纠正。
+- [x] 实现只重生成总结、不破坏证据。
 - [x] 支持修改任务背景说明后，只重跑下游校订和笔记提炼，不覆盖原始 ASR 证据。
-- [ ] 保护 `我的补充` 等人工区域。
-- [ ] 支持比较重生成前后的变化。
+- [x] 保护 `我的补充` 终端人工区域；重生成只替换其前方机器内容，边界缺失时安全失败。
+- [x] 支持比较重生成前后的变化。
 
 #### 完成标准
 
@@ -2450,3 +2450,61 @@ runtime、逐字稿和生成文档继续由 Git 忽略。
 
 Stage D 的本轮实现与发布前兼容审计完成。下一步先审阅当前 diff 并决定提交/推送，随后停在
 阶段 E 边界等待项目所有者明确确认；不得提前实现 Vault 发布协议或 Obsidian 前端。
+
+---
+
+## 42. 2026-08-02 `我的补充` 终端人工区域保护
+
+继续 Stage D 后，artifact schema 升级为 `1.5.0`，实现了纯净 Note 的人工区域保护：
+
+- `## 我的补充` 被定义为 `note.md` 的终端用户区域；重生成只替换其前方机器内容，从该标题
+  开始到 EOF 的 Markdown 字节内容原样保留，支持任务、wikilink、callout 和用户自己的标题；
+- 审计 Note 不复制人工区域，继续保持机器可重复生成；
+- processed 幂等门禁会核对六个实际文件哈希。人工编辑导致 Note 哈希改变时，Worker 自动
+  读取并保留人工区域、重建机器内容、更新 manifest；下一次无变化运行恢复幂等；
+- 既有 Note 缺少人工边界、不是 UTF-8、文件类型异常或超过安全大小时，在写入任何文件前
+  失败，优先避免用户内容丢失；
+- 新增两项端到端回归和一项文件安全测试，覆盖人工 Markdown 原样保留、机器区刷新、manifest
+  重算、审计版隔离、再次幂等、边界缺失拒绝覆盖、符号链接和非法 UTF-8。
+
+真实通用任务完成写入—重生成—删除临时内容—再次重生成验证，最终 manifest 为
+`f93e02fb7691b62d229253a564a558d68d0be28d0013210125ac35b490238523`；原始 ASR、校订逐字稿
+和 16 个 raw segment 摘要与此前一致。当前基线为 `294` 项测试全部通过，Ruff、`compileall`、
+`git diff --check` 通过；私有 runtime 继续被忽略。
+
+下一步仍属 Stage D：实现说话人命名、文字纠正和日期纠正的独立修订记录；随后支持只重生成
+总结并生成前后差异比较。完成这些人工修订安全项前，不进入 Stage E 或 Obsidian 前端。
+
+---
+
+## 43. 2026-08-02 独立校订台账、总结重生成与差异记录
+
+Stage D 剩余人工修订安全项已经实现：
+
+- Worker SQLite schema 升级为 `6`，新增 append-only `corrections` 台账；首版支持
+  `transcript_text`、`speaker_display_name`、`recording_date`，每条记录含 correction ID、
+  job revision、目标、before/after、author、幂等键和创建时间；
+- 校订只接受 processed 任务。重复相同幂等请求返回原记录；相同键不同内容、旧 job revision、
+  不连续 before 值、未知 segment/speaker、非法日期或空值均安全失败；
+- artifact schema 升级为 `1.6.0`。新校订会使旧 checkpoint 自动失效；文字校订进入
+  `transcript.md` 与 `speech-record.json.segments[].text`，说话人显示名进入逐字稿标题和参与者
+  展示，日期进入机器记录与审计 Note 属性；数据库 segment text、`raw_text` 和原始 ASR 不变；
+- 新增 `add-correction`、`list-corrections` 开发者命令。当前六份 artifact 契约不增加第七份
+  用户文档，校订历史随 `speech-record.json.corrections` 输出；
+- `--document-only` 现在会把文字校订叠加到完整校订逐字稿后再运行全文综合，复用已有 finding
+  索引，不调用 ASR、逐字稿润色或候选抽取；
+- 每次总结重生成会在私有 `summary_revisions` checkpoint 保存 before/after SHA-256、是否变化、
+  统一 JSON diff 和截断标志；`summary-revisions` 命令可读取，供后续界面做确认；
+- 端到端测试覆盖文字/说话人/日期三类校订、幂等重试、旧 revision 冲突、自动 artifact 重建、
+  再次幂等、总结模型确实读到校订文字、diff 可读，以及原始 ASR/稳定 segment 不变；数据库
+  旧版本迁移测试同步覆盖 schema 6。
+
+在真实通用样例的私有临时副本中追加录音日期并正常重生成：`speech-record.json` 从
+`1.5.0` 升至 `1.6.0` 且出现日期和校订记录；`transcript.raw.json` 哈希仍为
+`e1aba3f8bdf70982477ce795feb264241bb3a49b366d322dae16a96ffe06c498`，`transcript.md` 与
+`note.md` 哈希也保持不变；第二次生成返回 `already_generated`。临时副本验证后已删除，仓库中
+没有加入任何私有数据。
+
+当前 `297` 项测试全部通过，Ruff、`compileall`、CLI help、`git diff --check` 通过。
+Stage D 既定人工修订安全项已经完成；下一步停在 Stage E 边界，先审阅并提交当前改动，未经
+项目所有者明确确认不实现 Vault 发布协议，也不开始 Obsidian 前端。

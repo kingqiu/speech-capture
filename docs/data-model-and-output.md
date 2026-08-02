@@ -277,8 +277,9 @@ Corrections are an append-only ledger:
 ```json
 {
   "correction_id": "cor_01J...",
-  "segment_id": "seg_000123",
-  "field": "text",
+  "job_revision": 13,
+  "field": "transcript_text",
+  "target_id": "seg_000123",
   "before": "original reviewed value",
   "after": "corrected value",
   "author": "user",
@@ -286,33 +287,49 @@ Corrections are an append-only ledger:
 }
 ```
 
-Supported corrections include:
+Worker schema 6 implements these first three correction fields:
 
 - transcript text;
 - speaker display name;
-- speaker attribution;
-- paragraph boundaries;
-- terminology;
 - recording date;
-- content type.
+
+Speaker attribution, paragraph boundaries, terminology as a separate field, and content type
+remain later extensions. Content type already has its own revision-guarded job override.
+
+Each correction is bound to one job revision and one idempotency key. Replaying the same request
+returns the existing ledger row; reusing its key for different values fails. A stale revision or a
+`before` value that no longer matches the latest correction also fails. Corrections are accepted
+only for a processed job. Transcript targets and speaker targets must already exist in that job.
+
+Artifact schema `1.6.0` overlays the ordered ledger on derived values. `transcript.md`, the display
+`text` in `speech-record.json`, speaker display names, and recording-date metadata can change, while
+database transcript text, `raw_text`, and `transcript.raw.json` remain immutable. The artifact
+checkpoint fingerprints the ledger, so a new correction triggers normal deterministic regeneration
+without requiring `--force`.
+
+Summary-only regeneration reads the complete corrected transcript, reuses durable extracted
+findings, and does not rerun ASR, transcript polishing, or extraction batches. Every such run stores
+a private `summary_revisions` checkpoint containing before/after hashes and a bounded unified JSON
+diff. This comparison is review state, not a seventh user-facing Markdown document. The six-file
+artifact package remains unchanged.
 
 Re-running ASR creates a new attempt. It never destroys the prior raw attempt.
 
 ## 10. Protected human content
 
-The Markdown renderer owns only clearly marked generated sections. Human content remains outside those regions.
+Starting in artifact schema `1.5.0`, the clean `note.md` ends with one terminal user-owned section:
 
 ```markdown
-<!-- speech-capture:generated:summary:start -->
-Generated content
-<!-- speech-capture:generated:summary:end -->
-
 ## 我的补充
 
 This section belongs to the user and is never replaced by regeneration.
 ```
 
-If the renderer finds edited generated text whose source revision no longer matches, it creates a conflict revision and asks the user to choose rather than overwriting it.
+The renderer replaces only the machine-generated Markdown before this heading. It preserves the heading and every byte through EOF without interpreting nested headings, tasks, wikilinks, callouts, or whitespace. `note.evidence.md` is fully machine-maintained and never contains this manual section.
+
+Before treating an artifact checkpoint as idempotent, the Worker verifies all six generated file hashes. A manual edit therefore triggers deterministic regeneration and a new manifest hash while preserving the terminal section. If an existing clean Note is not UTF-8, is not a regular file, exceeds the safety limit, is a symlink, or lacks the terminal heading, regeneration fails before writing any artifact. This is intentionally safer than guessing which content belongs to the user.
+
+Vault-side conflict handling remains part of the later publication protocol. It is not implemented by the Worker artifact renderer yet.
 
 ## 11. Evidence rules for summaries
 

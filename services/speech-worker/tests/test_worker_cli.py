@@ -6,7 +6,7 @@ import wave
 
 import pytest
 
-from speech_capture_worker.domain import JobCreateRequest, UploadCreateRequest
+from speech_capture_worker.domain import JobCreateRequest, JobState, UploadCreateRequest
 from speech_capture_worker.job_store import JobStore
 from speech_capture_worker.media_probe import MediaProbeResult
 from speech_capture_worker.worker_cli import main
@@ -111,6 +111,89 @@ def test_cli_can_set_and_clear_job_content_type(tmp_path, capsys) -> None:
     cleared = json.loads(capsys.readouterr().out)
     assert cleared["changed"] is True
     assert cleared["content_type_override"] is None
+
+
+def test_cli_appends_and_lists_idempotent_recording_date_correction(
+    tmp_path, capsys
+) -> None:
+    data_path = tmp_path / "runtime"
+    content = b"test-audio"
+    checksum = hashlib.sha256(content).hexdigest()
+
+    def probe(_):
+        return MediaProbeResult(
+            duration_seconds=1,
+            audio_stream_count=1,
+            format_name="wav",
+        )
+
+    with JobStore(data_path / "worker.sqlite3", source_probe=probe) as store:
+        upload, _ = store.create_upload(
+            UploadCreateRequest(
+                vault_id="vault_primary",
+                source_display_name="dated.wav",
+                source_sha256=checksum,
+                source_size_bytes=len(content),
+                media_type="audio/wav",
+            ),
+            idempotency_key="dated-upload",
+        )
+        store.put_upload_part(
+            upload.upload_id,
+            part_number=1,
+            content=content,
+            part_sha256=checksum,
+        )
+        store.complete_upload(upload.upload_id)
+        queued, _ = store.create_job_from_upload(
+            upload.upload_id,
+            idempotency_key="dated-job",
+        )
+        current = store.claim_job_for_processing(
+            queued.job_id,
+            expected_revision=queued.revision,
+        )
+        for state in (
+            JobState.TRANSCRIBING,
+            JobState.ALIGNING,
+            JobState.STRUCTURING,
+            JobState.QUALITY_CHECK,
+            JobState.PROCESSED,
+        ):
+            current = store.transition_job(
+                current.job_id,
+                state,
+                expected_revision=current.revision,
+                reason_code="test_progress",
+            )
+
+    args = [
+        "add-correction",
+        "--data-dir",
+        str(data_path),
+        current.job_id,
+        "--field",
+        "recording_date",
+        "--after",
+        "2026-08-01",
+        "--author",
+        "azhua",
+        "--idempotency-key",
+        "date-correction-1",
+        "--expected-revision",
+        str(current.revision),
+    ]
+    assert main(args) == 0
+    first = json.loads(capsys.readouterr().out)
+    assert main(args) == 0
+    replay = json.loads(capsys.readouterr().out)
+    assert main(["list-corrections", "--data-dir", str(data_path), current.job_id]) == 0
+    listed = json.loads(capsys.readouterr().out)
+
+    assert first["created"] is True
+    assert replay["created"] is False
+    assert first["correction"]["correction_id"] == replay["correction"]["correction_id"]
+    assert listed["corrections"] == [first["correction"]]
 
 
 def test_cli_returns_stable_error_for_invalid_transition(tmp_path, capsys) -> None:

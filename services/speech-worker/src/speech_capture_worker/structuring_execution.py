@@ -10,12 +10,14 @@ import time
 import urllib.request
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
+from difflib import unified_diff
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Protocol
 from uuid import uuid4
 
 from speech_capture_worker.audio_preprocessing import AudioPreprocessor, NormalizedAudioPlan
+from speech_capture_worker.corrections import CorrectionField, corrections_sha256
 from speech_capture_worker.domain import JobRecord, JobState, ResourceStatus
 from speech_capture_worker.errors import (
     InvalidJobRequest,
@@ -53,6 +55,8 @@ LEGACY_STRUCTURING_SCHEMA_VERSIONS = {
 }
 STRUCTURING_STAGE = "structuring"
 STRUCTURING_CHECKPOINT_KEY = "structuring_result"
+SUMMARY_REVISION_STAGE = "summary_revisions"
+SUMMARY_REVISION_SCHEMA_VERSION = "1.0.0"
 STRUCTURING_HEADROOM_BYTES = GIB
 DEFAULT_BATCH_MAX_CHARS = 4000
 DEFAULT_EDITOR_BATCH_MAX_CHARS = 4800
@@ -1004,6 +1008,8 @@ class StructuringResult:
     batch_count: int
     unavailable_reason_code: str | None
     resource_report: ResourceReport | None
+    summary_revision_key: str | None = None
+    summary_changed: bool | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1018,6 +1024,8 @@ class StructuringResult:
             "resource_report": (
                 self.resource_report.to_dict() if self.resource_report is not None else None
             ),
+            "summary_revision_key": self.summary_revision_key,
+            "summary_changed": self.summary_changed,
         }
 
 
@@ -1825,9 +1833,21 @@ class StructuringExecutor:
             if recovered_document is not None:
                 raw_payload["document"] = recovered_document
                 raw_payload["document_recovery_source"] = "artifacts/speech-record.json"
+        prior_document = raw_payload.get("document")
+        prior_document_json = _canonical_json_value(prior_document)
 
         transcribed = [segment for segment in segments if segment.text]
         transcript_edit_map = _transcript_edit_map(raw_payload.get("transcript_edit_results", []))
+        corrections = self.store.list_corrections(job_id)
+        corrections_digest = corrections_sha256(corrections)
+        manual_corrections_changed = (
+            raw_payload.get("manual_corrections_sha256") != corrections_digest
+        )
+        transcript_edit_map = _apply_transcript_text_corrections(
+            transcribed,
+            transcript_edits=transcript_edit_map,
+            corrections=corrections,
+        )
         speaker_ids = {segment.speaker_id for segment in transcribed if segment.speaker_id}
         segment_texts = {
             segment.segment_id: transcript_edit_map.get(segment.segment_id, segment.text or "")
@@ -1897,7 +1917,12 @@ class StructuringExecutor:
         interview_quality_repair_version = raw_payload.get("interview_quality_repair_version")
         voice_memo_quality_repair_version = raw_payload.get("voice_memo_quality_repair_version")
         try:
-            if recording_context_changed or content_type_changed or extraction_type_changed:
+            if (
+                recording_context_changed
+                or content_type_changed
+                or extraction_type_changed
+                or manual_corrections_changed
+            ):
                 candidate = None
             elif raw_payload.get("prompt_version") in {
                 "2026-08-01.13",
@@ -2058,6 +2083,7 @@ class StructuringExecutor:
         raw_payload["recording_context_processing_version"] = (
             RECORDING_CONTEXT_PROCESSING_VERSION if recording_context is not None else None
         )
+        raw_payload["manual_corrections_sha256"] = corrections_digest
         raw_payload["document_unavailable_reason_code"] = document_error
         raw_payload["unavailable_reason_code"] = (
             ",".join(dict.fromkeys(unavailable_reasons)) if unavailable_reasons else None
@@ -2095,6 +2121,7 @@ class StructuringExecutor:
                 "recording_context_processing_version": (
                     RECORDING_CONTEXT_PROCESSING_VERSION if recording_context is not None else None
                 ),
+                "manual_corrections_sha256": corrections_digest,
                 "unavailable_reason_code": raw_payload["unavailable_reason_code"],
                 "raw_relative_path": raw_relative_path,
                 "raw_sha256": raw_sha256,
@@ -2110,6 +2137,13 @@ class StructuringExecutor:
             checkpoint_key=STRUCTURING_CHECKPOINT_KEY,
             payload=checkpoint_payload,
         )
+        summary_revision_key, summary_changed = self._record_summary_revision(
+            job_id,
+            structuring_generation=updated.generation,
+            corrections_digest=corrections_digest,
+            before_json=prior_document_json,
+            after_document=document,
+        )
         return StructuringResult(
             outcome=StructuringOutcome.REGENERATED,
             job=job,
@@ -2120,7 +2154,53 @@ class StructuringExecutor:
             batch_count=len(raw_payload["batch_results"]),
             unavailable_reason_code=raw_payload["unavailable_reason_code"],
             resource_report=resource_report,
+            summary_revision_key=summary_revision_key,
+            summary_changed=summary_changed,
         )
+
+    def _record_summary_revision(
+        self,
+        job_id: str,
+        *,
+        structuring_generation: int,
+        corrections_digest: str,
+        before_json: str,
+        after_document: Any,
+    ) -> tuple[str, bool]:
+        """Persist a private, checksummed before/after comparison for user review."""
+
+        after_json = _canonical_json_value(after_document)
+        changed = before_json != after_json
+        diff_lines = list(
+            unified_diff(
+                _pretty_json_from_canonical(before_json).splitlines(),
+                _pretty_json_from_canonical(after_json).splitlines(),
+                fromfile="summary-before.json",
+                tofile="summary-after.json",
+                lineterm="",
+            )
+        )
+        diff_text = "\n".join(diff_lines)
+        truncated = len(diff_text) > 200_000
+        if truncated:
+            diff_text = diff_text[:200_000]
+        checkpoint_key = f"revision_{structuring_generation:08d}"
+        self.store.put_checkpoint(
+            job_id,
+            stage=SUMMARY_REVISION_STAGE,
+            checkpoint_key=checkpoint_key,
+            payload={
+                "schema_version": SUMMARY_REVISION_SCHEMA_VERSION,
+                "structuring_generation": structuring_generation,
+                "corrections_sha256": corrections_digest,
+                "before_sha256": hashlib.sha256(before_json.encode("utf-8")).hexdigest(),
+                "after_sha256": hashlib.sha256(after_json.encode("utf-8")).hexdigest(),
+                "changed": changed,
+                "diff": diff_text,
+                "diff_truncated": truncated,
+            },
+        )
+        return checkpoint_key, changed
 
     def apply_recording_context_corrections(self, job_id: str) -> StructuringResult:
         """Apply only explicit, narrow context corrections to accepted derived evidence."""
@@ -2587,6 +2667,33 @@ def _segment_payload(
         }
         for segment in segments
     ]
+
+
+def _apply_transcript_text_corrections(
+    segments: list[TranscriptSegment],
+    *,
+    transcript_edits: dict[str, str],
+    corrections: list[Any],
+) -> dict[str, str]:
+    """Overlay only user text corrections before global summary synthesis."""
+
+    revised = dict(transcript_edits)
+    segment_map = {segment.segment_id: segment for segment in segments}
+    for correction in corrections:
+        if correction.field is not CorrectionField.TRANSCRIPT_TEXT:
+            continue
+        segment = segment_map.get(correction.target_id)
+        if segment is None:
+            raise StructuringFailed(
+                f"Correction {correction.correction_id} targets a missing segment."
+            )
+        current = revised.get(segment.segment_id, segment.text or "")
+        if current != correction.before:
+            raise StructuringFailed(
+                f"Correction {correction.correction_id} no longer matches the derived text."
+            )
+        revised[segment.segment_id] = correction.after
+    return revised
 
 
 def _synthesis_segment_payload(
@@ -5099,11 +5206,24 @@ def _checkpoint_by_key(checkpoints: list[Any], checkpoint_key: str) -> Any | Non
     )
 
 
-def _canonical_json(payload: dict[str, Any]) -> str:
+def _canonical_json(payload: Any) -> str:
     return json.dumps(
         payload,
         ensure_ascii=False,
         separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _canonical_json_value(value: Any) -> str:
+    return _canonical_json(value)
+
+
+def _pretty_json_from_canonical(value: str) -> str:
+    return json.dumps(
+        json.loads(value),
+        ensure_ascii=False,
+        indent=2,
         sort_keys=True,
     )
 

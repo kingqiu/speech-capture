@@ -16,6 +16,11 @@ from typing import Any
 from uuid import uuid4
 
 from speech_capture_worker.asr_domain import AsrAttemptRecord, AsrAttemptState
+from speech_capture_worker.corrections import (
+    CorrectionField,
+    CorrectionRecord,
+    validate_correction,
+)
 from speech_capture_worker.domain import (
     ACTIVE_PROCESSING_STATES,
     RECOVERY_TARGETS,
@@ -82,7 +87,7 @@ from speech_capture_worker.transcript import (
     validate_transcript_text,
 )
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 DEFAULT_UPLOAD_CHUNK_SIZE_BYTES = 8 * 1024 * 1024
 MAX_UPLOAD_CHUNK_SIZE_BYTES = 64 * 1024 * 1024
 MAX_UPLOAD_PARTS = 10_000
@@ -456,6 +461,158 @@ class JobStore:
                 created_at=now,
             )
             return self._row_to_job(self._fetch_job_row(job_id)), True
+
+    def append_correction(
+        self,
+        job_id: str,
+        *,
+        field: CorrectionField,
+        target_id: str | None,
+        before: str | None,
+        after: str,
+        author: str,
+        idempotency_key: str,
+        expected_revision: int,
+    ) -> tuple[CorrectionRecord, bool]:
+        """Append one revision-guarded correction without mutating source evidence."""
+
+        validate_correction(
+            field=field,
+            target_id=target_id,
+            before=before,
+            after=after,
+            author=author,
+        )
+        validate_idempotency_key(idempotency_key)
+        if (
+            not isinstance(expected_revision, int)
+            or isinstance(expected_revision, bool)
+            or expected_revision < 0
+        ):
+            raise InvalidJobRequest("expected_revision must be zero or greater.")
+        request_payload = {
+            "field": field.value,
+            "target_id": target_id,
+            "before": before,
+            "after": after,
+            "author": author,
+        }
+        request_fingerprint = hashlib.sha256(
+            _canonical_json(request_payload).encode("utf-8")
+        ).hexdigest()
+        with self._transaction():
+            current = self._row_to_job(self._fetch_job_row(job_id))
+            prior = self._connection.execute(
+                "SELECT * FROM corrections WHERE job_id = ? AND idempotency_key = ?",
+                (job_id, idempotency_key),
+            ).fetchone()
+            if prior is not None:
+                if str(prior["request_fingerprint"]) != request_fingerprint:
+                    raise IdempotencyConflict(
+                        "The idempotency key is already bound to a different correction.",
+                        details={"job_id": job_id},
+                    )
+                return self._row_to_correction(prior), False
+            if current.revision != expected_revision:
+                raise RevisionConflict(
+                    "The job changed after the correction snapshot.",
+                    details={
+                        "job_id": job_id,
+                        "expected_revision": expected_revision,
+                        "current_revision": current.revision,
+                    },
+                )
+            if current.state is not JobState.PROCESSED:
+                raise InvalidJobRequest("Corrections require a processed job.")
+            self._validate_correction_target(
+                job_id=job_id,
+                field=field,
+                target_id=target_id,
+            )
+            previous = self._connection.execute(
+                """
+                SELECT after_value
+                FROM corrections
+                WHERE job_id = ? AND field = ? AND target_id IS ?
+                ORDER BY sequence DESC
+                LIMIT 1
+                """,
+                (job_id, field.value, target_id),
+            ).fetchone()
+            if previous is not None and str(previous["after_value"]) != before:
+                raise RevisionConflict(
+                    "The corrected value changed after the caller's snapshot.",
+                    details={"job_id": job_id, "field": field.value, "target_id": target_id},
+                )
+            revision = current.revision + 1
+            correction_id = f"cor_{uuid4().hex}"
+            now = _utc_now()
+            self._connection.execute(
+                """
+                INSERT INTO corrections (
+                    correction_id, job_id, job_revision, field, target_id,
+                    before_value, after_value, author, idempotency_key,
+                    request_fingerprint, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    correction_id,
+                    job_id,
+                    revision,
+                    field.value,
+                    target_id,
+                    before,
+                    after,
+                    author.strip(),
+                    idempotency_key,
+                    request_fingerprint,
+                    now,
+                ),
+            )
+            cursor = self._connection.execute(
+                """
+                UPDATE jobs SET revision = ?, updated_at = ?
+                WHERE job_id = ? AND revision = ?
+                """,
+                (revision, now, job_id, current.revision),
+            )
+            if cursor.rowcount != 1:
+                raise RevisionConflict(
+                    "The job changed while the correction was being saved.",
+                    details={"job_id": job_id},
+                )
+            self._insert_event(
+                job_id=job_id,
+                revision=revision,
+                event_type="job.correction_appended",
+                from_state=current.state,
+                to_state=current.state,
+                reason_code="user_correction_saved",
+                payload={
+                    "correction_id": correction_id,
+                    "field": field.value,
+                    "target_id": target_id,
+                },
+                created_at=now,
+            )
+            row = self._connection.execute(
+                "SELECT * FROM corrections WHERE correction_id = ?",
+                (correction_id,),
+            ).fetchone()
+            assert row is not None
+            return self._row_to_correction(row), True
+
+    def list_corrections(self, job_id: str) -> list[CorrectionRecord]:
+        """Return a job's immutable corrections in application order."""
+
+        with self._lock:
+            self._fetch_job_row(job_id)
+            rows = self._connection.execute(
+                "SELECT * FROM corrections WHERE job_id = ? ORDER BY sequence ASC",
+                (job_id,),
+            ).fetchall()
+            return [self._row_to_correction(row) for row in rows]
 
     def list_jobs(
         self,
@@ -3085,6 +3242,44 @@ class JobStore:
                     if self._connection.in_transaction:
                         self._connection.execute("ROLLBACK")
                     raise
+                current = 5
+            if current == 5:
+                try:
+                    self._connection.executescript(
+                        """
+                    BEGIN IMMEDIATE;
+
+                    CREATE TABLE corrections (
+                        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                        correction_id TEXT NOT NULL UNIQUE,
+                        job_id TEXT NOT NULL
+                            REFERENCES jobs(job_id) ON DELETE CASCADE,
+                        job_revision INTEGER NOT NULL CHECK (job_revision > 0),
+                        field TEXT NOT NULL,
+                        target_id TEXT,
+                        before_value TEXT,
+                        after_value TEXT NOT NULL,
+                        author TEXT NOT NULL,
+                        idempotency_key TEXT NOT NULL,
+                        request_fingerprint TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        UNIQUE (job_id, idempotency_key)
+                    );
+
+                    CREATE INDEX corrections_job_sequence_idx
+                    ON corrections (job_id, sequence);
+
+                    CREATE INDEX corrections_job_target_idx
+                    ON corrections (job_id, field, target_id, sequence);
+
+                    PRAGMA user_version = 6;
+                    COMMIT;
+                    """
+                    )
+                except BaseException:
+                    if self._connection.in_transaction:
+                        self._connection.execute("ROLLBACK")
+                    raise
 
     @contextmanager
     def _transaction(self) -> Iterator[None]:
@@ -3237,6 +3432,56 @@ class JobStore:
                 details={"job_id": job_id, "segment_id": segment_id},
             )
         return row
+
+    def _validate_correction_target(
+        self,
+        *,
+        job_id: str,
+        field: CorrectionField,
+        target_id: str | None,
+    ) -> None:
+        if field is CorrectionField.TRANSCRIPT_TEXT:
+            assert target_id is not None
+            segment = self._row_to_transcript_segment(
+                self._fetch_transcript_segment_row(job_id, target_id)
+            )
+            if segment.outcome is not TranscriptOutcome.TRANSCRIBED:
+                raise InvalidJobRequest(
+                    "Only a transcribed segment can receive a text correction."
+                )
+            return
+        if field is CorrectionField.SPEAKER_DISPLAY_NAME:
+            assert target_id is not None
+            row = self._connection.execute(
+                """
+                SELECT 1 FROM transcript_segments
+                WHERE job_id = ? AND speaker_id = ?
+                LIMIT 1
+                """,
+                (job_id, target_id),
+            ).fetchone()
+            if row is None:
+                raise InvalidJobRequest(
+                    "The correction speaker_id does not exist in this job."
+                )
+
+    @staticmethod
+    def _row_to_correction(row: sqlite3.Row) -> CorrectionRecord:
+        return CorrectionRecord(
+            sequence=int(row["sequence"]),
+            correction_id=str(row["correction_id"]),
+            job_id=str(row["job_id"]),
+            job_revision=int(row["job_revision"]),
+            field=CorrectionField(str(row["field"])),
+            target_id=(str(row["target_id"]) if row["target_id"] is not None else None),
+            before=(
+                str(row["before_value"]) if row["before_value"] is not None else None
+            ),
+            after=str(row["after_value"]),
+            author=str(row["author"]),
+            idempotency_key=str(row["idempotency_key"]),
+            created_at=str(row["created_at"]),
+        )
 
     @staticmethod
     def _validate_segment_content(

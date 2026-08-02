@@ -6,6 +6,7 @@ import hashlib
 import importlib.metadata
 import json
 import os
+import re
 from dataclasses import asdict, dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -19,6 +20,11 @@ from speech_capture_worker.alignment import (
     CHECKPOINT_STAGE as ALIGNMENT_STAGE,
 )
 from speech_capture_worker.audio_preprocessing import AudioPreprocessor
+from speech_capture_worker.corrections import (
+    CorrectionField,
+    CorrectionRecord,
+    corrections_sha256,
+)
 from speech_capture_worker.domain import JobRecord, JobState
 from speech_capture_worker.errors import (
     ArtifactGenerationFailed,
@@ -41,7 +47,7 @@ from speech_capture_worker.transcript import (
     TranscriptSegment,
 )
 
-ARTIFACT_SCHEMA_VERSION = "1.4.0"
+ARTIFACT_SCHEMA_VERSION = "1.6.0"
 RAW_TRANSCRIPT_SCHEMA_VERSION = "1.0.0"
 ARTIFACT_STAGE = "artifacts"
 ARTIFACT_CHECKPOINT_KEY = "artifacts_generation"
@@ -60,6 +66,10 @@ ARTIFACT_FILES = (
     NOTE_EVIDENCE_MARKDOWN,
     TIMELINE_MARKDOWN,
 )
+MAX_EXISTING_NOTE_BYTES = 8 * 1024 * 1024
+MAX_MANUAL_SECTION_BYTES = 4 * 1024 * 1024
+MANUAL_SECTION_HEADING = "## 我的补充"
+MANUAL_SECTION_PATTERN = re.compile(r"(?m)^##[ \t]+我的补充[ \t]*(?:\r?\n|$)")
 
 
 class ArtifactOutcome(StrEnum):
@@ -83,6 +93,87 @@ class ArtifactResult:
         return asdict(self)
 
 
+@dataclass(frozen=True)
+class EffectiveCorrections:
+    transcript_edits: dict[str, str]
+    speaker_display_names: dict[str, str]
+    recording_date: str | None
+    document: Any
+
+
+def _artifact_files_match_checkpoint(
+    package_dir: Path,
+    checkpoint_payload: dict[str, Any],
+) -> bool:
+    """Verify the generated package before treating a processed job as idempotent."""
+
+    expected = checkpoint_payload.get("files")
+    if (
+        not isinstance(expected, dict)
+        or set(expected) != set(ARTIFACT_FILES)
+        or package_dir.is_symlink()
+        or not package_dir.is_dir()
+    ):
+        return False
+    for name in ARTIFACT_FILES:
+        expected_sha256 = expected.get(name)
+        path = package_dir / name
+        if (
+            not isinstance(expected_sha256, str)
+            or len(expected_sha256) != 64
+            or path.is_symlink()
+            or not path.is_file()
+        ):
+            return False
+        try:
+            digest = _file_sha256(path)
+        except OSError:
+            return False
+        if digest != expected_sha256:
+            return False
+    return True
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _read_manual_section(path: Path) -> str | None:
+    """Read the terminal user-owned Note section without interpreting its Markdown."""
+
+    if path.is_symlink():
+        raise UploadStorageError("The existing note cannot be a symlink.")
+    if not path.exists():
+        return None
+    if not path.is_file():
+        raise ArtifactGenerationFailed("The existing note is not a regular file.")
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        raise ArtifactGenerationFailed("The existing note could not be inspected.") from exc
+    if size > MAX_EXISTING_NOTE_BYTES:
+        raise ArtifactGenerationFailed("The existing note is too large to regenerate safely.")
+    try:
+        content = path.read_bytes().decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ArtifactGenerationFailed("The existing note is not valid UTF-8.") from exc
+    except OSError as exc:
+        raise ArtifactGenerationFailed("The existing note could not be read.") from exc
+    match = MANUAL_SECTION_PATTERN.search(content)
+    if match is None:
+        raise ArtifactGenerationFailed(
+            "The existing note is missing the protected '我的补充' section."
+        )
+    manual_section = content[match.start() :]
+    if len(manual_section.encode("utf-8")) > MAX_MANUAL_SECTION_BYTES:
+        raise ArtifactGenerationFailed("The protected manual section is too large.")
+    return manual_section
+
+
 class ArtifactGenerator:
     """Generate four user Markdown files and two machine records plus a manifest."""
 
@@ -99,6 +190,8 @@ class ArtifactGenerator:
         if not isinstance(force, bool):
             raise InvalidJobRequest("force must be a boolean.")
         job = self.store.get_job(job_id)
+        corrections = self.store.list_corrections(job_id)
+        corrections_digest = corrections_sha256(corrections)
         regenerating_processed = False
         if job.state is JobState.PROCESSED and not force:
             checkpoint = _checkpoint_by_key(
@@ -118,6 +211,11 @@ class ArtifactGenerator:
                 and checkpoint.payload.get("schema_version") == ARTIFACT_SCHEMA_VERSION
                 and checkpoint.payload.get("structuring_checkpoint_generation")
                 == current_structuring.generation
+                and checkpoint.payload.get("corrections_sha256") == corrections_digest
+                and _artifact_files_match_checkpoint(
+                    self.store.get_job_stage_directory(job_id, stage=ARTIFACT_STAGE),
+                    checkpoint.payload,
+                )
             ):
                 return ArtifactResult(
                     outcome=ArtifactOutcome.ALREADY_GENERATED,
@@ -181,6 +279,14 @@ class ArtifactGenerator:
         transcript_edits = _transcript_edits(
             structuring_raw.get("transcript_edit_results", structuring_raw["batch_results"])
         )
+        effective = _apply_corrections(
+            segments=segments,
+            transcript_edits=transcript_edits,
+            document=document,
+            corrections=corrections,
+        )
+        transcript_edits = effective.transcript_edits
+        document = effective.document
         context_corrections = structuring_raw.get("context_corrections", [])
         if not isinstance(context_corrections, list):
             raise ArtifactGenerationFailed(
@@ -195,6 +301,7 @@ class ArtifactGenerator:
         package_dir.mkdir(parents=True, exist_ok=True)
         if package_dir.is_symlink():
             raise UploadStorageError("The artifact package directory cannot be a symlink.")
+        manual_section = _read_manual_section(package_dir / NOTE_MARKDOWN)
 
         raw_transcript = _build_raw_transcript(
             speech_id=speech_id,
@@ -206,6 +313,7 @@ class ArtifactGenerator:
             segments=segments,
             block_ids=block_ids,
             transcript_edits=transcript_edits,
+            speaker_display_names=effective.speaker_display_names,
         )
         speech_record = _build_speech_record(
             job=job,
@@ -221,6 +329,9 @@ class ArtifactGenerator:
             alignment_report_generation=alignment_checkpoint.generation,
             structuring_checkpoint=structuring_checkpoint.payload,
             context_corrections=context_corrections,
+            manual_corrections=corrections,
+            speaker_display_names=effective.speaker_display_names,
+            recording_date=effective.recording_date,
         )
         note_markdown = _build_note_markdown(
             job=job,
@@ -233,6 +344,9 @@ class ArtifactGenerator:
             document=document,
             alignment_report=alignment_checkpoint.payload,
             include_evidence=False,
+            manual_section=manual_section,
+            speaker_display_names=effective.speaker_display_names,
+            recording_date=effective.recording_date,
         )
         evidence_note_markdown = _build_note_markdown(
             job=job,
@@ -245,6 +359,8 @@ class ArtifactGenerator:
             document=document,
             alignment_report=alignment_checkpoint.payload,
             include_evidence=True,
+            speaker_display_names=effective.speaker_display_names,
+            recording_date=effective.recording_date,
         )
         timeline_markdown = _build_timeline_markdown(
             job=job,
@@ -271,6 +387,7 @@ class ArtifactGenerator:
             "files": hashes,
             "alignment_report_generation": alignment_checkpoint.generation,
             "structuring_checkpoint_generation": structuring_checkpoint.generation,
+            "corrections_sha256": corrections_digest,
         }
         manifest_bytes = _canonical_json(manifest).encode("utf-8") + b"\n"
         manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
@@ -289,6 +406,7 @@ class ArtifactGenerator:
                 "files": hashes,
                 "alignment_report_generation": alignment_checkpoint.generation,
                 "structuring_checkpoint_generation": structuring_checkpoint.generation,
+                "corrections_sha256": corrections_digest,
             },
         )
         current = self.store.get_job(job_id)
@@ -443,17 +561,128 @@ def _transcript_edits(batch_results: list[dict[str, Any]]) -> dict[str, str]:
     return edits
 
 
+def _apply_corrections(
+    *,
+    segments: list[TranscriptSegment],
+    transcript_edits: dict[str, str],
+    document: Any,
+    corrections: list[CorrectionRecord],
+) -> EffectiveCorrections:
+    """Overlay the append-only ledger on derived values, never source evidence."""
+
+    revised_edits = dict(transcript_edits)
+    revised_document = document
+    segment_map = {segment.segment_id: segment for segment in segments}
+    speaker_ids = sorted({segment.speaker_id for segment in segments if segment.speaker_id})
+    speaker_names = {speaker_id: _default_speaker_name(speaker_id) for speaker_id in speaker_ids}
+    if isinstance(document, dict) and isinstance(document.get("speaker_summaries"), list):
+        for summary in document["speaker_summaries"]:
+            if not isinstance(summary, dict):
+                continue
+            speaker_id = summary.get("speaker_id")
+            display_name = summary.get("display_name")
+            if (
+                isinstance(speaker_id, str)
+                and speaker_id in speaker_names
+                and isinstance(display_name, str)
+                and display_name.strip()
+            ):
+                speaker_names[speaker_id] = display_name.strip()
+    recording_date: str | None = None
+    for correction in corrections:
+        if correction.field is CorrectionField.TRANSCRIPT_TEXT:
+            segment = segment_map.get(correction.target_id or "")
+            if segment is None:
+                raise ArtifactGenerationFailed(
+                    f"Correction {correction.correction_id} targets a missing segment."
+                )
+            current = revised_edits.get(segment.segment_id, segment.text or "")
+            if current != correction.before:
+                raise ArtifactGenerationFailed(
+                    f"Correction {correction.correction_id} no longer matches the derived text."
+                )
+            revised_edits[segment.segment_id] = correction.after
+            revised_document = _replace_derived_text(
+                revised_document,
+                before=correction.before,
+                after=correction.after,
+            )
+        elif correction.field is CorrectionField.SPEAKER_DISPLAY_NAME:
+            speaker_id = correction.target_id or ""
+            current = speaker_names.get(speaker_id)
+            if current != correction.before:
+                raise ArtifactGenerationFailed(
+                    f"Correction {correction.correction_id} no longer matches the speaker name."
+                )
+            speaker_names[speaker_id] = correction.after
+            revised_document = _replace_speaker_display_name(
+                revised_document,
+                speaker_id=speaker_id,
+                display_name=correction.after,
+            )
+        else:
+            if recording_date != correction.before:
+                raise ArtifactGenerationFailed(
+                    f"Correction {correction.correction_id} no longer matches the recording date."
+                )
+            recording_date = correction.after
+    return EffectiveCorrections(
+        transcript_edits=revised_edits,
+        speaker_display_names=speaker_names,
+        recording_date=recording_date,
+        document=revised_document,
+    )
+
+
+def _replace_derived_text(value: Any, *, before: str, after: str) -> Any:
+    if isinstance(value, str):
+        return value.replace(before, after)
+    if isinstance(value, list):
+        return [_replace_derived_text(item, before=before, after=after) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: _replace_derived_text(item, before=before, after=after)
+            for key, item in value.items()
+        }
+    return value
+
+
+def _replace_speaker_display_name(
+    document: Any,
+    *,
+    speaker_id: str,
+    display_name: str,
+) -> Any:
+    if not isinstance(document, dict):
+        return document
+    revised = dict(document)
+    raw_summaries = document.get("speaker_summaries")
+    if not isinstance(raw_summaries, list):
+        return revised
+    summaries: list[Any] = []
+    for item in raw_summaries:
+        if isinstance(item, dict) and item.get("speaker_id") == speaker_id:
+            updated = dict(item)
+            updated["display_name"] = display_name
+            summaries.append(updated)
+        else:
+            summaries.append(item)
+    revised["speaker_summaries"] = summaries
+    return revised
+
+
 def _build_transcript_markdown(
     *,
     segments: list[TranscriptSegment],
     block_ids: dict[str, str],
     transcript_edits: dict[str, str],
+    speaker_display_names: dict[str, str] | None = None,
 ) -> str:
     lines: list[str] = []
     for segment in segments:
         if not _show_transcript_segment(segment):
             continue
-        heading = _segment_heading(segment)
+        heading = _segment_heading(segment, speaker_display_names=speaker_display_names)
         lines.append(f"## {heading}")
         lines.append("")
         if segment.outcome is TranscriptOutcome.TRANSCRIBED:
@@ -565,6 +794,9 @@ def _build_speech_record(
     alignment_report_generation: int,
     structuring_checkpoint: dict[str, Any],
     context_corrections: list[Any],
+    manual_corrections: list[CorrectionRecord],
+    speaker_display_names: dict[str, str],
+    recording_date: str | None,
 ) -> dict[str, Any]:
     status = (
         "complete"
@@ -596,9 +828,14 @@ def _build_speech_record(
             "detected_format": upload.detected_format_name,
         },
         "dates": {
+            "recording_date": recording_date,
             "imported_at": job.created_at,
             "processed_at": job.updated_at,
         },
+        "speakers": [
+            {"speaker_id": speaker_id, "display_name": display_name}
+            for speaker_id, display_name in sorted(speaker_display_names.items())
+        ],
         "segments": [
             {
                 "segment_id": segment.segment_id,
@@ -630,7 +867,21 @@ def _build_speech_record(
             for finding in findings
         ],
         "document": document if isinstance(document, dict) else None,
-        "corrections": context_corrections,
+        "corrections": [
+            *context_corrections,
+            *[
+                {
+                    "correction_id": item.correction_id,
+                    "field": item.field.value,
+                    "target_id": item.target_id,
+                    "before": item.before,
+                    "after": item.after,
+                    "author": item.author,
+                    "created_at": item.created_at,
+                }
+                for item in manual_corrections
+            ],
+        ],
         "provenance": {
             "artifact_schema_version": ARTIFACT_SCHEMA_VERSION,
             "worker_package_version": _package_version(),
@@ -667,11 +918,21 @@ def _build_note_markdown(
     document: Any,
     alignment_report: dict[str, Any],
     include_evidence: bool = True,
+    manual_section: str | None = None,
+    speaker_display_names: dict[str, str] | None = None,
+    recording_date: str | None = None,
 ) -> str:
     content_type = classification.get("type") or "generic"
     supported = [finding for finding in findings if not finding.unsupported]
     unsupported = [finding for finding in findings if finding.unsupported]
-    speakers = sorted({segment.speaker_id for segment in segments if segment.speaker_id})
+    speaker_display_names = speaker_display_names or {}
+    speakers = sorted(
+        {
+            speaker_display_names.get(segment.speaker_id, segment.speaker_id)
+            for segment in segments
+            if segment.speaker_id
+        }
+    )
     segment_map = {segment.segment_id: segment for segment in segments}
     duration_seconds = round(upload.duration_seconds or 0, 1)
     status = (
@@ -697,6 +958,7 @@ def _build_note_markdown(
                 f"content_type: {content_type}",
                 f"speech_id: {speech_id}",
                 f"duration_seconds: {duration_seconds}",
+                *( [f"recording_date: {recording_date}"] if recording_date else [] ),
                 "speakers:",
             ]
         )
@@ -973,15 +1235,11 @@ def _build_note_markdown(
                 + f"{len(unsupported)} 条提炼结论证据不足，未写入正文。"
             )
         lines.append("")
-    if not include_evidence:
-        lines.extend(
-            [
-                "## 我的补充",
-                "",
-                "",
-            ]
-        )
-    return "\n".join(lines)
+    rendered = "\n".join(lines)
+    if include_evidence:
+        return rendered
+    protected = manual_section if manual_section is not None else f"{MANUAL_SECTION_HEADING}\n\n"
+    return rendered.rstrip() + "\n\n" + protected
 
 
 def _note_evidence_suffix(
@@ -1364,13 +1622,24 @@ def _content_sections(
     return lines
 
 
-def _segment_heading(segment: TranscriptSegment) -> str:
-    speaker = (
-        f"Speaker {int(segment.speaker_id.rsplit('_', 1)[-1])}"
-        if segment.speaker_id and "_" in segment.speaker_id
-        else "Speaker ?"
-    )
+def _segment_heading(
+    segment: TranscriptSegment,
+    *,
+    speaker_display_names: dict[str, str] | None = None,
+) -> str:
+    speaker = None
+    if segment.speaker_id and speaker_display_names:
+        speaker = speaker_display_names.get(segment.speaker_id)
+    if not speaker:
+        speaker = _default_speaker_name(segment.speaker_id)
     return f"{_format_range(segment.start_ms, segment.end_ms)} · {speaker}"
+
+
+def _default_speaker_name(speaker_id: str | None) -> str:
+    if not speaker_id:
+        return "Speaker ?"
+    suffix = speaker_id.rsplit("_", 1)[-1]
+    return f"Speaker {int(suffix)}" if suffix.isdigit() else speaker_id
 
 
 def _format_range(start_ms: int, end_ms: int) -> str:

@@ -18,6 +18,7 @@ from speech_capture_worker.artifact_generation import (
 )
 from speech_capture_worker.asr_execution import AsrChunkExecutor, MlxQwenAsrEngine
 from speech_capture_worker.audio_preprocessing import AudioPreprocessor
+from speech_capture_worker.corrections import CorrectionField
 from speech_capture_worker.diarization_execution import (
     DiarizationOutcome,
     PyannoteSpeakerDiarizationEngine,
@@ -65,6 +66,7 @@ from speech_capture_worker.resources import (
 )
 from speech_capture_worker.scheduler import JobScheduler, SchedulerOutcome
 from speech_capture_worker.structuring_execution import (
+    SUMMARY_REVISION_STAGE,
     OllamaStructuringEngine,
     StructuringExecutor,
     StructuringOutcome,
@@ -162,6 +164,29 @@ def _build_parser() -> argparse.ArgumentParser:
         "--content-type", choices=sorted(SUPPORTED_CONTENT_TYPES)
     )
     content_type_source.add_argument("--clear", action="store_true")
+
+    add_correction = subparsers.add_parser(
+        "add-correction",
+        help="Append a correction to derived output without rewriting raw ASR.",
+    )
+    _add_data_dir(add_correction)
+    add_correction.add_argument("job_id")
+    add_correction.add_argument(
+        "--field", choices=[field.value for field in CorrectionField], required=True
+    )
+    add_correction.add_argument("--target-id")
+    add_correction.add_argument("--before")
+    add_correction.add_argument("--after", required=True)
+    add_correction.add_argument("--author", required=True)
+    add_correction.add_argument("--idempotency-key", required=True)
+    add_correction.add_argument("--expected-revision", type=int, required=True)
+
+    list_corrections = subparsers.add_parser(
+        "list-corrections",
+        help="List a job's immutable correction history.",
+    )
+    _add_data_dir(list_corrections)
+    list_corrections.add_argument("job_id")
 
     create_upload = subparsers.add_parser(
         "create-upload",
@@ -505,6 +530,13 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Regenerate artifacts for an already processed job.",
     )
 
+    summary_revisions = subparsers.add_parser(
+        "summary-revisions",
+        help="List private before/after comparisons from summary-only regeneration.",
+    )
+    _add_data_dir(summary_revisions)
+    summary_revisions.add_argument("job_id")
+
     retranscribe_gaps = subparsers.add_parser(
         "retranscribe-gaps",
         help="Re-transcribe VAD-identified speech gaps with raw evidence.",
@@ -629,6 +661,29 @@ def _dispatch(args: argparse.Namespace) -> int:
                     "content_type_override": job.content_type_override,
                 }
             )
+            return 0
+        if args.command == "add-correction":
+            correction, created = store.append_correction(
+                args.job_id,
+                field=CorrectionField(args.field),
+                target_id=args.target_id,
+                before=args.before,
+                after=args.after,
+                author=args.author,
+                idempotency_key=args.idempotency_key,
+                expected_revision=args.expected_revision,
+            )
+            _write_json(
+                {
+                    "created": created,
+                    "correction": correction.to_dict(),
+                    "job_revision": store.get_job(args.job_id).revision,
+                }
+            )
+            return 0
+        if args.command == "list-corrections":
+            corrections = store.list_corrections(args.job_id)
+            _write_json({"corrections": [item.to_dict() for item in corrections]})
             return 0
         if args.command == "create-upload":
             request = UploadCreateRequest(
@@ -946,6 +1001,24 @@ def _dispatch(args: argparse.Namespace) -> int:
         if args.command == "generate-artifacts":
             result = ArtifactGenerator(store).generate(args.job_id, force=args.force)
             _write_json(result.to_dict())
+            return 0
+        if args.command == "summary-revisions":
+            revisions = store.list_checkpoints(
+                args.job_id,
+                stage=SUMMARY_REVISION_STAGE,
+            )
+            _write_json(
+                {
+                    "summary_revisions": [
+                        {
+                            "revision_key": item.checkpoint_key,
+                            "created_at": item.created_at,
+                            **item.payload,
+                        }
+                        for item in revisions
+                    ]
+                }
+            )
             return 0
         if args.command == "retranscribe-gaps":
             job = store.get_job(args.job_id)

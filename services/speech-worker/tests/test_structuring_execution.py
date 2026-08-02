@@ -16,6 +16,7 @@ from speech_capture_worker.alignment import (
     TranscriptAlignmentFinalizer,
 )
 from speech_capture_worker.asr_execution import AsrChunkExecutor, AsrRunOutcome
+from speech_capture_worker.corrections import CorrectionField
 from speech_capture_worker.domain import JobState, ResourceStatus, UploadCreateRequest
 from speech_capture_worker.errors import InvalidJobRequest, StructuringFailed
 from speech_capture_worker.job_store import JobStore
@@ -137,6 +138,7 @@ class FakeStructuringEngine:
         polish_replacements=None,
         coverage_sections=None,
         max_extract_segments=None,
+        summary_from_transcript=False,
     ):
         self.classification = classification or {
             "type": "meeting",
@@ -149,6 +151,7 @@ class FakeStructuringEngine:
         self.polish_replacements = polish_replacements or {}
         self.coverage_sections = coverage_sections or []
         self.max_extract_segments = max_extract_segments
+        self.summary_from_transcript = summary_from_transcript
         self.classify_calls = 0
         self.extract_calls = 0
         self.synthesize_calls = 0
@@ -185,7 +188,13 @@ class FakeStructuringEngine:
         if self.error is not None:
             raise self.error
         evidence = list(findings[0]["evidence"]) if findings else [segments[0]["segment_id"]]
-        text = findings[0]["text"] if findings else "从完整逐字稿生成的笔记。"
+        text = (
+            segments[0]["text"]
+            if self.summary_from_transcript
+            else findings[0]["text"]
+            if findings
+            else "从完整逐字稿生成的笔记。"
+        )
         document = {
             "title": "结构提炼测试会议",
             "summary": {"text": text, "evidence": evidence},
@@ -768,6 +777,69 @@ def test_document_can_be_resynthesized_without_reextracting_batches(tmp_path) ->
         assert checkpoint.payload["content_type"] == "meeting"
         assert checkpoint.payload["content_type_source"] == "automatic"
         assert checkpoint.payload["automatic_content_type"] == "meeting"
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")
+def test_summary_only_regeneration_reads_text_corrections_and_records_diff(tmp_path) -> None:
+    with JobStore(
+        tmp_path / "worker.sqlite3",
+        source_probe=source_probe_for(95),
+    ) as store:
+        job = create_structuring_job(
+            store,
+            duration_seconds=95,
+            suffix="corrected-summary",
+        )
+        initial_engine = FakeStructuringEngine(summary_from_transcript=True)
+        first = StructuringExecutor(
+            store,
+            initial_engine,
+            boundary_preflight=preflight(),
+        ).run(job.job_id)
+        processed = store.transition_job(
+            job.job_id,
+            JobState.PROCESSED,
+            expected_revision=first.job.revision,
+            reason_code="test_artifacts_generated",
+        )
+        segment = store.get_job_snapshot(job.job_id).stable_segments[0]
+        polished_text = initial_engine.synthesize_inputs[0][0]["text"]
+        corrected_text = polished_text.replace("稳定文字", "人工校订文字")
+        correction, _ = store.append_correction(
+            job.job_id,
+            field=CorrectionField.TRANSCRIPT_TEXT,
+            target_id=segment.segment_id,
+            before=polished_text,
+            after=corrected_text,
+            author="test-user",
+            idempotency_key="summary-text-correction",
+            expected_revision=processed.revision,
+        )
+        assert correction.after == corrected_text
+        raw_attempts_before = [item.raw_sha256 for item in store.list_asr_attempts(job.job_id)]
+        engine = FakeStructuringEngine(summary_from_transcript=True)
+
+        result = StructuringExecutor(
+            store,
+            engine,
+            boundary_preflight=preflight(),
+        ).resynthesize_document(job.job_id)
+        revisions = store.list_checkpoints(job.job_id, stage="summary_revisions")
+        stable_after = store.get_job_snapshot(job.job_id).stable_segments[0]
+        raw_attempts_after = [item.raw_sha256 for item in store.list_asr_attempts(job.job_id)]
+
+    assert result.outcome is StructuringOutcome.REGENERATED
+    assert result.summary_changed is True
+    assert result.summary_revision_key == revisions[0].checkpoint_key
+    assert engine.synthesize_calls == 1
+    assert engine.extract_calls == 0
+    assert engine.polish_calls == 0
+    assert engine.synthesize_inputs[0][0]["text"] == corrected_text
+    assert revisions[0].payload["changed"] is True
+    assert corrected_text in revisions[0].payload["diff"]
+    assert revisions[0].payload["diff_truncated"] is False
+    assert stable_after.text == segment.text
+    assert raw_attempts_after == raw_attempts_before
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")
