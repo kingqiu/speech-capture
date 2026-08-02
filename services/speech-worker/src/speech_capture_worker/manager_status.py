@@ -126,7 +126,7 @@ def collect_manager_status(
         port_reachable=(port_probe or _port_reachable)(validated.host, validated.port),
     )
     tailscale = _tailscale_status(user_home, runner)
-    ollama = _ollama_status(runner)
+    ollama = _ollama_status(runner, user_home)
     models = (
         _huggingface_model_status(hf_cache, ACCURACY_MODEL_ID, "mlx"),
         _huggingface_model_status(hf_cache, SPEED_MODEL_ID, "mlx"),
@@ -192,13 +192,16 @@ def _huggingface_model_status(cache: Path, model_id: str, provider: str) -> Mode
     return ModelStatus(model_id=model_id, provider=provider, cache_present=present)
 
 
-def _ollama_status(runner: CommandRunner) -> OllamaStatus:
+def _ollama_status(runner: CommandRunner, home: Path) -> OllamaStatus:
+    models_dir = _default_ollama_models_dir(home)
+    local_accuracy = _ollama_manifest_present(models_dir, OLLAMA_ACCURACY_MODEL)
+    local_editor = _ollama_manifest_present(models_dir, OLLAMA_EDITOR_MODEL)
     executable = shutil.which("ollama")
     if executable is None:
-        return OllamaStatus(False, False, False, False)
+        return OllamaStatus(False, False, local_accuracy, local_editor)
     result = runner((executable, "list"))
     if result.returncode != 0:
-        return OllamaStatus(True, False, False, False)
+        return OllamaStatus(True, False, local_accuracy, local_editor)
     names = {
         line.split()[0]
         for line in result.stdout.splitlines()[1:]
@@ -207,9 +210,23 @@ def _ollama_status(runner: CommandRunner) -> OllamaStatus:
     return OllamaStatus(
         cli_available=True,
         service_reachable=True,
-        accuracy_model_present=OLLAMA_ACCURACY_MODEL in names,
-        editor_model_present=OLLAMA_EDITOR_MODEL in names,
+        accuracy_model_present=local_accuracy or OLLAMA_ACCURACY_MODEL in names,
+        editor_model_present=local_editor or OLLAMA_EDITOR_MODEL in names,
     )
+
+
+def _ollama_manifest_present(models_dir: Path, model_id: str) -> bool:
+    try:
+        name, tag = model_id.split(":", 1)
+    except ValueError:
+        return False
+    manifest = (
+        models_dir / "manifests" / "registry.ollama.ai" / "library" / name / tag
+    )
+    try:
+        return manifest.is_file() and not manifest.is_symlink()
+    except OSError:
+        return False
 
 
 def _tailscale_status(home: Path, runner: CommandRunner) -> NetworkStatus:
@@ -243,6 +260,13 @@ def _default_huggingface_cache(home: Path) -> Path:
     if hf_home:
         return (Path(hf_home).expanduser().resolve() / "hub")
     return home / ".cache" / "huggingface" / "hub"
+
+
+def _default_ollama_models_dir(home: Path) -> Path:
+    models_dir = os.environ.get("OLLAMA_MODELS")
+    if models_dir:
+        return Path(models_dir).expanduser().resolve()
+    return home / ".ollama" / "models"
 
 
 def _disk_usage(path: Path):

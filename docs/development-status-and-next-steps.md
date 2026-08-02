@@ -1284,7 +1284,7 @@ FastAPI，并加入设备身份和 Vault 授权。阶段 H 的 Obsidian 前端�
 - [x] 明确 FileVault 解锁、用户登录和同步盘挂载状态。
 - [x] 显示模型、磁盘、内存、端口和网络状态。
 - [x] 下载模型前显示空间预算。
-- [ ] 校验模型文件。
+- [x] 校验模型文件。
 - [ ] 支持模型激活、切换和回滚。
 - [ ] 提供不含私人内容的诊断包。
 - [ ] 最终提供无需开发环境的打包运行时。
@@ -2705,9 +2705,35 @@ Stage H 或 Obsidian 前端。
   `can_download=false` 为后续下载动作提供安全阻断依据；
 - 结果明确标记 `estimate_only=true`，因为模型仓库体积以后可能变化；输出只包含公开模型 ID、
   provider、存在状态和容量数字，不包含用户目录、缓存路径、文件名、音频、逐字稿或 Note；
-- 本机只读验证确认三个 MLX 缓存可被识别；`accuracy` 档只计入当前缺失的 qwen3:14b/8b，当前
-  磁盘预算返回可下载，没有发起下载或修改模型；
+- 本机只读验证确认三个 MLX 缓存可被识别；随后在模型校验时发现 Ollama 服务虽未运行，但本地
+  两个 manifest 和模型文件仍完整，因此状态快照已改为把“已安装”和“服务运行”分开判断；修正后
+  `all` 档剩余下载量为 0，没有发起下载或修改模型；
 - 新增预算公式、已有缓存扣除、低空间拦截、非法输入和 Manager 命令输出测试。
 
 下一步严格实现模型文件校验：不能只看缓存目录是否存在，需要验证所需文件、版本身份和完整性；
 校验完成后才进入模型激活、切换和回滚。不得开始 Stage H。
+
+---
+
+## 53. 2026-08-02 Stage G 模型文件完整性校验
+
+- 新增 `speech-capture-manager model-verify --profile accuracy|speed|all`；验证失败返回独立退出码
+  `3`，同时输出内容无关的稳定 issue code，便于后续原生 Manager 清楚区分命令错误和模型损坏；
+- Hugging Face/MLX 校验不再以 snapshot 目录存在为准：核对 `refs/main` revision、对应 tree
+  元数据、所有运行必需配置、分片索引和分片集合，拒绝逃出模型仓库的链接；
+- 每个小文件按 Git blob SHA-1 校验，每个 LFS/Safetensors 文件按仓库记录的 SHA-256 全量校验，
+  同时复核字节数、配置 model type、权重索引和 Safetensors 头；
+- 当前发布明确固定三个 Hugging Face revision 和两个 Ollama manifest digest；即使一个未知版本的
+  本地元数据与文件彼此自洽，也会以 `MODEL_REVISION_UNAPPROVED` 拒绝进入激活候选；
+- Ollama 校验直接读取标准 manifest，核对 schema、config/layer 描述、blob 数量和大小，并对每个
+  blob 做完整 SHA-256；服务没有运行不影响判断本地模型是否安装及文件是否完整；
+- 输出只含公开模型 ID、provider、revision/manifest digest、已校验文件数/字节数、状态和 issue
+  code，不含缓存路径、用户目录、音频、逐字稿、Note、prompt 或凭据；
+- 本机 `all` 档真实校验通过：Qwen3-ASR 1.7B/0.6B、ForcedAligner、qwen3:14b/8b 五个模型共
+  30 个必需文件、约 22.9 GB 均完成全量哈希并有效；没有下载、改写或激活模型；
+- 自动化覆盖完整模型、分片模型、同大小内容损坏、缺失 revision metadata、未知 revision、链接
+  逃逸、Ollama blob 损坏、服务不可达时的本地 manifest 识别和 Manager 失败退出码；全套
+  `396` 项测试通过。
+
+下一步严格实现模型激活、切换和回滚。任何新版本必须先完整校验，在一次原子切换前保持当前
+可用版本；激活失败或 Worker 启动验证失败时回到旧版本。不得开始 Stage H。

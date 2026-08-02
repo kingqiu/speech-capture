@@ -22,6 +22,7 @@ from speech_capture_worker.model_budget import (
     calculate_model_download_budget,
     presence_from_status,
 )
+from speech_capture_worker.model_validation import validate_model_profile
 from speech_capture_worker.redaction import public_cli_error_payload
 
 
@@ -30,6 +31,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         config = _config_from_args(args)
         manager = LaunchdServiceManager()
+        if args.command == "model-verify":
+            report = validate_model_profile(args.profile)
+            print(json.dumps({"validation": report.to_dict()}, sort_keys=True))
+            return 0 if report.valid else 3
         if args.command in {"status", "model-budget"}:
             service = manager.status(config)
             status = collect_manager_status(config, service)
@@ -72,6 +77,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "status",
         "uninstall",
         "model-budget",
+        "model-verify",
     ):
         subparser = subparsers.add_parser(command)
         subparser.add_argument("--data-dir", type=Path, default=default_data_dir())
@@ -80,7 +86,7 @@ def _build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--port", type=int, default=8765)
         subparser.add_argument("--ssl-certfile", type=Path)
         subparser.add_argument("--ssl-keyfile", type=Path)
-        if command == "model-budget":
+        if command in {"model-budget", "model-verify"}:
             subparser.add_argument(
                 "--profile",
                 choices=("accuracy", "speed", "all"),

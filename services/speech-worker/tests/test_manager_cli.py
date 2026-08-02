@@ -149,6 +149,49 @@ def test_manager_cli_reports_pre_download_budget_without_starting_download(
     assert str(tmp_path) not in output.out
 
 
+def test_manager_cli_returns_distinct_code_for_failed_model_validation(
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    class InvalidReport:
+        valid = False
+
+        def to_dict(self):
+            return {
+                "profile": "speed",
+                "valid": False,
+                "models": (
+                    {
+                        "model_id": "qwen3:8b",
+                        "state": "missing",
+                        "issue_codes": ("MODEL_NOT_INSTALLED",),
+                    },
+                ),
+            }
+
+    monkeypatch.setattr(
+        "speech_capture_worker.manager_cli.validate_model_profile",
+        lambda _profile: InvalidReport(),
+    )
+
+    result = main([
+        "model-verify",
+        "--profile",
+        "speed",
+        "--data-dir",
+        str(tmp_path / "runtime"),
+        "--executable",
+        str(_executable(tmp_path)),
+    ])
+    output = capsys.readouterr()
+
+    assert result == 3
+    assert output.err == ""
+    assert json.loads(output.out)["validation"]["valid"] is False
+    assert str(tmp_path) not in output.out
+
+
 class SimpleStatus:
     def __init__(self, service: LaunchdServiceStatus) -> None:
         self.service = service

@@ -173,3 +173,40 @@ def test_status_uses_actionable_codes_when_dependencies_are_unavailable(
     )
     assert snapshot.network.tailscale_cli_available is False
     assert all(model.cache_present is False for model in snapshot.models)
+
+
+def test_status_detects_local_ollama_manifests_when_service_is_unreachable(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    config = _config(tmp_path)
+    manifests = (
+        tmp_path
+        / ".ollama"
+        / "models"
+        / "manifests"
+        / "registry.ollama.ai"
+        / "library"
+        / "qwen3"
+    )
+    manifests.mkdir(parents=True)
+    (manifests / "14b").write_text("{}", encoding="utf-8")
+    (manifests / "8b").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(
+        "speech_capture_worker.manager_status.shutil.which",
+        lambda name: "/test-bin/ollama" if name == "ollama" else None,
+    )
+
+    snapshot = collect_manager_status(
+        config,
+        _service(running=False),
+        home=tmp_path,
+        huggingface_cache=tmp_path / "missing-model-cache",
+        command_runner=lambda _arguments: LaunchdCommandResult(returncode=1),
+        port_probe=lambda _host, _port: False,
+    )
+
+    assert snapshot.ollama.service_reachable is False
+    assert snapshot.ollama.accuracy_model_present is True
+    assert snapshot.ollama.editor_model_present is True
+    assert "OLLAMA_NOT_RUNNING" in snapshot.issue_codes

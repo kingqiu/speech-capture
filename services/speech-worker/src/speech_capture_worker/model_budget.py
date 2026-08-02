@@ -34,6 +34,14 @@ class ModelDownloadItem:
 
 
 @dataclass(frozen=True)
+class ModelCatalogItem:
+    key: str
+    model_id: str
+    provider: str
+    expected_download_bytes: int
+
+
+@dataclass(frozen=True)
 class ModelDownloadBudget:
     profile: ModelProfileName
     estimate_only: bool
@@ -75,13 +83,13 @@ def calculate_model_download_budget(
     presence = present or {}
     items = tuple(
         ModelDownloadItem(
-            key=key,
-            model_id=model_id,
-            provider=provider,
-            expected_download_bytes=expected_bytes,
-            present=bool(presence.get(key, False)),
+            key=item.key,
+            model_id=item.model_id,
+            provider=item.provider,
+            expected_download_bytes=item.expected_download_bytes,
+            present=bool(presence.get(item.key, False)),
         )
-        for key, model_id, provider, expected_bytes in _catalog_for_profile(profile)
+        for item in model_catalog_for_profile(profile)
     )
     catalog_bytes = sum(item.expected_download_bytes for item in items)
     missing_bytes = sum(
@@ -123,9 +131,9 @@ def presence_from_status(snapshot: ManagerStatusSnapshot) -> dict[str, bool]:
     }
 
 
-def _catalog_for_profile(
+def model_catalog_for_profile(
     profile: ModelProfileName,
-) -> tuple[tuple[str, str, str, int], ...]:
+) -> tuple[ModelCatalogItem, ...]:
     catalog = {
         "asr_accuracy": (
             "asr_accuracy",
@@ -169,4 +177,4 @@ def _catalog_for_profile(
             "ollama_editor",
         ),
     }[profile]
-    return tuple(catalog[key] for key in keys)
+    return tuple(ModelCatalogItem(*catalog[key]) for key in keys)

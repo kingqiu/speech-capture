@@ -31,6 +31,10 @@ uv run speech-capture-manager model-budget \
   --profile accuracy \
   --executable "$PWD/.venv/bin/speech-capture-worker"
 
+uv run speech-capture-manager model-verify \
+  --profile accuracy \
+  --executable "$PWD/.venv/bin/speech-capture-worker"
+
 uv run speech-capture-manager restart \
   --executable "$PWD/.venv/bin/speech-capture-worker"
 
@@ -51,6 +55,11 @@ does not delete databases, models, uploaded sources, generated artifacts, or use
 `model-budget` is a read-only preflight. It subtracts models already reported as present, adds 15% download
 headroom, and requires the filesystem to retain at least 20 GiB or 10% of total capacity, whichever is larger.
 It reports an estimate and shortfall before a future download action; it does not download or activate a model.
+
+`model-verify` performs a full content-hash check. For MLX models it verifies the selected Hugging Face revision,
+repository metadata, required configuration and weight shards, Git/LFS hashes, and Safetensors headers. For Ollama
+models it verifies the manifest and every referenced blob SHA-256. A failed validation returns exit code 3 and safe
+issue codes; no local path or user content is emitted. Validation can take time because it reads every model byte.
 
 ## 3. Restart and login conditions
 
