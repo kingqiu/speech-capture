@@ -1,5 +1,5 @@
 // Generated Worker protocol wire types. Do not edit manually.
-export const OPENAPI_SHA256 = "8bed2318f02dd8cd4b181ffb8ae6dccd626d709af6cbe44bb74de95e6a45ca5d" as const;
+export const OPENAPI_SHA256 = "447e392e161b0cbd8aabecca5dd811f9c4653b4cd93d4c03bacf47e9cb9bf56e" as const;
 export const OPENAPI_VERSION = "3.1.0" as const;
 export const PROTOCOL_VERSION = "1.0.0" as const;
 
@@ -76,6 +76,17 @@ export interface CredentialRotationPrepareRequestSchema {
 export interface DeviceRevocationResponse {
   readonly device_id: string;
   readonly revoked: boolean;
+}
+
+export interface DiagnosticsSummaryResponse {
+  readonly authorized_vault_count: number;
+  readonly job_state_counts: Readonly<Record<string, number>>;
+  readonly protocol_version: string;
+  readonly security_database_ok: boolean;
+  readonly visible_device_count: number;
+  readonly visible_job_count: number;
+  readonly worker_database_ok: boolean;
+  readonly worker_version: string;
 }
 
 export type DiarizationStatus =

@@ -27,6 +27,8 @@ V1 assumes a private network such as Tailscale.
 - Pairing is confirmed on the Worker host and can be revoked by device.
 - A Worker restricts each device to approved Vault identities and operations.
 - Routine Worker restart or upgrade preserves pairing.
+- The Worker defaults to loopback-only HTTP. Non-loopback binds require an explicit non-public IP and a protected
+  TLS certificate/key pair; wildcard and public listeners are rejected.
 
 A reinstall, explicit reset of security state, or loss of the processing host requires new pairing.
 

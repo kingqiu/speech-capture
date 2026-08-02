@@ -269,6 +269,9 @@ Before each release:
 - scan tracked files and build artifacts for credentials and private paths;
 - assert that routine logs omit transcript text;
 - inspect diagnostic redaction;
+- assert wildcard/public listeners fail closed and non-loopback listeners require TLS;
+- perform a real local TLS health check with a temporary certificate;
+- verify unexpected exceptions, persisted job failures, and diagnostic summaries never echo private content;
 - verify private fixture directories remain ignored;
 - test device revocation;
 - test path traversal and symlink escape;

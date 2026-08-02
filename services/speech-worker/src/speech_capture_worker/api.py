@@ -24,6 +24,7 @@ from speech_capture_worker.api_schemas import (
     CredentialRotationActivateRequestSchema,
     CredentialRotationPrepareRequestSchema,
     DeviceRevocationResponse,
+    DiagnosticsSummaryResponse,
     HealthResponse,
     IssuedDeviceCredentialSchema,
     JobActionEnvelope,
@@ -88,6 +89,7 @@ from speech_capture_worker.recording_context import (
     RECORDING_CONTEXT_OPTION,
     recording_context_from_options,
 )
+from speech_capture_worker.redaction import public_error_message
 from speech_capture_worker.transcript import JobSnapshot, TranscriptSegment
 
 PRIVATE_ERROR_RESPONSES = {
@@ -170,7 +172,16 @@ def create_app(
             request,
             status_code=_worker_error_status(exc),
             code=exc.code,
-            message=exc.message,
+            message=public_error_message(exc.code) or "The Worker request failed.",
+        )
+
+    @app.exception_handler(Exception)
+    async def handle_unexpected_error(request: Request, _exc: Exception) -> JSONResponse:
+        return _error_response(
+            request,
+            status_code=500,
+            code="INTERNAL_WORKER_ERROR",
+            message="The Worker encountered an internal error. Use the request ID for diagnosis.",
         )
 
     def require_bearer_token(
@@ -389,6 +400,36 @@ def create_app(
             replacement_token=replacement_token,
         )
         return ActivatedCredentialRotationSchema.model_validate(asdict(activated))
+
+    @app.get(
+        "/v1/diagnostics/summary",
+        response_model=DiagnosticsSummaryResponse,
+        operation_id="getDiagnosticsSummary",
+        tags=["diagnostics"],
+        responses=PRIVATE_ERROR_RESPONSES,
+    )
+    def get_diagnostics_summary(
+        principal: Principal,
+        worker_store: Store,
+    ) -> DiagnosticsSummaryResponse:
+        security_store = _require_device_security_store(device_security_store)
+        vaults = tuple(sorted(principal.allowed_vault_ids))
+        state_counts = worker_store.count_jobs_by_state(vaults)
+        visible_devices = sum(
+            1
+            for device in security_store.list_devices()
+            if set(device.allowed_vault_ids) <= principal.allowed_vault_ids
+        )
+        return DiagnosticsSummaryResponse(
+            worker_version=__version__,
+            protocol_version=PROTOCOL_VERSION,
+            worker_database_ok=worker_store.quick_check(),
+            security_database_ok=security_store.quick_check(),
+            authorized_vault_count=len(vaults),
+            visible_device_count=visible_devices,
+            visible_job_count=sum(state_counts.values()),
+            job_state_counts={state.value: count for state, count in state_counts.items()},
+        )
 
     @app.post(
         "/v1/uploads",
@@ -885,7 +926,9 @@ def _require_device_security_store(
 
 
 def _upload_schema(upload: UploadRecord) -> UploadSchema:
-    return UploadSchema.model_validate(upload.to_dict())
+    payload = upload.to_dict()
+    payload["last_error_message"] = public_error_message(upload.last_error_code)
+    return UploadSchema.model_validate(payload)
 
 
 def _upload_envelope(
@@ -916,7 +959,7 @@ def _job_schema(job: JobRecord) -> JobSchema:
         recording_context=recording_context_from_options(job.options),
         revision=job.revision,
         last_error_code=job.last_error_code,
-        last_error_message=job.last_error_message,
+        last_error_message=public_error_message(job.last_error_code),
         created_at=job.created_at,
         updated_at=job.updated_at,
     )

@@ -1,6 +1,6 @@
 # Speech Capture Worker
 
-Status: local model spike, persistent Worker core, durable media intake, one-active-job scheduling, progressive transcript persistence, deterministic normalization, restart-safe local ASR chunk execution, one-call batch execution of all remaining ASR chunks, durable whole-transcript alignment finalization, anonymous speaker attribution, content-type classification and evidence-linked extraction, deterministic backend artifact generation, controlled forced-alignment fallback, conservative PCM gap evidence, evidence-bound definite-silence materialization, and explicit human-reviewed gap outcomes. There is no network Worker service yet.
+Status: persistent Worker core plus a versioned authenticated API with fail-closed local/HTTPS listeners, durable media intake, one-active-job scheduling, progressive transcript persistence, deterministic normalization, restart-safe local ASR chunk execution, one-call batch execution of all remaining ASR chunks, durable whole-transcript alignment finalization, anonymous speaker attribution, content-type classification and evidence-linked extraction, deterministic backend artifact generation, controlled forced-alignment fallback, conservative PCM gap evidence, evidence-bound definite-silence materialization, and explicit human-reviewed gap outcomes.
 
 The Worker performs durable local processing outside Obsidian. It will own:
 
@@ -68,6 +68,11 @@ Developer commands:
 uv sync --extra dev
 
 uv run speech-capture-worker init \
+  --data-dir runtime/dev-worker
+
+# Plain HTTP is accepted only on loopback. Remote binds fail unless an explicit
+# private-network IP and protected TLS certificate/key pair are supplied.
+uv run speech-capture-worker serve \
   --data-dir runtime/dev-worker
 
 uv run speech-capture-worker preflight \
@@ -323,4 +328,6 @@ Probe reports may contain transcript text. `tests/output/` and private fixtures 
 
 The probe checks source duration, chunk timeline continuity, generation truncation, empty chunk output, timestamp bounds, and optional normalized character error rate against a reviewed transcript. It exits with a non-zero status when the current result cannot be called complete.
 
-See the [architecture](../../docs/architecture.md), [Worker API direction](../../docs/worker-api.md), and [testing strategy](../../docs/testing-strategy.md).
+See the [architecture](../../docs/architecture.md), [Worker API direction](../../docs/worker-api.md),
+[HTTPS and private-network setup](../../docs/private-network-setup.md), and
+[testing strategy](../../docs/testing-strategy.md).

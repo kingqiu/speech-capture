@@ -350,6 +350,61 @@
         "title": "DeviceRevocationResponse",
         "type": "object"
       },
+      "DiagnosticsSummaryResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "authorized_vault_count": {
+            "minimum": 0.0,
+            "title": "Authorized Vault Count",
+            "type": "integer"
+          },
+          "job_state_counts": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "title": "Job State Counts",
+            "type": "object"
+          },
+          "protocol_version": {
+            "title": "Protocol Version",
+            "type": "string"
+          },
+          "security_database_ok": {
+            "title": "Security Database Ok",
+            "type": "boolean"
+          },
+          "visible_device_count": {
+            "minimum": 0.0,
+            "title": "Visible Device Count",
+            "type": "integer"
+          },
+          "visible_job_count": {
+            "minimum": 0.0,
+            "title": "Visible Job Count",
+            "type": "integer"
+          },
+          "worker_database_ok": {
+            "title": "Worker Database Ok",
+            "type": "boolean"
+          },
+          "worker_version": {
+            "title": "Worker Version",
+            "type": "string"
+          }
+        },
+        "required": [
+          "worker_version",
+          "protocol_version",
+          "worker_database_ok",
+          "security_database_ok",
+          "authorized_vault_count",
+          "visible_device_count",
+          "visible_job_count",
+          "job_state_counts"
+        ],
+        "title": "DiagnosticsSummaryResponse",
+        "type": "object"
+      },
       "DiarizationStatus": {
         "enum": [
           "not_started",
@@ -2302,6 +2357,122 @@
         "summary": "Prepare Device Credential Rotation",
         "tags": [
           "devices"
+        ]
+      }
+    },
+    "/v1/diagnostics/summary": {
+      "get": {
+        "operationId": "getDiagnosticsSummary",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DiagnosticsSummaryResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Request Entity Too Large"
+          },
+          "415": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Unsupported Media Type"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Get Diagnostics Summary",
+        "tags": [
+          "diagnostics"
         ]
       }
     },

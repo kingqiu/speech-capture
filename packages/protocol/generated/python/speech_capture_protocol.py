@@ -2,7 +2,7 @@
 
 from typing import Final, Literal, NotRequired, TypeAlias, TypedDict
 
-OPENAPI_SHA256: Final = "8bed2318f02dd8cd4b181ffb8ae6dccd626d709af6cbe44bb74de95e6a45ca5d"
+OPENAPI_SHA256: Final = "447e392e161b0cbd8aabecca5dd811f9c4653b4cd93d4c03bacf47e9cb9bf56e"
 OPENAPI_VERSION: Final = "3.1.0"
 PROTOCOL_VERSION: Final = "1.0.0"
 
@@ -120,6 +120,16 @@ class CredentialRotationPrepareRequestSchema(TypedDict):
 class DeviceRevocationResponse(TypedDict):
     device_id: str
     revoked: bool
+
+class DiagnosticsSummaryResponse(TypedDict):
+    authorized_vault_count: int
+    job_state_counts: dict[str, int]
+    protocol_version: str
+    security_database_ok: bool
+    visible_device_count: int
+    visible_job_count: int
+    worker_database_ok: bool
+    worker_version: str
 
 class HealthResponse(TypedDict):
     protocol_version: str
@@ -366,6 +376,7 @@ __all__ = [
     "CredentialRotationActivateRequestSchema",
     "CredentialRotationPrepareRequestSchema",
     "DeviceRevocationResponse",
+    "DiagnosticsSummaryResponse",
     "DiarizationStatus",
     "HealthResponse",
     "IssuedDeviceCredentialSchema",

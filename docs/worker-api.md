@@ -71,7 +71,8 @@ POST   /v1/diagnostics/export
 The checked-in OpenAPI now implements pairing, authenticated device management, two-phase credential rotation,
 uploads, jobs, lifecycle actions, bounded snapshots and updates, artifact listing, and integrity-checked artifact
 download. Upload status includes exact missing part numbers; the update feed is bounded and deliberately excludes
-transcript text. Model management, diagnostics, and publication lease HTTP routes remain reserved.
+transcript text. The authenticated diagnostic summary exposes only scoped counts, versions, and database health.
+Model management, diagnostic export, and publication lease HTTP routes remain reserved.
 
 ## 4. Authentication
 
@@ -95,6 +96,11 @@ Remote access requires:
 Pairing creates a per-device revocable credential. Restarting or upgrading the Worker does not require pairing again. Reinstalling or deleting Worker security state does.
 
 Credentials are not stored in the synchronized Vault.
+
+The implemented server defaults to `127.0.0.1:8765`. Plain HTTP is rejected for non-loopback listeners; direct
+remote listeners require an explicit non-public IP plus a protected certificate/key pair. Wildcard and public
+binds are rejected. Tailscale Serve over the loopback listener is the recommended V1 deployment; see
+[Worker HTTPS and private-network setup](private-network-setup.md).
 
 The durable Worker security store retains only credential and pairing-secret digests plus explicit Vault allowlists.
 An authorized device can create a pairing session only within its own Vault scope, list only devices fully contained

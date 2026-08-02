@@ -11,6 +11,7 @@ from speech_capture_worker.device_security import (
     MAX_PAIRING_ATTEMPTS,
     DeviceSecurityStore,
 )
+from speech_capture_worker.domain import JobCreateRequest, JobState
 from speech_capture_worker.errors import (
     CredentialRotationExpired,
     CredentialRotationInvalid,
@@ -445,3 +446,80 @@ def test_security_schema_one_is_migrated_without_losing_credentials(tmp_path) ->
     connection.close()
     assert version == 2
     assert rotation_table == ("credential_rotations",)
+
+
+def test_diagnostics_and_api_job_errors_are_scope_bounded_and_content_free(tmp_path) -> None:
+    private_error = "/Users/private/client-meeting.wav: secret transcript sentence"
+    with (
+        DeviceSecurityStore(tmp_path / "security.sqlite3") as security,
+        JobStore(tmp_path / "worker.sqlite3") as jobs,
+    ):
+        session = security.create_pairing_session(
+            device_id="laptop_diagnostics",
+            allowed_vault_ids=("vault_one",),
+        )
+        issued = security.confirm_pairing(
+            session_id=session.session_id,
+            pairing_code=session.pairing_code,
+        )
+        visible, _ = jobs.create_job(
+            JobCreateRequest(
+                vault_id="vault_one",
+                source_display_name="visible-source.m4a",
+                source_sha256="a" * 64,
+                source_size_bytes=100,
+            ),
+            idempotency_key="visible-job",
+        )
+        jobs.transition_job(visible.job_id, JobState.UPLOADING, expected_revision=0)
+        jobs.transition_job(
+            visible.job_id,
+            JobState.FAILED,
+            expected_revision=1,
+            error_code="PRIVATE_BACKEND_FAILED",
+            error_message=private_error,
+        )
+        jobs.create_job(
+            JobCreateRequest(
+                vault_id="vault_hidden",
+                source_display_name="hidden-source.m4a",
+                source_sha256="b" * 64,
+                source_size_bytes=100,
+            ),
+            idempotency_key="hidden-job",
+        )
+        client = TestClient(
+            create_app(
+                store=jobs,
+                credential_verifier=security,
+                device_security_store=security,
+            )
+        )
+        headers = {"Authorization": f"Bearer {issued.bearer_token}"}
+        diagnostics = client.get("/v1/diagnostics/summary", headers=headers)
+        jobs_response = client.get(
+            "/v1/jobs",
+            params={"vault_id": "vault_one"},
+            headers=headers,
+        )
+
+    assert diagnostics.status_code == 200
+    assert diagnostics.json() == {
+        "worker_version": "0.1.0a0",
+        "protocol_version": "1.0.0",
+        "worker_database_ok": True,
+        "security_database_ok": True,
+        "authorized_vault_count": 1,
+        "visible_device_count": 1,
+        "visible_job_count": 1,
+        "job_state_counts": {"failed": 1},
+    }
+    assert "vault_one" not in diagnostics.text
+    assert "vault_hidden" not in diagnostics.text
+    assert "source" not in diagnostics.text
+    assert private_error not in diagnostics.text
+    assert jobs_response.status_code == 200
+    assert private_error not in jobs_response.text
+    assert jobs_response.json()["jobs"][0]["last_error_message"] == (
+        "The Worker could not complete this processing stage safely."
+    )

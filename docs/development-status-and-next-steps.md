@@ -1256,12 +1256,13 @@ FastAPI，并加入设备身份和 Vault 授权。阶段 H 的 Obsidian 前端�
 - [x] 实现大文件断点续传。
 - [x] 实现有限制的轮询或 SSE 更新。
 - [x] 实现设备配对。
-- [ ] 实现长期凭据的安全保存。
+- [x] Worker 仅持久保存长期凭据摘要。
+- [ ] Obsidian 客户端将明文 token 放入操作系统保护存储（阶段 H）。
 - [x] 实现 Vault 级授权。
 - [x] 实现设备撤销和凭据轮换。
-- [ ] 配置 HTTPS。
-- [ ] 编写 Tailscale 推荐接入方案，同时允许其他安全网络方案。
-- [ ] 对错误消息和诊断日志做脱敏。
+- [x] 配置 HTTPS。
+- [x] 编写 Tailscale 推荐接入方案，同时允许其他安全网络方案。
+- [x] 对错误消息和诊断日志做脱敏。
 
 #### 完成标准
 
@@ -2616,3 +2617,29 @@ Stage F 的设备管理、撤销和 Worker 侧凭据轮换已经完成：
 
 下一步严格进入 Stage F 的 HTTPS 配置与 Tailscale/其他安全网络接入说明，随后完成错误消息和诊断
 日志脱敏审计。客户端长期 token 的系统保护存储仍属于后续 Obsidian 端，不提前进入阶段 H。
+
+---
+
+## 49. 2026-08-02 Stage F HTTPS、安全网络与脱敏收口
+
+Stage F 的 Worker 端实现已经收口，没有进入 Stage G 或 Obsidian 前端：
+
+- 新增正式 `serve` 入口和锁定的 Uvicorn 运行时；默认只监听 `127.0.0.1:8765`；
+- 明文 HTTP 只允许 loopback；非 loopback 必须绑定一个明确的非公网 IP，并同时提供证书和私钥；
+  wildcard、公网 IP 和远程 hostname bind 均 fail closed；私钥存在组/其他用户权限时拒绝启动；
+- server 不信任代理头，不发送 server/date header，并关闭 routine access log；Bearer 与 Vault 授权
+  在任何私网之后仍然强制执行；
+- 已用临时证书真实启动 HTTPS Worker 并验证 `/v1/health`；
+- `docs/private-network-setup.md` 给出 Tailscale Serve 推荐方案、禁止 Funnel/公网转发、ACL、证书
+  透明度提示、验证与恢复清单，并规定其他安全网络必须保持的相同边界；
+- WorkerCoreError 对外只使用 error code 对应的固定安全文案；未知异常统一返回 request ID，不回显
+  exception；持久 job/upload 错误不再把原始 message 复制到 API；本地 CLI 保留可操作文案但会
+  移除路径/凭据并且不再输出 details；
+- 新增认证诊断摘要，仅按调用设备获批 Vault 统计 job 状态和可见设备数量，并返回版本/数据库
+  健康；不包含 ID、Vault 名、文件名、路径、正文、prompt 或 token；
+- OpenAPI 与 Python/TypeScript 类型同步；全套 `371` 项测试、Ruff、`compileall`、类型漂移和差异
+  检查通过。
+
+Stage F 的 Worker 端范围完成。唯一未实现的长期明文 token 系统保护存储明确属于 Stage H 的
+Obsidian 客户端。下一步停在 Stage G 边界，等待项目所有者确认后才进入 Worker Manager 和系统
+后台服务；不得自行开始阶段 G 或阶段 H。

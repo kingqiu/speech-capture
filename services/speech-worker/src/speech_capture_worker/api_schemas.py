@@ -187,6 +187,17 @@ class ActivatedCredentialRotationSchema(PublicSchema):
     activated_at: str
 
 
+class DiagnosticsSummaryResponse(PublicSchema):
+    worker_version: str
+    protocol_version: str
+    worker_database_ok: bool
+    security_database_ok: bool
+    authorized_vault_count: int = Field(ge=0)
+    visible_device_count: int = Field(ge=0)
+    visible_job_count: int = Field(ge=0)
+    job_state_counts: dict[str, int]
+
+
 class UploadCreateSchema(PublicSchema):
     vault_id: SafeIdentifier
     source_display_name: str = Field(min_length=1, max_length=255)

@@ -993,6 +993,28 @@ class JobStore:
                 ).fetchall()
             return [self._row_to_job(row) for row in rows]
 
+    def count_jobs_by_state(self, vault_ids: Sequence[str]) -> dict[JobState, int]:
+        normalized = tuple(dict.fromkeys(vault_ids))
+        if len(normalized) > 64 or any(
+            not SAFE_IDENTIFIER_PATTERN.fullmatch(vault_id) for vault_id in normalized
+        ):
+            raise InvalidJobRequest("Diagnostic Vault scope is invalid.")
+        if not normalized:
+            return {}
+        placeholders = ", ".join("?" for _ in normalized)
+        with self._lock:
+            rows = self._connection.execute(
+                f"""
+                SELECT state, COUNT(*) AS job_count
+                FROM jobs
+                WHERE vault_id IN ({placeholders})
+                GROUP BY state
+                ORDER BY state
+                """,
+                normalized,
+            ).fetchall()
+        return {JobState(str(row["state"])): int(row["job_count"]) for row in rows}
+
     def get_active_processing_job(self) -> JobRecord | None:
         with self._lock:
             placeholders = ", ".join("?" for _ in ACTIVE_PROCESSING_STATES)

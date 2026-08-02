@@ -62,6 +62,7 @@ from speech_capture_worker.recording_context import (
     normalize_recording_context,
     recording_context_sha256,
 )
+from speech_capture_worker.redaction import public_cli_error_payload
 from speech_capture_worker.resources import (
     check_resource_preflight,
     estimate_job_disk_bytes,
@@ -91,7 +92,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         return _dispatch(args)
     except WorkerCoreError as exc:
-        _write_json({"error": exc.to_dict()}, stream=sys.stderr)
+        _write_json(
+            {"error": public_cli_error_payload(exc.code, exc.message)},
+            stream=sys.stderr,
+        )
         return 2
 
 
@@ -666,6 +670,16 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     _add_data_dir(revoke_device)
     revoke_device.add_argument("device_id")
+
+    serve = subparsers.add_parser(
+        "serve",
+        help="Run the authenticated Worker API with fail-closed network settings.",
+    )
+    _add_data_dir(serve)
+    serve.add_argument("--host", default="127.0.0.1")
+    serve.add_argument("--port", type=int, default=8765)
+    serve.add_argument("--ssl-certfile", type=Path)
+    serve.add_argument("--ssl-keyfile", type=Path)
     return parser
 
 
@@ -679,6 +693,20 @@ def _add_data_dir(parser: argparse.ArgumentParser) -> None:
 
 
 def _dispatch(args: argparse.Namespace) -> int:
+    if args.command == "serve":
+        from speech_capture_worker.server import ServerConfig, serve
+
+        serve(
+            ServerConfig(
+                data_dir=args.data_dir,
+                host=args.host,
+                port=args.port,
+                ssl_certfile=args.ssl_certfile,
+                ssl_keyfile=args.ssl_keyfile,
+            )
+        )
+        return 0
+
     if args.command == "preflight":
         estimated_bytes = _resolve_estimated_bytes(args)
         report = check_resource_preflight(

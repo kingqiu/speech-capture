@@ -134,6 +134,24 @@ def test_unconfigured_private_api_fails_closed() -> None:
     assert response.json()["error"]["code"] == "AUTHENTICATION_NOT_CONFIGURED"
 
 
+def test_unexpected_api_error_never_echoes_exception_content() -> None:
+    private_value = "/Users/private/customer-recording.wav secret transcript text"
+    test_app = create_app(credential_verifier=_verifier("vault_primary"))
+
+    @test_app.get("/test-unexpected-error")
+    def explode() -> None:
+        raise RuntimeError(private_value)
+
+    response = TestClient(test_app, raise_server_exceptions=False).get(
+        "/test-unexpected-error"
+    )
+
+    assert response.status_code == 500
+    assert response.json()["error"]["code"] == "INTERNAL_WORKER_ERROR"
+    assert private_value not in response.text
+    assert "/Users/" not in response.text
+
+
 def test_resumable_upload_job_snapshot_updates_and_vault_isolation(tmp_path) -> None:
     with JobStore(
         tmp_path / "worker.sqlite3",

@@ -285,6 +285,11 @@ class DeviceSecurityStore:
             ).fetchall()
             return [_row_to_device(row) for row in rows]
 
+    def quick_check(self) -> bool:
+        with self._lock:
+            row = self._connection.execute("PRAGMA quick_check").fetchone()
+            return row is not None and str(row[0]).lower() == "ok"
+
     def get_device(self, device_id: str) -> PairedDevice:
         _validate_device_id(device_id)
         with self._lock:
