@@ -1,5 +1,5 @@
 // Generated Worker protocol wire types. Do not edit manually.
-export const OPENAPI_SHA256 = "7545d5bd8d7e20c8aa01cf62daa3490e6a4d016b6014d9c00d899d70f8b9a0a1" as const;
+export const OPENAPI_SHA256 = "f693de0586e4bfdf685d671c30a6964e63421ea22078ba34b135566656571825" as const;
 export const OPENAPI_VERSION = "3.1.0" as const;
 export const PROTOCOL_VERSION = "1.0.0" as const;
 
@@ -67,6 +67,15 @@ export interface HealthResponse {
   readonly protocol_version: string;
   readonly status: "ok";
   readonly worker_version: string;
+}
+
+export interface IssuedDeviceCredentialSchema {
+  readonly allowed_vault_ids: ReadonlyArray<string>;
+  readonly bearer_token: string;
+  readonly created_at: string;
+  readonly credential_id: string;
+  readonly device_id: string;
+  readonly generation: number;
 }
 
 export interface JobActionEnvelope {
@@ -176,6 +185,11 @@ export interface JobUpdatesResponse {
 export type ModelProfile =
   | "accuracy"
   | "speed";
+
+export interface PairingConfirmRequestSchema {
+  readonly pairing_code: string;
+  readonly session_id: string;
+}
 
 export type ProtocolCapability =
   | "resumable_uploads"

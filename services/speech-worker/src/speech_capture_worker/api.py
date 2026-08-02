@@ -10,7 +10,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from speech_capture_worker import __version__
-from speech_capture_worker.api_auth import ApiPrincipal, CredentialVerifier
+from speech_capture_worker.api_auth import ApiPrincipal, CredentialAuthenticator
 from speech_capture_worker.api_schemas import (
     ApiErrorResponse,
     ApiErrorSchema,
@@ -21,6 +21,7 @@ from speech_capture_worker.api_schemas import (
     CompatibilityRequestSchema,
     CompatibilityResponse,
     HealthResponse,
+    IssuedDeviceCredentialSchema,
     JobActionEnvelope,
     JobActionRequestSchema,
     JobCreateSchema,
@@ -31,6 +32,7 @@ from speech_capture_worker.api_schemas import (
     JobSnapshotResponse,
     JobUpdateSchema,
     JobUpdatesResponse,
+    PairingConfirmRequestSchema,
     ProvisionalTranscriptSchema,
     SafeIdentifier,
     Sha256String,
@@ -42,6 +44,7 @@ from speech_capture_worker.api_schemas import (
     UploadSchema,
 )
 from speech_capture_worker.artifact_access import load_artifact_package
+from speech_capture_worker.device_security import DeviceSecurityStore
 from speech_capture_worker.domain import (
     JobRecord,
     JobState,
@@ -110,7 +113,8 @@ class ApiProblem(RuntimeError):
 def create_app(
     *,
     store: JobStore | None = None,
-    credential_verifier: CredentialVerifier | None = None,
+    credential_verifier: CredentialAuthenticator | None = None,
+    device_security_store: DeviceSecurityStore | None = None,
 ) -> FastAPI:
     app = FastAPI(
         title="Speech Capture Worker API",
@@ -245,6 +249,35 @@ def create_app(
             )
         )
         return CompatibilityResponse.model_validate(result.to_dict())
+
+    @app.post(
+        "/v1/pairing/confirm",
+        response_model=IssuedDeviceCredentialSchema,
+        operation_id="confirmPairing",
+        tags=["pairing"],
+        responses={
+            401: {"model": ApiErrorResponse},
+            404: {"model": ApiErrorResponse},
+            409: {"model": ApiErrorResponse},
+            410: {"model": ApiErrorResponse},
+            422: {"model": ApiErrorResponse},
+            503: {"model": ApiErrorResponse},
+        },
+    )
+    def confirm_pairing(
+        request: PairingConfirmRequestSchema,
+    ) -> IssuedDeviceCredentialSchema:
+        if device_security_store is None:
+            raise ApiProblem(
+                503,
+                "PAIRING_NOT_CONFIGURED",
+                "Device pairing is not configured.",
+            )
+        issued = device_security_store.confirm_pairing(
+            session_id=request.session_id,
+            pairing_code=request.pairing_code,
+        )
+        return IssuedDeviceCredentialSchema.model_validate(asdict(issued))
 
     @app.post(
         "/v1/uploads",
@@ -686,6 +719,14 @@ def _worker_error_status(exc: WorkerCoreError) -> int:
         "PUBLICATION_LEASE_CONFLICT",
         "PUBLICATION_VERIFICATION_FAILED",
     }:
+        return 409
+    if exc.code == "PAIRING_CODE_INVALID":
+        return 401
+    if exc.code == "PAIRING_SESSION_EXPIRED":
+        return 410
+    if exc.code in {"PAIRING_SESSION_NOT_FOUND", "DEVICE_NOT_FOUND"}:
+        return 404
+    if exc.code == "DEVICE_ALREADY_PAIRED":
         return 409
     return 500
 

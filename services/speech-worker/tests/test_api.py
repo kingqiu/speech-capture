@@ -116,6 +116,7 @@ def test_openapi_is_versioned_strict_and_has_stable_operation_ids() -> None:
         "/v1/jobs/{job_id}/resume",
         "/v1/jobs/{job_id}/retry",
         "/v1/jobs/{job_id}/snapshot",
+        "/v1/pairing/confirm",
         "/v1/uploads",
         "/v1/uploads/{upload_id}",
         "/v1/uploads/{upload_id}/complete",
@@ -130,10 +131,17 @@ def test_openapi_is_versioned_strict_and_has_stable_operation_ids() -> None:
         schema["paths"]["/v1/capabilities/negotiate"]["post"]["operationId"]
         == "negotiateCapabilities"
     )
+    assert schema["paths"]["/v1/pairing/confirm"]["post"]["operationId"] == "confirmPairing"
+    public_paths = {
+        "/v1/health",
+        "/v1/capabilities",
+        "/v1/capabilities/negotiate",
+        "/v1/pairing/confirm",
+    }
     private_operations = {
         operation["operationId"]
         for path, methods in schema["paths"].items()
-        if path not in {"/v1/health", "/v1/capabilities", "/v1/capabilities/negotiate"}
+        if path not in public_paths
         for operation in methods.values()
     }
     assert private_operations == {
@@ -154,7 +162,7 @@ def test_openapi_is_versioned_strict_and_has_stable_operation_ids() -> None:
         "retryJob",
     }
     for path, methods in schema["paths"].items():
-        if path in {"/v1/health", "/v1/capabilities", "/v1/capabilities/negotiate"}:
+        if path in public_paths:
             continue
         for operation in methods.values():
             assert operation["security"] == [{"BearerAuth": []}]

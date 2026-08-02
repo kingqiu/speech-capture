@@ -94,8 +94,9 @@ Pairing creates a per-device revocable credential. Restarting or upgrading the W
 Credentials are not stored in the synchronized Vault.
 
 The current API boundary accepts an injected digest-only credential verifier and an explicit Vault allowlist. This
-is a fail-closed foundation, not the final pairing store: persistent pairing, revocation, and rotation are the next
-Stage F work items.
+foundation now has a durable Worker implementation: a local CLI creates a short-lived pairing session,
+`POST /v1/pairing/confirm` returns a per-device token once, and only its digest plus Vault allowlist persists.
+Rotation and authenticated device-management routes remain the next Stage F work items.
 
 ## 5. Idempotency
 

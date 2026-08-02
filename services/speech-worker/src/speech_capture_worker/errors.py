@@ -151,6 +151,26 @@ class ArtifactVerificationFailed(WorkerCoreError):
     code = "ARTIFACT_VERIFICATION_FAILED"
 
 
+class PairingSessionNotFound(WorkerCoreError):
+    code = "PAIRING_SESSION_NOT_FOUND"
+
+
+class PairingSessionExpired(WorkerCoreError):
+    code = "PAIRING_SESSION_EXPIRED"
+
+
+class PairingCodeInvalid(WorkerCoreError):
+    code = "PAIRING_CODE_INVALID"
+
+
+class DeviceAlreadyPaired(WorkerCoreError):
+    code = "DEVICE_ALREADY_PAIRED"
+
+
+class DeviceNotFound(WorkerCoreError):
+    code = "DEVICE_NOT_FOUND"
+
+
 class PublicationLeaseConflict(WorkerCoreError):
     code = "PUBLICATION_LEASE_CONFLICT"
 

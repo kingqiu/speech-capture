@@ -19,6 +19,7 @@ from speech_capture_worker.artifact_generation import (
 from speech_capture_worker.asr_execution import AsrChunkExecutor, MlxQwenAsrEngine
 from speech_capture_worker.audio_preprocessing import AudioPreprocessor
 from speech_capture_worker.corrections import CorrectionField
+from speech_capture_worker.device_security import DeviceSecurityStore
 from speech_capture_worker.diarization_execution import (
     DiarizationOutcome,
     PyannoteSpeakerDiarizationEngine,
@@ -643,6 +644,28 @@ def _build_parser() -> argparse.ArgumentParser:
     estimate.add_argument("--estimated-bytes", type=int)
     estimate.add_argument("--source-size-bytes", type=int)
     preflight.add_argument("--duration-sec", type=float)
+
+    create_pairing = subparsers.add_parser(
+        "create-pairing-session",
+        help="Create one short-lived local pairing code for a device.",
+    )
+    _add_data_dir(create_pairing)
+    create_pairing.add_argument("--device-id", required=True)
+    create_pairing.add_argument("--vault-id", action="append", required=True)
+    create_pairing.add_argument("--ttl-seconds", type=int, default=300)
+
+    list_devices = subparsers.add_parser(
+        "list-paired-devices",
+        help="List paired devices without credential hashes or tokens.",
+    )
+    _add_data_dir(list_devices)
+
+    revoke_device = subparsers.add_parser(
+        "revoke-device",
+        help="Immediately revoke one device's active Worker credential.",
+    )
+    _add_data_dir(revoke_device)
+    revoke_device.add_argument("device_id")
     return parser
 
 
@@ -665,6 +688,47 @@ def _dispatch(args: argparse.Namespace) -> int:
         )
         _write_json(report.to_dict())
         return 0 if report.can_start else 2
+
+    if args.command in {
+        "create-pairing-session",
+        "list-paired-devices",
+        "revoke-device",
+    }:
+        security_path = args.data_dir.resolve() / "security.sqlite3"
+        with DeviceSecurityStore(security_path) as security:
+            if args.command == "create-pairing-session":
+                session = security.create_pairing_session(
+                    device_id=args.device_id,
+                    allowed_vault_ids=tuple(args.vault_id),
+                    ttl_seconds=args.ttl_seconds,
+                )
+                _write_json({
+                    "session_id": session.session_id,
+                    "pairing_code": session.pairing_code,
+                    "device_id": session.device_id,
+                    "allowed_vault_ids": session.allowed_vault_ids,
+                    "expires_at": session.expires_at,
+                })
+                return 0
+            if args.command == "list-paired-devices":
+                _write_json({
+                    "devices": [
+                        {
+                            "credential_id": device.credential_id,
+                            "device_id": device.device_id,
+                            "allowed_vault_ids": device.allowed_vault_ids,
+                            "generation": device.generation,
+                            "created_at": device.created_at,
+                            "last_used_at": device.last_used_at,
+                            "revoked_at": device.revoked_at,
+                        }
+                        for device in security.list_devices()
+                    ]
+                })
+                return 0
+            changed = security.revoke_device(args.device_id)
+            _write_json({"device_id": args.device_id, "revoked": changed})
+            return 0
 
     database_path = args.data_dir.resolve() / "worker.sqlite3"
     with JobStore(database_path) as store:

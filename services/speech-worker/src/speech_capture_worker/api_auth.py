@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import secrets
 from dataclasses import dataclass
+from typing import Protocol
 
 from speech_capture_worker.domain import SAFE_IDENTIFIER_PATTERN
 
@@ -66,6 +67,10 @@ class CredentialVerifier:
             if secrets.compare_digest(candidate, credential.token_sha256):
                 matched = credential.principal
         return matched
+
+
+class CredentialAuthenticator(Protocol):
+    def authenticate(self, token: str) -> ApiPrincipal | None: ...
 
 
 def _validate_plaintext_token(token: str) -> None:

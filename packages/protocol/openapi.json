@@ -299,6 +299,54 @@
         "title": "HealthResponse",
         "type": "object"
       },
+      "IssuedDeviceCredentialSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "allowed_vault_ids": {
+            "items": {
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$",
+              "type": "string"
+            },
+            "title": "Allowed Vault Ids",
+            "type": "array"
+          },
+          "bearer_token": {
+            "maxLength": 512,
+            "minLength": 32,
+            "title": "Bearer Token",
+            "type": "string"
+          },
+          "created_at": {
+            "title": "Created At",
+            "type": "string"
+          },
+          "credential_id": {
+            "pattern": "^cred_[0-9a-f]{32}$",
+            "title": "Credential Id",
+            "type": "string"
+          },
+          "device_id": {
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$",
+            "title": "Device Id",
+            "type": "string"
+          },
+          "generation": {
+            "exclusiveMinimum": 0.0,
+            "title": "Generation",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "credential_id",
+          "device_id",
+          "bearer_token",
+          "allowed_vault_ids",
+          "generation",
+          "created_at"
+        ],
+        "title": "IssuedDeviceCredentialSchema",
+        "type": "object"
+      },
       "JobActionEnvelope": {
         "additionalProperties": false,
         "properties": {
@@ -796,6 +844,28 @@
         ],
         "title": "ModelProfile",
         "type": "string"
+      },
+      "PairingConfirmRequestSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "pairing_code": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Pairing Code",
+            "type": "string"
+          },
+          "session_id": {
+            "pattern": "^pair_[0-9a-f]{32}$",
+            "title": "Session Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "pairing_code"
+        ],
+        "title": "PairingConfirmRequestSchema",
+        "type": "object"
       },
       "ProtocolCapability": {
         "enum": [
@@ -3043,6 +3113,97 @@
         "summary": "Get Job Snapshot",
         "tags": [
           "jobs"
+        ]
+      }
+    },
+    "/v1/pairing/confirm": {
+      "post": {
+        "operationId": "confirmPairing",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PairingConfirmRequestSchema"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IssuedDeviceCredentialSchema"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "410": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Gone"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "summary": "Confirm Pairing",
+        "tags": [
+          "pairing"
         ]
       }
     },

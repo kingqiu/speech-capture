@@ -2,7 +2,7 @@
 
 from typing import Final, Literal, NotRequired, TypeAlias, TypedDict
 
-OPENAPI_SHA256: Final = "7545d5bd8d7e20c8aa01cf62daa3490e6a4d016b6014d9c00d899d70f8b9a0a1"
+OPENAPI_SHA256: Final = "f693de0586e4bfdf685d671c30a6964e63421ea22078ba34b135566656571825"
 OPENAPI_VERSION: Final = "3.1.0"
 PROTOCOL_VERSION: Final = "1.0.0"
 
@@ -109,6 +109,14 @@ class HealthResponse(TypedDict):
     status: Literal['ok']
     worker_version: str
 
+class IssuedDeviceCredentialSchema(TypedDict):
+    allowed_vault_ids: list[str]
+    bearer_token: str
+    created_at: str
+    credential_id: str
+    device_id: str
+    generation: int
+
 class JobActionRequestSchema(TypedDict):
     expected_revision: int
 
@@ -156,6 +164,10 @@ class JobUpdateSchema(TypedDict):
     job_revision: int
     payload: dict[str, object]
     sequence: int
+
+class PairingConfirmRequestSchema(TypedDict):
+    pairing_code: str
+    session_id: str
 
 class ProtocolLimitsSchema(TypedDict):
     default_upload_chunk_size_bytes: int
@@ -304,6 +316,7 @@ __all__ = [
     "CompatibilityResponse",
     "DiarizationStatus",
     "HealthResponse",
+    "IssuedDeviceCredentialSchema",
     "JobActionEnvelope",
     "JobActionRequestSchema",
     "JobCreateSchema",
@@ -316,6 +329,7 @@ __all__ = [
     "JobUpdateSchema",
     "JobUpdatesResponse",
     "ModelProfile",
+    "PairingConfirmRequestSchema",
     "ProtocolCapability",
     "ProtocolLimitsSchema",
     "ProvisionalTranscriptSchema",

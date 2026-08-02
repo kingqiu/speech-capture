@@ -6,6 +6,7 @@ import wave
 
 import pytest
 
+from speech_capture_worker.device_security import DeviceSecurityStore
 from speech_capture_worker.domain import JobCreateRequest, JobState, UploadCreateRequest
 from speech_capture_worker.job_store import JobStore
 from speech_capture_worker.media_probe import MediaProbeResult
@@ -18,6 +19,40 @@ def test_cli_initializes_database_without_exposing_path(tmp_path, capsys) -> Non
 
     assert result == 0
     assert payload == {"database_ready": True, "schema_ready": True}
+
+
+def test_cli_bootstraps_lists_and_revokes_a_paired_device(tmp_path, capsys) -> None:
+    data_dir = tmp_path / "runtime"
+    assert main([
+        "create-pairing-session",
+        "--data-dir",
+        str(data_dir),
+        "--device-id",
+        "laptop_cli",
+        "--vault-id",
+        "vault_primary",
+    ]) == 0
+    session = json.loads(capsys.readouterr().out)
+    with DeviceSecurityStore(data_dir / "security.sqlite3") as security:
+        issued = security.confirm_pairing(
+            session_id=session["session_id"],
+            pairing_code=session["pairing_code"],
+        )
+
+    assert main(["list-paired-devices", "--data-dir", str(data_dir)]) == 0
+    listed_output = capsys.readouterr().out
+    listed = json.loads(listed_output)
+    assert issued.bearer_token not in listed_output
+    assert listed["devices"][0]["device_id"] == "laptop_cli"
+
+    assert main([
+        "revoke-device",
+        "--data-dir",
+        str(data_dir),
+        "laptop_cli",
+    ]) == 0
+    revoked = json.loads(capsys.readouterr().out)
+    assert revoked == {"device_id": "laptop_cli", "revoked": True}
 
 
 def test_cli_create_is_idempotent_and_listable(tmp_path, capsys) -> None:

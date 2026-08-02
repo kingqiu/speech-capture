@@ -116,6 +116,20 @@ class ApiErrorResponse(PublicSchema):
     error: ApiErrorSchema
 
 
+class PairingConfirmRequestSchema(PublicSchema):
+    session_id: str = Field(pattern=r"^pair_[0-9a-f]{32}$")
+    pairing_code: str = Field(min_length=1, max_length=128)
+
+
+class IssuedDeviceCredentialSchema(PublicSchema):
+    credential_id: str = Field(pattern=r"^cred_[0-9a-f]{32}$")
+    device_id: SafeIdentifier
+    bearer_token: str = Field(min_length=32, max_length=512)
+    allowed_vault_ids: tuple[SafeIdentifier, ...]
+    generation: int = Field(gt=0)
+    created_at: str
+
+
 class UploadCreateSchema(PublicSchema):
     vault_id: SafeIdentifier
     source_display_name: str = Field(min_length=1, max_length=255)
