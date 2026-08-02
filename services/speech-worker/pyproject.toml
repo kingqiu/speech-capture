@@ -28,6 +28,9 @@ diarization = [
   "pyannote.audio>=4.0.4,<5",
   "omegaconf>=2.3,<3",
 ]
+packaging = [
+  "pyinstaller==6.21.0",
+]
 
 [project.scripts]
 speech-capture-asr-probe = "speech_capture_worker.asr_probe:main"

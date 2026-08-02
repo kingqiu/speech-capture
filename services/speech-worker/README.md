@@ -333,4 +333,5 @@ See the [architecture](../../docs/architecture.md), [Worker API direction](../..
 [testing strategy](../../docs/testing-strategy.md).
 
 Stage G background-service development and restart boundaries are documented in
-[macOS Worker background service](../../docs/macos-background-service.md).
+[macOS Worker background service](../../docs/macos-background-service.md). The standalone Apple Silicon build and
+verification contract is documented in [standalone runtime](../../docs/standalone-runtime.md).

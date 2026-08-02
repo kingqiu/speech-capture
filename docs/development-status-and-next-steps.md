@@ -1287,7 +1287,7 @@ FastAPI，并加入设备身份和 Vault 授权。阶段 H 的 Obsidian 前端�
 - [x] 校验模型文件。
 - [x] 支持模型激活、切换和回滚。
 - [x] 提供不含私人内容的诊断包。
-- [ ] 最终提供无需开发环境的打包运行时。
+- [x] 最终提供无需开发环境的打包运行时。
 
 #### 完成标准
 
@@ -2782,3 +2782,28 @@ Stage H 或 Obsidian 前端。
 
 下一步严格完成无需开发环境的打包运行时；仍不开始 Stage H。真实冷重启验收继续等待项目所有者
 安排维护窗口，不得为自动验证而中断当前登录会话。
+
+---
+
+## 56. 2026-08-02 Stage G 无开发环境独立运行时
+
+- 新增 PyInstaller 6.21.0 锁定的 `macOS arm64 onedir` 构建；单一 frozen runtime 通过两个轻量
+  launcher 提供 Worker 与 Manager，目标机不需要源码、Python、uv、虚拟环境或 Homebrew FFmpeg；
+- 包内包含 Python 3.11、FastAPI/Uvicorn、SQLite、MLX ASR/aligner、pyannote/torch 和 FFmpeg/
+  FFprobe 及所需非系统 dylib；Ollama 服务和约 22.9 GB 模型继续外置，应用更新不覆盖模型和数据；
+- 构建脚本只清理自己验证过的 build/dist 子目录；输出 manifest 对每个普通文件记录 mode、bytes、
+  SHA-256，对每个内部 symlink 记录相对 target 和 target hash，并拒绝任何逃出包目录的链接；
+- 构建后在最小系统 PATH、`/private/tmp` 工作目录下运行 frozen Worker/Manager，创建 SQLite、读取
+  激活状态、扫描所有文件中的项目/home/venv 私有路径，并验证本地 macOS 代码签名；
+- 最终本地包 3,392 项、磁盘占用约 703 MiB，manifest SHA-256 为
+  `3ad1d8e85ffdda0b1eca85e674dd6b88892ec1ca3cc6010a23ecee4bb5984f1b`；dist/build 均被 Git 忽略；
+- 包内 FFmpeg 8.0.1/FFprobe 在最小 PATH 下运行，动态依赖均为包内 `@rpath` 或系统库；frozen archive
+  已确认含 MLX ASR/aligner 与 pyannote pipeline；
+- 打包后的 Manager 对五个模型完成约 22.9 GB 全哈希，打包 Worker 真实启动回环 API，健康响应为
+  Worker `0.1.0a0`、协议 `1.0.0`，随后干净关闭；所有临时数据均删除；
+- 新增 dispatcher、build safety、manifest、internal symlink 和路径逃逸测试；全套测试基线为
+  `421 passed`。
+
+Stage G 可自动完成的 Worker/Manager 核心工作已经结束。仍有两项明确的外部/人工边界：冷重启与
+logout/login 必须由项目所有者安排维护窗口；跨 Mac 分发前需要项目控制的 Apple Developer ID
+签名和 notarization。未经项目所有者下一阶段确认，不进入 Stage H 或 Obsidian 前端。
