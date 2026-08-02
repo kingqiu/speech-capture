@@ -2538,5 +2538,7 @@ Obsidian 前端：
   `transcript.raw.json` 哈希均保持
   `45bf58083c586998b690faf8bc9bfb705d3b260b5b2c971aa25ce5c73f2575ea`。临时数据验证后删除。
 
-下一步停在阶段 F 边界：先审阅并按项目所有者要求提交/推送 Stage E。未经明确确认，不实现
-FastAPI、设备/Vault 授权或阶段 H 前端。
+Stage E 已在 `9872f20 Implement atomic Vault publication` 提交并推送到
+`origin/agent/worker-core`，私有 runtime、reference、音频和生成数据未进入 Git。项目所有者
+随后明确确认继续，下一步严格进入阶段 F：先定义协议版本与能力协商，再建立 OpenAPI；不提前
+进入阶段 G 或阶段 H 前端。
