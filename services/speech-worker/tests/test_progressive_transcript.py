@@ -563,6 +563,8 @@ def test_schema_three_migration_backfills_state_events_into_update_feed(tmp_path
     connection = sqlite3.connect(database)
     connection.executescript(
         """
+        DROP TABLE publication_receipts;
+        DROP TABLE publication_leases;
         DROP TABLE corrections;
         DROP TABLE asr_attempts;
         DROP TABLE job_updates;

@@ -33,9 +33,14 @@ The Worker core now has an executable local foundation for:
 - evidence-bound definite-silence backfill and immediate alignment refresh;
 - version-anchored explicit human review for exact unresolved ranges;
 - stable machine-readable errors;
+- exclusive publication leases, renewal, release, acknowledgement, expiry takeover, and restart recovery;
+- verified seven-file Vault packages written through a temporary sibling and atomic directory rename;
+- idempotent publication retry with existing-user-content and sync-conflict preservation;
 - a developer CLI.
 
-This is not yet the network Worker service. It can execute or replay one local ASR chunk through backend tools, but it does not yet run a continuous background job loop, expose FastAPI, authenticate devices, diarize speakers, structure notes, or publish to a Vault.
+This is not yet the network Worker service. The local core can run ASR, diarization, structuring,
+artifact generation, and verified Vault publication through backend tools, but it does not yet run a
+continuous background job loop, expose FastAPI, or authenticate and authorize devices.
 
 ## 2. Core invariants
 
@@ -800,7 +805,7 @@ The Worker package currently tests:
 - memory and swap warning and blocked states;
 - model-profile memory minimums;
 - CLI initialization, idempotency, listing, and stable errors;
-- schema-one through schema-five migration and state-event backfill;
+- schema-one through schema-seven migration and state-event backfill;
 - idempotent upload creation and manifest conflicts;
 - out-of-order part receipt and exact resume status;
 - part checksum, size, number, and replacement conflicts;
@@ -887,6 +892,13 @@ The Worker package currently tests:
 - all-or-none owner-supplied acceptance policy with no invented defaults;
 - path-free, transcript-free, `0600` atomic evaluation reports;
 - passing evaluation still cannot authorize stable timeline materialization.
+- one-active-publication enforcement across two database connections;
+- lease renewal, release, expiration takeover, acknowledgement, idempotent replay, and restart recovery;
+- canonical Vault-relative path validation and symlink/mount escape rejection;
+- complete-package hash verification, temporary-directory write, atomic rename, and post-write verification;
+- interruption after directory commit but before acknowledgement, followed by safe retry;
+- pre-existing user content, sync-like differences, extra files, and corrupted Worker artifacts preserved
+  or rejected without a false `published` state.
 
 A separate CLI integration run advanced a job to `transcribing`, closed the store, recovered it to `queued`, and verified all seven events and database integrity.
 
@@ -896,10 +908,9 @@ The scheduler integration continued that source into a bound revision-three queu
 
 ## 15. Next implementation boundary
 
-The next layer will add:
-
-1. atomic Vault publication with leases, retries, and verified package hashes;
-2. add FastAPI only after the core behavior is stable under integration tests.
+The next layer will add the formal FastAPI protocol, capability negotiation, device pairing, and
+Vault-scoped authorization around the now-tested local core. The Obsidian frontend remains a later
+stage after that API and security boundary are accepted.
 
 Continuous multi-chunk ASR batches are now available through `run-asr-all`; a
 full packaged background stage loop will still be needed for the network

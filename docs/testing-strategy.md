@@ -53,6 +53,10 @@ Scenarios include:
 - partial diarization availability;
 - pause, resume, cancel, and retry;
 - artifact regeneration after transcript correction;
+- concurrent publication claim, lease expiry takeover, and restart recovery;
+- atomic seven-file Vault publication and post-write checksum verification;
+- interruption after atomic rename but before acknowledgement;
+- pre-existing user edits, sync-like conflicts, symlink escape, and corrupt Worker artifact rejection;
 - duplicate-source behavior.
 
 Model adapters also support deterministic fakes so reliability tests do not require expensive inference.

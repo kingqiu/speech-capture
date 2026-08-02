@@ -28,6 +28,8 @@ from speech_capture_worker.domain import JobState, ResourceStatus, UploadCreateR
 from speech_capture_worker.errors import (
     ArtifactGenerationFailed,
     InvalidJobRequest,
+    PublicationConflict,
+    PublicationVerificationFailed,
     RevisionConflict,
     UploadStorageError,
 )
@@ -44,6 +46,11 @@ from speech_capture_worker.structuring_execution import (
     StructuringExecutor,
 )
 from speech_capture_worker.transcript import SpeakerLabelStatus
+from speech_capture_worker.vault_publication import (
+    PUBLISHED_PACKAGE_FILES,
+    VaultPublicationOutcome,
+    VaultPublisher,
+)
 
 
 def wav_bytes(*, duration_seconds: float) -> bytes:
@@ -878,3 +885,214 @@ def test_artifact_generation_requires_structuring_evidence(tmp_path) -> None:
 
         with pytest.raises(ArtifactGenerationFailed):
             ArtifactGenerator(store).generate(job.job_id)
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")
+def test_vault_publisher_atomically_publishes_and_verifies_complete_package(
+    tmp_path,
+) -> None:
+    vault = tmp_path / "Vault"
+    vault.mkdir()
+    with JobStore(
+        tmp_path / "worker.sqlite3",
+        source_probe=source_probe_for(95),
+    ) as store:
+        job = create_quality_check_job(
+            store,
+            duration_seconds=95,
+            suffix="vault-publish",
+        )
+        first = ArtifactGenerator(store).generate(job.job_id)
+        current = store.get_job(job.job_id)
+        store.append_correction(
+            job.job_id,
+            field=CorrectionField.RECORDING_DATE,
+            target_id=None,
+            before=None,
+            after="2026-08-01",
+            author="test-user",
+            idempotency_key="publish-recording-date",
+            expected_revision=current.revision,
+        )
+        regenerated = ArtifactGenerator(store).generate(job.job_id)
+        package = store.get_job_stage_directory(job.job_id, stage="artifacts")
+        publisher = VaultPublisher(
+            store,
+            vault_root=vault,
+            publisher_id="local_vault",
+            output_root="Published Speech",
+        )
+
+        result = publisher.publish(
+            job.job_id,
+            expected_revision=regenerated.job.revision,
+        )
+        target = vault / result.target_relative_path
+        replayed = publisher.publish(
+            job.job_id,
+            expected_revision=result.job.revision,
+        )
+
+        assert first.job.state is JobState.PROCESSED
+        assert result.outcome is VaultPublicationOutcome.PUBLISHED
+        assert result.job.state is JobState.PUBLISHED
+        assert result.target_relative_path.startswith("Published Speech/2026/08/2026-08-01-")
+        assert result.target_relative_path.endswith(f"--{regenerated.speech_id}")
+        assert {item.name for item in target.iterdir()} == set(PUBLISHED_PACKAGE_FILES)
+        for name in PUBLISHED_PACKAGE_FILES:
+            assert (target / name).read_bytes() == (package / name).read_bytes()
+        assert not any(item.name.startswith(".") for item in target.parent.iterdir())
+        assert replayed.outcome is VaultPublicationOutcome.ALREADY_PUBLISHED
+        assert replayed.receipt == result.receipt
+
+        edited = (target / "note.md").read_text("utf-8") + "\n用户在 Vault 中的修改。\n"
+        (target / "note.md").write_text(edited, "utf-8")
+        with pytest.raises(PublicationConflict):
+            publisher.publish(job.job_id, expected_revision=result.job.revision)
+        assert (target / "note.md").read_text("utf-8") == edited
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")
+def test_vault_publication_conflict_preserves_user_and_worker_files(tmp_path) -> None:
+    vault = tmp_path / "Vault"
+    vault.mkdir()
+    with JobStore(
+        tmp_path / "worker.sqlite3",
+        source_probe=source_probe_for(95),
+    ) as store:
+        job = create_quality_check_job(
+            store,
+            duration_seconds=95,
+            suffix="vault-conflict",
+        )
+        generated = ArtifactGenerator(store).generate(job.job_id)
+        package = store.get_job_stage_directory(job.job_id, stage="artifacts")
+        worker_note = (package / "note.md").read_bytes()
+        target = vault / "Speech" / "Undated" / f"平台规划会议--{generated.speech_id}"
+        target.mkdir(parents=True)
+        user_file = target / "user-note.md"
+        user_file.write_text("用户已有内容，不得覆盖。", "utf-8")
+        publisher = VaultPublisher(
+            store,
+            vault_root=vault,
+            publisher_id="local_vault",
+            output_root="Speech",
+        )
+
+        with pytest.raises(PublicationConflict, match="user changes"):
+            publisher.publish(job.job_id, expected_revision=generated.job.revision)
+
+        assert store.get_job(job.job_id).state is JobState.PROCESSED
+        assert user_file.read_text("utf-8") == "用户已有内容，不得覆盖。"
+        assert (package / "note.md").read_bytes() == worker_note
+        assert store.get_publication_receipt(job.job_id) is None
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")
+def test_publication_can_resume_after_directory_commit_before_acknowledgement(
+    tmp_path, monkeypatch
+) -> None:
+    vault = tmp_path / "Vault"
+    vault.mkdir()
+    with JobStore(
+        tmp_path / "worker.sqlite3",
+        source_probe=source_probe_for(95),
+    ) as store:
+        job = create_quality_check_job(
+            store,
+            duration_seconds=95,
+            suffix="vault-resume",
+        )
+        generated = ArtifactGenerator(store).generate(job.job_id)
+        publisher = VaultPublisher(
+            store,
+            vault_root=vault,
+            publisher_id="local_vault",
+            output_root="Speech",
+        )
+        acknowledge = store.acknowledge_publication
+
+        def interrupt_acknowledgement(*args, **kwargs):
+            raise PublicationVerificationFailed("simulated acknowledgement interruption")
+
+        monkeypatch.setattr(store, "acknowledge_publication", interrupt_acknowledgement)
+        with pytest.raises(PublicationVerificationFailed, match="simulated"):
+            publisher.publish(job.job_id, expected_revision=generated.job.revision)
+        processed = store.get_job(job.job_id)
+        target = vault / "Speech" / "Undated" / f"平台规划会议--{generated.speech_id}"
+        assert processed.state is JobState.PROCESSED
+        assert target.is_dir()
+        assert {item.name for item in target.iterdir()} == set(PUBLISHED_PACKAGE_FILES)
+
+        monkeypatch.setattr(store, "acknowledge_publication", acknowledge)
+        resumed = publisher.publish(job.job_id, expected_revision=processed.revision)
+
+    assert resumed.outcome is VaultPublicationOutcome.PUBLISHED
+    assert resumed.job.state is JobState.PUBLISHED
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")
+def test_vault_publication_rejects_symlink_escape_before_claim(tmp_path) -> None:
+    vault = tmp_path / "Vault"
+    outside = tmp_path / "Outside"
+    vault.mkdir()
+    outside.mkdir()
+    (vault / "Speech").symlink_to(outside, target_is_directory=True)
+    with JobStore(
+        tmp_path / "worker.sqlite3",
+        source_probe=source_probe_for(95),
+    ) as store:
+        job = create_quality_check_job(
+            store,
+            duration_seconds=95,
+            suffix="vault-symlink",
+        )
+        generated = ArtifactGenerator(store).generate(job.job_id)
+        publisher = VaultPublisher(
+            store,
+            vault_root=vault,
+            publisher_id="local_vault",
+            output_root="Speech",
+        )
+
+        with pytest.raises(PublicationConflict, match="outside"):
+            publisher.publish(job.job_id, expected_revision=generated.job.revision)
+
+        assert store.get_job(job.job_id).state is JobState.PROCESSED
+        assert store.list_publication_leases(job.job_id) == []
+        assert list(outside.iterdir()) == []
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")
+def test_vault_publication_rejects_corrupt_worker_artifact_before_claim(tmp_path) -> None:
+    vault = tmp_path / "Vault"
+    vault.mkdir()
+    with JobStore(
+        tmp_path / "worker.sqlite3",
+        source_probe=source_probe_for(95),
+    ) as store:
+        job = create_quality_check_job(
+            store,
+            duration_seconds=95,
+            suffix="vault-corrupt-worker-artifact",
+        )
+        generated = ArtifactGenerator(store).generate(job.job_id)
+        package = store.get_job_stage_directory(job.job_id, stage="artifacts")
+        transcript = package / "transcript.md"
+        transcript.write_text(
+            transcript.read_text("utf-8") + "\n未经清单记录的修改。\n",
+            "utf-8",
+        )
+        publisher = VaultPublisher(
+            store,
+            vault_root=vault,
+            publisher_id="local_vault",
+            output_root="Speech",
+        )
+
+        with pytest.raises(PublicationVerificationFailed, match="checksum"):
+            publisher.publish(job.job_id, expected_revision=generated.job.revision)
+
+        assert store.get_job(job.job_id).state is JobState.PROCESSED
+        assert store.list_publication_leases(job.job_id) == []
+        assert list(vault.iterdir()) == []

@@ -196,6 +196,121 @@ def test_cli_appends_and_lists_idempotent_recording_date_correction(
     assert listed["corrections"] == [first["correction"]]
 
 
+def test_cli_manages_publication_lease_lifecycle(tmp_path, capsys) -> None:
+    data_path = tmp_path / "runtime"
+    content = b"publication-audio"
+    checksum = hashlib.sha256(content).hexdigest()
+
+    def probe(_):
+        return MediaProbeResult(
+            duration_seconds=1,
+            audio_stream_count=1,
+            format_name="wav",
+        )
+
+    with JobStore(data_path / "worker.sqlite3", source_probe=probe) as store:
+        upload, _ = store.create_upload(
+            UploadCreateRequest(
+                vault_id="vault_primary",
+                source_display_name="publication.wav",
+                source_sha256=checksum,
+                source_size_bytes=len(content),
+                media_type="audio/wav",
+            ),
+            idempotency_key="publication-cli-upload",
+        )
+        store.put_upload_part(
+            upload.upload_id,
+            part_number=1,
+            content=content,
+            part_sha256=checksum,
+        )
+        store.complete_upload(upload.upload_id)
+        queued, _ = store.create_job_from_upload(
+            upload.upload_id,
+            idempotency_key="publication-cli-job",
+        )
+        current = store.claim_job_for_processing(
+            queued.job_id,
+            expected_revision=queued.revision,
+        )
+        for state in (
+            JobState.TRANSCRIBING,
+            JobState.ALIGNING,
+            JobState.STRUCTURING,
+            JobState.QUALITY_CHECK,
+            JobState.PROCESSED,
+        ):
+            current = store.transition_job(
+                current.job_id,
+                state,
+                expected_revision=current.revision,
+                reason_code="test_progress",
+            )
+
+    claim_args = [
+        "claim-publication",
+        "--data-dir",
+        str(data_path),
+        current.job_id,
+        "--publisher-id",
+        "device_a",
+        "--target-relative-path",
+        "Speech/Undated/publication--sp_123",
+        "--manifest-sha256",
+        "a" * 64,
+        "--expected-revision",
+        str(current.revision),
+    ]
+    assert main(claim_args) == 0
+    claimed = json.loads(capsys.readouterr().out)
+    assert claimed["created"] is True
+    assert claimed["job"]["state"] == "publishing"
+
+    assert (
+        main(
+            [
+                "renew-publication",
+                "--data-dir",
+                str(data_path),
+                current.job_id,
+                "--lease-id",
+                claimed["lease"]["lease_id"],
+                "--publisher-id",
+                "device_a",
+                "--lease-seconds",
+                "300",
+            ]
+        )
+        == 0
+    )
+    renewed = json.loads(capsys.readouterr().out)
+    assert renewed["lease"]["expires_at"] > claimed["lease"]["expires_at"]
+
+    assert main(["publication-status", "--data-dir", str(data_path), current.job_id]) == 0
+    status = json.loads(capsys.readouterr().out)
+    assert status["leases"][0]["state"] == "active"
+    assert status["receipt"] is None
+
+    assert (
+        main(
+            [
+                "release-publication",
+                "--data-dir",
+                str(data_path),
+                current.job_id,
+                "--lease-id",
+                claimed["lease"]["lease_id"],
+                "--publisher-id",
+                "device_a",
+            ]
+        )
+        == 0
+    )
+    released = json.loads(capsys.readouterr().out)
+    assert released["job"]["state"] == "processed"
+
+
 def test_cli_returns_stable_error_for_invalid_transition(tmp_path, capsys) -> None:
     data_dir = str(tmp_path / "runtime")
     main(

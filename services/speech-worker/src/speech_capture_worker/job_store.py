@@ -10,7 +10,7 @@ import sqlite3
 import threading
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -47,6 +47,7 @@ from speech_capture_worker.errors import (
     IdempotencyConflict,
     InvalidJobRequest,
     JobNotFound,
+    PublicationLeaseConflict,
     RevisionConflict,
     SchedulerBusy,
     TranscriptConflict,
@@ -62,6 +63,15 @@ from speech_capture_worker.errors import (
     WorkerCoreError,
 )
 from speech_capture_worker.media_probe import MediaProbeResult, probe_audio_source
+from speech_capture_worker.publication_domain import (
+    DEFAULT_PUBLICATION_LEASE_SECONDS,
+    PublicationLeaseRecord,
+    PublicationLeaseState,
+    PublicationReceiptRecord,
+    validate_lease_seconds,
+    validate_publication_lease_request,
+    validate_publisher_id,
+)
 from speech_capture_worker.recording_context import (
     RECORDING_CONTEXT_OPTION,
     normalize_recording_context,
@@ -87,7 +97,7 @@ from speech_capture_worker.transcript import (
     validate_transcript_text,
 )
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 DEFAULT_UPLOAD_CHUNK_SIZE_BYTES = 8 * 1024 * 1024
 MAX_UPLOAD_CHUNK_SIZE_BYTES = 64 * 1024 * 1024
 MAX_UPLOAD_PARTS = 10_000
@@ -354,6 +364,10 @@ class JobStore:
                         "current_revision": current.revision,
                     },
                 )
+            if current.state in {JobState.PUBLISHING, JobState.PUBLISHED}:
+                raise InvalidJobRequest(
+                    "Recording context cannot change during or after publication."
+                )
             existing = recording_context_from_options(current.options)
             if existing == normalized:
                 return current, False
@@ -428,6 +442,10 @@ class JobStore:
                         "expected_revision": expected_revision,
                         "current_revision": current.revision,
                     },
+                )
+            if current.state in {JobState.PUBLISHING, JobState.PUBLISHED}:
+                raise InvalidJobRequest(
+                    "Content type cannot change during or after publication."
                 )
             if current.content_type_override == normalized:
                 return current, False
@@ -614,6 +632,308 @@ class JobStore:
             ).fetchall()
             return [self._row_to_correction(row) for row in rows]
 
+    def claim_publication(
+        self,
+        job_id: str,
+        *,
+        publisher_id: str,
+        target_relative_path: str,
+        manifest_sha256: str,
+        expected_revision: int,
+        lease_seconds: int = DEFAULT_PUBLICATION_LEASE_SECONDS,
+    ) -> tuple[PublicationLeaseRecord, JobRecord, bool]:
+        """Claim the only active publication lease for one processed package."""
+
+        validate_publication_lease_request(
+            publisher_id=publisher_id,
+            target_relative_path=target_relative_path,
+            manifest_sha256=manifest_sha256,
+            lease_seconds=lease_seconds,
+        )
+        if (
+            not isinstance(expected_revision, int)
+            or isinstance(expected_revision, bool)
+            or expected_revision < 0
+        ):
+            raise InvalidJobRequest("expected_revision must be zero or greater.")
+        with self._transaction():
+            current = self._row_to_job(self._fetch_job_row(job_id))
+            active = self._fetch_active_publication_lease_row(job_id)
+            now = _utc_now()
+            if active is not None and not _publication_lease_expired(active, now=now):
+                lease = self._row_to_publication_lease(active)
+                if (
+                    lease.publisher_id == publisher_id
+                    and lease.target_relative_path == target_relative_path
+                    and lease.manifest_sha256 == manifest_sha256
+                ):
+                    return lease, current, False
+                raise PublicationLeaseConflict(
+                    "Another publisher currently owns this job's publication lease.",
+                    details={
+                        "job_id": job_id,
+                        "lease_expires_at": str(active["expires_at"]),
+                    },
+                )
+            if current.revision != expected_revision:
+                raise RevisionConflict(
+                    "The job changed after the publication snapshot.",
+                    details={
+                        "job_id": job_id,
+                        "expected_revision": expected_revision,
+                        "current_revision": current.revision,
+                    },
+                )
+            if active is not None:
+                self._complete_publication_lease(
+                    str(active["lease_id"]),
+                    state=PublicationLeaseState.EXPIRED,
+                    completed_at=now,
+                )
+                if current.state is not JobState.PUBLISHING:
+                    raise PublicationLeaseConflict(
+                        "The expired lease does not match the current job state.",
+                        details={"job_id": job_id},
+                    )
+                current = self._transition_in_transaction(
+                    current=current,
+                    target_state=JobState.PROCESSED,
+                    reason_code="publication_lease_expired",
+                    error_code=None,
+                    error_message=None,
+                    event_type="publication.lease_expired",
+                )
+            if current.state is not JobState.PROCESSED:
+                raise InvalidJobRequest("Only a processed job can be claimed for publication.")
+            publishing = self._transition_in_transaction(
+                current=current,
+                target_state=JobState.PUBLISHING,
+                reason_code="publication_lease_claimed",
+                error_code=None,
+                error_message=None,
+                event_type="publication.claimed",
+            )
+            generation = int(
+                self._connection.execute(
+                    "SELECT COALESCE(MAX(generation), 0) + 1 FROM publication_leases "
+                    "WHERE job_id = ?",
+                    (job_id,),
+                ).fetchone()[0]
+            )
+            lease_id = f"lease_{uuid4().hex}"
+            expires_at = _future_utc(now, seconds=lease_seconds)
+            self._connection.execute(
+                """
+                INSERT INTO publication_leases (
+                    lease_id, job_id, generation, publisher_id,
+                    target_relative_path, manifest_sha256, state,
+                    expires_at, created_at, updated_at, completed_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                """,
+                (
+                    lease_id,
+                    job_id,
+                    generation,
+                    publisher_id,
+                    target_relative_path,
+                    manifest_sha256,
+                    PublicationLeaseState.ACTIVE.value,
+                    expires_at,
+                    now,
+                    now,
+                ),
+            )
+            row = self._connection.execute(
+                "SELECT * FROM publication_leases WHERE lease_id = ?",
+                (lease_id,),
+            ).fetchone()
+            assert row is not None
+            return self._row_to_publication_lease(row), publishing, True
+
+    def renew_publication_lease(
+        self,
+        job_id: str,
+        *,
+        lease_id: str,
+        publisher_id: str,
+        lease_seconds: int = DEFAULT_PUBLICATION_LEASE_SECONDS,
+    ) -> PublicationLeaseRecord:
+        """Extend an unexpired active lease without changing the job revision."""
+
+        validate_publisher_id(publisher_id)
+        validate_lease_seconds(lease_seconds)
+        with self._transaction():
+            job = self._row_to_job(self._fetch_job_row(job_id))
+            row = self._fetch_publication_lease_row(lease_id)
+            now = _utc_now()
+            self._require_owned_active_lease(
+                row,
+                job_id=job_id,
+                publisher_id=publisher_id,
+                now=now,
+            )
+            if job.state is not JobState.PUBLISHING:
+                raise PublicationLeaseConflict(
+                    "The publication lease is not attached to a publishing job."
+                )
+            self._connection.execute(
+                """
+                UPDATE publication_leases
+                SET expires_at = ?, updated_at = ?
+                WHERE lease_id = ? AND state = ?
+                """,
+                (
+                    _future_utc(now, seconds=lease_seconds),
+                    now,
+                    lease_id,
+                    PublicationLeaseState.ACTIVE.value,
+                ),
+            )
+            return self._row_to_publication_lease(
+                self._fetch_publication_lease_row(lease_id)
+            )
+
+    def release_publication_lease(
+        self,
+        job_id: str,
+        *,
+        lease_id: str,
+        publisher_id: str,
+        reason_code: str = "publisher_unavailable",
+    ) -> JobRecord:
+        """Release publication back to processed while retaining Worker artifacts."""
+
+        validate_publisher_id(publisher_id)
+        validate_reason_code(reason_code)
+        with self._transaction():
+            current = self._row_to_job(self._fetch_job_row(job_id))
+            row = self._fetch_publication_lease_row(lease_id)
+            now = _utc_now()
+            self._require_owned_active_lease(
+                row,
+                job_id=job_id,
+                publisher_id=publisher_id,
+                now=now,
+                allow_expired=True,
+            )
+            if current.state is not JobState.PUBLISHING:
+                raise PublicationLeaseConflict("The job is not currently publishing.")
+            self._complete_publication_lease(
+                lease_id,
+                state=PublicationLeaseState.RELEASED,
+                completed_at=now,
+            )
+            return self._transition_in_transaction(
+                current=current,
+                target_state=JobState.PROCESSED,
+                reason_code=reason_code,
+                error_code=None,
+                error_message=None,
+                event_type="publication.released",
+            )
+
+    def acknowledge_publication(
+        self,
+        job_id: str,
+        *,
+        lease_id: str,
+        publisher_id: str,
+        manifest_sha256: str,
+    ) -> tuple[PublicationReceiptRecord, JobRecord, bool]:
+        """Acknowledge one fully written and verified Vault package."""
+
+        validate_publisher_id(publisher_id)
+        if not isinstance(manifest_sha256, str) or not SHA256_PATTERN.fullmatch(
+            manifest_sha256
+        ):
+            raise InvalidJobRequest("manifest_sha256 must be lowercase SHA-256.")
+        with self._transaction():
+            current = self._row_to_job(self._fetch_job_row(job_id))
+            prior = self._connection.execute(
+                "SELECT * FROM publication_receipts WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            if prior is not None:
+                receipt = self._row_to_publication_receipt(prior)
+                if (
+                    receipt.lease_id == lease_id
+                    and receipt.publisher_id == publisher_id
+                    and receipt.manifest_sha256 == manifest_sha256
+                    and current.state is JobState.PUBLISHED
+                ):
+                    return receipt, current, False
+                raise PublicationLeaseConflict(
+                    "The job already has a different publication acknowledgement."
+                )
+            row = self._fetch_publication_lease_row(lease_id)
+            now = _utc_now()
+            self._require_owned_active_lease(
+                row,
+                job_id=job_id,
+                publisher_id=publisher_id,
+                now=now,
+            )
+            if str(row["manifest_sha256"]) != manifest_sha256:
+                raise PublicationLeaseConflict(
+                    "The acknowledgement manifest does not match the claimed package."
+                )
+            if current.state is not JobState.PUBLISHING:
+                raise PublicationLeaseConflict("The job is not currently publishing.")
+            self._connection.execute(
+                """
+                INSERT INTO publication_receipts (
+                    job_id, lease_id, publisher_id, target_relative_path,
+                    manifest_sha256, published_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    job_id,
+                    lease_id,
+                    publisher_id,
+                    str(row["target_relative_path"]),
+                    manifest_sha256,
+                    now,
+                ),
+            )
+            self._complete_publication_lease(
+                lease_id,
+                state=PublicationLeaseState.ACKNOWLEDGED,
+                completed_at=now,
+            )
+            published = self._transition_in_transaction(
+                current=current,
+                target_state=JobState.PUBLISHED,
+                reason_code="publication_verified",
+                error_code=None,
+                error_message=None,
+                event_type="publication.acknowledged",
+            )
+            receipt_row = self._connection.execute(
+                "SELECT * FROM publication_receipts WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            assert receipt_row is not None
+            return self._row_to_publication_receipt(receipt_row), published, True
+
+    def list_publication_leases(self, job_id: str) -> list[PublicationLeaseRecord]:
+        with self._lock:
+            self._fetch_job_row(job_id)
+            rows = self._connection.execute(
+                "SELECT * FROM publication_leases WHERE job_id = ? ORDER BY generation ASC",
+                (job_id,),
+            ).fetchall()
+            return [self._row_to_publication_lease(row) for row in rows]
+
+    def get_publication_receipt(self, job_id: str) -> PublicationReceiptRecord | None:
+        with self._lock:
+            self._fetch_job_row(job_id)
+            row = self._connection.execute(
+                "SELECT * FROM publication_receipts WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            return self._row_to_publication_receipt(row) if row is not None else None
+
     def list_jobs(
         self,
         *,
@@ -794,6 +1114,10 @@ class JobStore:
                         "current_revision": current.revision,
                     },
                 )
+            if target_state in {JobState.PUBLISHING, JobState.PUBLISHED}:
+                raise InvalidJobRequest(
+                    "Publishing states can be entered only through the publication lease protocol."
+                )
             if target_state in ACTIVE_PROCESSING_STATES:
                 active = self._fetch_active_processing_row(excluding_job_id=job_id)
                 if active is not None:
@@ -841,6 +1165,22 @@ class JobStore:
             for row in rows:
                 current = self._row_to_job(row)
                 target = RECOVERY_TARGETS[current.state]
+                if current.state is JobState.PUBLISHING:
+                    now = _utc_now()
+                    self._connection.execute(
+                        """
+                        UPDATE publication_leases
+                        SET state = ?, updated_at = ?, completed_at = ?
+                        WHERE job_id = ? AND state = ?
+                        """,
+                        (
+                            PublicationLeaseState.RECOVERED.value,
+                            now,
+                            now,
+                            current.job_id,
+                            PublicationLeaseState.ACTIVE.value,
+                        ),
+                    )
                 recovered.append(
                     self._transition_in_transaction(
                         current=current,
@@ -3280,6 +3620,54 @@ class JobStore:
                     if self._connection.in_transaction:
                         self._connection.execute("ROLLBACK")
                     raise
+                current = 6
+            if current == 6:
+                try:
+                    self._connection.executescript(
+                        """
+                    BEGIN IMMEDIATE;
+
+                    CREATE TABLE publication_leases (
+                        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                        lease_id TEXT NOT NULL UNIQUE,
+                        job_id TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+                        generation INTEGER NOT NULL CHECK (generation > 0),
+                        publisher_id TEXT NOT NULL,
+                        target_relative_path TEXT NOT NULL,
+                        manifest_sha256 TEXT NOT NULL,
+                        state TEXT NOT NULL,
+                        expires_at TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        completed_at TEXT,
+                        UNIQUE (job_id, generation)
+                    );
+
+                    CREATE UNIQUE INDEX publication_leases_job_active_idx
+                    ON publication_leases (job_id)
+                    WHERE state = 'active';
+
+                    CREATE INDEX publication_leases_job_generation_idx
+                    ON publication_leases (job_id, generation);
+
+                    CREATE TABLE publication_receipts (
+                        job_id TEXT PRIMARY KEY REFERENCES jobs(job_id) ON DELETE CASCADE,
+                        lease_id TEXT NOT NULL UNIQUE
+                            REFERENCES publication_leases(lease_id),
+                        publisher_id TEXT NOT NULL,
+                        target_relative_path TEXT NOT NULL,
+                        manifest_sha256 TEXT NOT NULL,
+                        published_at TEXT NOT NULL
+                    );
+
+                    PRAGMA user_version = 7;
+                    COMMIT;
+                    """
+                    )
+                except BaseException:
+                    if self._connection.in_transaction:
+                        self._connection.execute("ROLLBACK")
+                    raise
 
     @contextmanager
     def _transaction(self) -> Iterator[None]:
@@ -3481,6 +3869,97 @@ class JobStore:
             author=str(row["author"]),
             idempotency_key=str(row["idempotency_key"]),
             created_at=str(row["created_at"]),
+        )
+
+    def _fetch_active_publication_lease_row(self, job_id: str) -> sqlite3.Row | None:
+        return self._connection.execute(
+            "SELECT * FROM publication_leases WHERE job_id = ? AND state = ?",
+            (job_id, PublicationLeaseState.ACTIVE.value),
+        ).fetchone()
+
+    def _fetch_publication_lease_row(self, lease_id: str) -> sqlite3.Row:
+        if (
+            not isinstance(lease_id, str)
+            or not SAFE_IDENTIFIER_PATTERN.fullmatch(lease_id)
+            or not lease_id.startswith("lease_")
+        ):
+            raise InvalidJobRequest("lease_id contains unsupported characters.")
+        row = self._connection.execute(
+            "SELECT * FROM publication_leases WHERE lease_id = ?",
+            (lease_id,),
+        ).fetchone()
+        if row is None:
+            raise PublicationLeaseConflict("The publication lease does not exist.")
+        return row
+
+    @staticmethod
+    def _require_owned_active_lease(
+        row: sqlite3.Row,
+        *,
+        job_id: str,
+        publisher_id: str,
+        now: str,
+        allow_expired: bool = False,
+    ) -> None:
+        if (
+            str(row["job_id"]) != job_id
+            or str(row["publisher_id"]) != publisher_id
+            or str(row["state"]) != PublicationLeaseState.ACTIVE.value
+        ):
+            raise PublicationLeaseConflict("The publisher does not own the active lease.")
+        if not allow_expired and _publication_lease_expired(row, now=now):
+            raise PublicationLeaseConflict("The publication lease has expired.")
+
+    def _complete_publication_lease(
+        self,
+        lease_id: str,
+        *,
+        state: PublicationLeaseState,
+        completed_at: str,
+    ) -> None:
+        self._connection.execute(
+            """
+            UPDATE publication_leases
+            SET state = ?, updated_at = ?, completed_at = ?
+            WHERE lease_id = ? AND state = ?
+            """,
+            (
+                state.value,
+                completed_at,
+                completed_at,
+                lease_id,
+                PublicationLeaseState.ACTIVE.value,
+            ),
+        )
+
+    @staticmethod
+    def _row_to_publication_lease(row: sqlite3.Row) -> PublicationLeaseRecord:
+        return PublicationLeaseRecord(
+            sequence=int(row["sequence"]),
+            lease_id=str(row["lease_id"]),
+            job_id=str(row["job_id"]),
+            generation=int(row["generation"]),
+            publisher_id=str(row["publisher_id"]),
+            target_relative_path=str(row["target_relative_path"]),
+            manifest_sha256=str(row["manifest_sha256"]),
+            state=PublicationLeaseState(str(row["state"])),
+            expires_at=str(row["expires_at"]),
+            created_at=str(row["created_at"]),
+            updated_at=str(row["updated_at"]),
+            completed_at=(
+                str(row["completed_at"]) if row["completed_at"] is not None else None
+            ),
+        )
+
+    @staticmethod
+    def _row_to_publication_receipt(row: sqlite3.Row) -> PublicationReceiptRecord:
+        return PublicationReceiptRecord(
+            job_id=str(row["job_id"]),
+            lease_id=str(row["lease_id"]),
+            publisher_id=str(row["publisher_id"]),
+            target_relative_path=str(row["target_relative_path"]),
+            manifest_sha256=str(row["manifest_sha256"]),
+            published_at=str(row["published_at"]),
         )
 
     @staticmethod
@@ -4260,6 +4739,14 @@ def _json_object(value: str) -> dict[str, Any]:
 
 def _utc_now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _future_utc(now: str, *, seconds: int) -> str:
+    return (datetime.fromisoformat(now) + timedelta(seconds=seconds)).isoformat()
+
+
+def _publication_lease_expired(row: sqlite3.Row, *, now: str) -> bool:
+    return datetime.fromisoformat(str(row["expires_at"])) <= datetime.fromisoformat(now)
 
 
 def _validate_checkpoint_identifier(name: str, value: str) -> None:

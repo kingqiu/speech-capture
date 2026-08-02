@@ -54,6 +54,7 @@ from speech_capture_worker.gap_speech_activity import (
     PyannoteVoiceActivityDetector,
 )
 from speech_capture_worker.job_store import JobStore
+from speech_capture_worker.publication_domain import DEFAULT_PUBLICATION_LEASE_SECONDS
 from speech_capture_worker.recording_context import (
     MAX_RECORDING_CONTEXT_CHARACTERS,
     RECORDING_CONTEXT_OPTION,
@@ -76,6 +77,10 @@ from speech_capture_worker.transcript import (
     SpeakerLabelStatus,
     TranscriptOutcome,
     TranscriptTimingStatus,
+)
+from speech_capture_worker.vault_publication import (
+    DEFAULT_VAULT_OUTPUT_ROOT,
+    VaultPublisher,
 )
 
 
@@ -536,6 +541,77 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     _add_data_dir(summary_revisions)
     summary_revisions.add_argument("job_id")
+
+    claim_publication = subparsers.add_parser(
+        "claim-publication",
+        help="Claim the only active lease for a processed artifact package.",
+    )
+    _add_data_dir(claim_publication)
+    claim_publication.add_argument("job_id")
+    claim_publication.add_argument("--publisher-id", required=True)
+    claim_publication.add_argument("--target-relative-path", required=True)
+    claim_publication.add_argument("--manifest-sha256", required=True)
+    claim_publication.add_argument("--expected-revision", type=int, required=True)
+    claim_publication.add_argument(
+        "--lease-seconds", type=int, default=DEFAULT_PUBLICATION_LEASE_SECONDS
+    )
+
+    renew_publication = subparsers.add_parser(
+        "renew-publication",
+        help="Renew an unexpired publication lease.",
+    )
+    _add_data_dir(renew_publication)
+    renew_publication.add_argument("job_id")
+    renew_publication.add_argument("--lease-id", required=True)
+    renew_publication.add_argument("--publisher-id", required=True)
+    renew_publication.add_argument(
+        "--lease-seconds", type=int, default=DEFAULT_PUBLICATION_LEASE_SECONDS
+    )
+
+    release_publication = subparsers.add_parser(
+        "release-publication",
+        help="Release a publication lease and return the job to processed.",
+    )
+    _add_data_dir(release_publication)
+    release_publication.add_argument("job_id")
+    release_publication.add_argument("--lease-id", required=True)
+    release_publication.add_argument("--publisher-id", required=True)
+    release_publication.add_argument(
+        "--reason-code", default="publisher_unavailable"
+    )
+
+    acknowledge_publication = subparsers.add_parser(
+        "acknowledge-publication",
+        help="Acknowledge a fully written and verified Vault package.",
+    )
+    _add_data_dir(acknowledge_publication)
+    acknowledge_publication.add_argument("job_id")
+    acknowledge_publication.add_argument("--lease-id", required=True)
+    acknowledge_publication.add_argument("--publisher-id", required=True)
+    acknowledge_publication.add_argument("--manifest-sha256", required=True)
+
+    publication_status = subparsers.add_parser(
+        "publication-status",
+        help="Read publication lease history and the final acknowledgement.",
+    )
+    _add_data_dir(publication_status)
+    publication_status.add_argument("job_id")
+
+    publish_to_vault = subparsers.add_parser(
+        "publish-to-vault",
+        help="Atomically publish a processed package into a local Vault root.",
+    )
+    _add_data_dir(publish_to_vault)
+    publish_to_vault.add_argument("job_id")
+    publish_to_vault.add_argument("--vault-root", type=Path, required=True)
+    publish_to_vault.add_argument("--publisher-id", required=True)
+    publish_to_vault.add_argument(
+        "--output-root", default=DEFAULT_VAULT_OUTPUT_ROOT
+    )
+    publish_to_vault.add_argument("--expected-revision", type=int, required=True)
+    publish_to_vault.add_argument(
+        "--lease-seconds", type=int, default=DEFAULT_PUBLICATION_LEASE_SECONDS
+    )
 
     retranscribe_gaps = subparsers.add_parser(
         "retranscribe-gaps",
@@ -1019,6 +1095,74 @@ def _dispatch(args: argparse.Namespace) -> int:
                     ]
                 }
             )
+            return 0
+        if args.command == "claim-publication":
+            lease, job, created = store.claim_publication(
+                args.job_id,
+                publisher_id=args.publisher_id,
+                target_relative_path=args.target_relative_path,
+                manifest_sha256=args.manifest_sha256,
+                expected_revision=args.expected_revision,
+                lease_seconds=args.lease_seconds,
+            )
+            _write_json(
+                {"created": created, "lease": lease.to_dict(), "job": job.to_dict()}
+            )
+            return 0
+        if args.command == "renew-publication":
+            lease = store.renew_publication_lease(
+                args.job_id,
+                lease_id=args.lease_id,
+                publisher_id=args.publisher_id,
+                lease_seconds=args.lease_seconds,
+            )
+            _write_json({"lease": lease.to_dict()})
+            return 0
+        if args.command == "release-publication":
+            job = store.release_publication_lease(
+                args.job_id,
+                lease_id=args.lease_id,
+                publisher_id=args.publisher_id,
+                reason_code=args.reason_code,
+            )
+            _write_json({"job": job.to_dict()})
+            return 0
+        if args.command == "acknowledge-publication":
+            receipt, job, created = store.acknowledge_publication(
+                args.job_id,
+                lease_id=args.lease_id,
+                publisher_id=args.publisher_id,
+                manifest_sha256=args.manifest_sha256,
+            )
+            _write_json(
+                {
+                    "created": created,
+                    "receipt": receipt.to_dict(),
+                    "job": job.to_dict(),
+                }
+            )
+            return 0
+        if args.command == "publication-status":
+            receipt = store.get_publication_receipt(args.job_id)
+            _write_json(
+                {
+                    "leases": [
+                        lease.to_dict()
+                        for lease in store.list_publication_leases(args.job_id)
+                    ],
+                    "receipt": receipt.to_dict() if receipt is not None else None,
+                }
+            )
+            return 0
+        if args.command == "publish-to-vault":
+            result = VaultPublisher(
+                store,
+                vault_root=args.vault_root,
+                publisher_id=args.publisher_id,
+                output_root=args.output_root,
+                lease_seconds=args.lease_seconds,
+            ).publish(args.job_id, expected_revision=args.expected_revision)
+            _write_json(result.to_dict())
             return 0
         if args.command == "retranscribe-gaps":
             job = store.get_job(args.job_id)

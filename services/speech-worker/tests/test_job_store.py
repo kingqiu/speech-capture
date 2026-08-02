@@ -9,6 +9,7 @@ from speech_capture_worker.errors import (
     IdempotencyConflict,
     InvalidJobRequest,
     InvalidTransition,
+    PublicationLeaseConflict,
     RevisionConflict,
 )
 from speech_capture_worker.job_store import JobStore
@@ -348,13 +349,311 @@ def test_recovery_returns_publication_to_processed(tmp_path) -> None:
                 JobState.STRUCTURING,
                 JobState.QUALITY_CHECK,
                 JobState.PROCESSED,
-                JobState.PUBLISHING,
             ],
+        )
+        processed = store.get_job(job.job_id)
+        store.claim_publication(
+            job.job_id,
+            publisher_id="local_vault",
+            target_relative_path="Speech/Undated/example",
+            manifest_sha256="a" * 64,
+            expected_revision=processed.revision,
         )
 
         recovered = store.recover_interrupted_jobs()
+        leases = store.list_publication_leases(job.job_id)
 
     assert recovered[0].state is JobState.PROCESSED
+    assert leases[-1].state.value == "recovered"
+
+
+def test_generic_transition_cannot_bypass_publication_protocol(tmp_path) -> None:
+    with JobStore(tmp_path / "worker.sqlite3") as store:
+        job, _ = store.create_job(request(), idempotency_key="publication-bypass")
+        advance(
+            store,
+            job.job_id,
+            [
+                JobState.UPLOADING,
+                JobState.VERIFYING,
+                JobState.QUEUED,
+                JobState.PREPROCESSING,
+                JobState.TRANSCRIBING,
+                JobState.ALIGNING,
+                JobState.STRUCTURING,
+                JobState.QUALITY_CHECK,
+                JobState.PROCESSED,
+            ],
+        )
+        processed = store.get_job(job.job_id)
+
+        with pytest.raises(InvalidJobRequest, match="publication lease protocol"):
+            store.transition_job(
+                job.job_id,
+                JobState.PUBLISHING,
+                expected_revision=processed.revision,
+            )
+
+        assert store.get_job(job.job_id) == processed
+
+
+def test_publication_lease_is_exclusive_renewable_and_releasable(tmp_path) -> None:
+    with JobStore(tmp_path / "worker.sqlite3") as store:
+        job, _ = store.create_job(request(), idempotency_key="publication-lease")
+        advance(
+            store,
+            job.job_id,
+            [
+                JobState.UPLOADING,
+                JobState.VERIFYING,
+                JobState.QUEUED,
+                JobState.PREPROCESSING,
+                JobState.TRANSCRIBING,
+                JobState.ALIGNING,
+                JobState.STRUCTURING,
+                JobState.QUALITY_CHECK,
+                JobState.PROCESSED,
+            ],
+        )
+        processed = store.get_job(job.job_id)
+        lease, publishing, created = store.claim_publication(
+            job.job_id,
+            publisher_id="device_a",
+            target_relative_path="Speech/Undated/test--sp_123",
+            manifest_sha256="b" * 64,
+            expected_revision=processed.revision,
+        )
+        replayed, replayed_job, replayed_created = store.claim_publication(
+            job.job_id,
+            publisher_id="device_a",
+            target_relative_path="Speech/Undated/test--sp_123",
+            manifest_sha256="b" * 64,
+            expected_revision=processed.revision,
+        )
+
+        assert created is True
+        assert publishing.state is JobState.PUBLISHING
+        assert replayed_created is False
+        assert replayed.lease_id == lease.lease_id
+        assert replayed_job.revision == publishing.revision
+        with pytest.raises(PublicationLeaseConflict):
+            store.claim_publication(
+                job.job_id,
+                publisher_id="device_b",
+                target_relative_path="Speech/Undated/test--sp_123",
+                manifest_sha256="b" * 64,
+                expected_revision=publishing.revision,
+            )
+
+        renewed = store.renew_publication_lease(
+            job.job_id,
+            lease_id=lease.lease_id,
+            publisher_id="device_a",
+            lease_seconds=300,
+        )
+        released = store.release_publication_lease(
+            job.job_id,
+            lease_id=lease.lease_id,
+            publisher_id="device_a",
+        )
+        leases = store.list_publication_leases(job.job_id)
+
+    assert renewed.expires_at > lease.expires_at
+    assert released.state is JobState.PROCESSED
+    assert leases[0].state.value == "released"
+
+
+def test_expired_publication_lease_can_be_taken_over(tmp_path) -> None:
+    database = tmp_path / "worker.sqlite3"
+    with JobStore(database) as store:
+        job, _ = store.create_job(request(), idempotency_key="publication-takeover")
+        advance(
+            store,
+            job.job_id,
+            [
+                JobState.UPLOADING,
+                JobState.VERIFYING,
+                JobState.QUEUED,
+                JobState.PREPROCESSING,
+                JobState.TRANSCRIBING,
+                JobState.ALIGNING,
+                JobState.STRUCTURING,
+                JobState.QUALITY_CHECK,
+                JobState.PROCESSED,
+            ],
+        )
+        processed = store.get_job(job.job_id)
+        first, publishing, _ = store.claim_publication(
+            job.job_id,
+            publisher_id="device_a",
+            target_relative_path="Speech/Undated/test--sp_123",
+            manifest_sha256="c" * 64,
+            expected_revision=processed.revision,
+        )
+        connection = sqlite3.connect(database)
+        connection.execute(
+            "UPDATE publication_leases SET expires_at = ? WHERE lease_id = ?",
+            ("2000-01-01T00:00:00+00:00", first.lease_id),
+        )
+        connection.commit()
+        connection.close()
+
+        second, taken_over, created = store.claim_publication(
+            job.job_id,
+            publisher_id="device_b",
+            target_relative_path="Speech/Undated/test--sp_123",
+            manifest_sha256="c" * 64,
+            expected_revision=publishing.revision,
+        )
+        leases = store.list_publication_leases(job.job_id)
+
+    assert created is True
+    assert second.generation == 2
+    assert taken_over.state is JobState.PUBLISHING
+    assert taken_over.revision == publishing.revision + 2
+    assert [lease.state.value for lease in leases] == ["expired", "active"]
+
+
+def test_publication_acknowledgement_is_idempotent_and_restart_recovers_lease(
+    tmp_path,
+) -> None:
+    with JobStore(tmp_path / "worker.sqlite3") as store:
+        job, _ = store.create_job(request(), idempotency_key="publication-ack")
+        advance(
+            store,
+            job.job_id,
+            [
+                JobState.UPLOADING,
+                JobState.VERIFYING,
+                JobState.QUEUED,
+                JobState.PREPROCESSING,
+                JobState.TRANSCRIBING,
+                JobState.ALIGNING,
+                JobState.STRUCTURING,
+                JobState.QUALITY_CHECK,
+                JobState.PROCESSED,
+            ],
+        )
+        processed = store.get_job(job.job_id)
+        lease, _, _ = store.claim_publication(
+            job.job_id,
+            publisher_id="device_a",
+            target_relative_path="Speech/Undated/test--sp_123",
+            manifest_sha256="d" * 64,
+            expected_revision=processed.revision,
+        )
+        receipt, published, created = store.acknowledge_publication(
+            job.job_id,
+            lease_id=lease.lease_id,
+            publisher_id="device_a",
+            manifest_sha256="d" * 64,
+        )
+        replayed, replayed_job, replayed_created = store.acknowledge_publication(
+            job.job_id,
+            lease_id=lease.lease_id,
+            publisher_id="device_a",
+            manifest_sha256="d" * 64,
+        )
+
+        assert created is True
+        assert published.state is JobState.PUBLISHED
+        assert replayed_created is False
+        assert replayed == receipt
+        assert replayed_job.state is JobState.PUBLISHED
+
+        second_job, _ = store.create_job(
+            request(source_name="second.m4a"),
+            idempotency_key="publication-recover-lease",
+        )
+        advance(
+            store,
+            second_job.job_id,
+            [
+                JobState.UPLOADING,
+                JobState.VERIFYING,
+                JobState.QUEUED,
+                JobState.PREPROCESSING,
+                JobState.TRANSCRIBING,
+                JobState.ALIGNING,
+                JobState.STRUCTURING,
+                JobState.QUALITY_CHECK,
+                JobState.PROCESSED,
+            ],
+        )
+        second_processed = store.get_job(second_job.job_id)
+        store.claim_publication(
+            second_job.job_id,
+            publisher_id="device_b",
+            target_relative_path="Speech/Undated/second--sp_456",
+            manifest_sha256="e" * 64,
+            expected_revision=second_processed.revision,
+        )
+        recovered = store.recover_interrupted_jobs()
+        recovered_lease = store.list_publication_leases(second_job.job_id)[0]
+
+    assert [item.job_id for item in recovered] == [second_job.job_id]
+    assert recovered[0].state is JobState.PROCESSED
+    assert recovered_lease.state.value == "recovered"
+
+
+def test_concurrent_publishers_create_only_one_active_lease(tmp_path) -> None:
+    database = tmp_path / "worker.sqlite3"
+    with JobStore(database) as setup:
+        job, _ = setup.create_job(request(), idempotency_key="publication-concurrent")
+        advance(
+            setup,
+            job.job_id,
+            [
+                JobState.UPLOADING,
+                JobState.VERIFYING,
+                JobState.QUEUED,
+                JobState.PREPROCESSING,
+                JobState.TRANSCRIBING,
+                JobState.ALIGNING,
+                JobState.STRUCTURING,
+                JobState.QUALITY_CHECK,
+                JobState.PROCESSED,
+            ],
+        )
+        processed = setup.get_job(job.job_id)
+
+    first_store = JobStore(database)
+    second_store = JobStore(database)
+    barrier = threading.Barrier(2)
+    claimed = []
+    errors = []
+
+    def claim(store, publisher_id):
+        try:
+            barrier.wait(timeout=5)
+            lease, _, _ = store.claim_publication(
+                job.job_id,
+                publisher_id=publisher_id,
+                target_relative_path="Speech/Undated/test--sp_123",
+                manifest_sha256="f" * 64,
+                expected_revision=processed.revision,
+            )
+            claimed.append(lease)
+        except Exception as exc:  # noqa: BLE001 - exercise cross-connection race outcome
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=claim, args=(first_store, "device_a")),
+        threading.Thread(target=claim, args=(second_store, "device_b")),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+    with JobStore(database) as inspected:
+        leases = inspected.list_publication_leases(job.job_id)
+    first_store.close()
+    second_store.close()
+
+    assert len(claimed) == 1
+    assert len(errors) == 1
+    assert isinstance(errors[0], PublicationLeaseConflict)
+    assert [lease.state.value for lease in leases] == ["active"]
 
 
 def test_concurrent_identical_creation_produces_one_job(tmp_path) -> None:

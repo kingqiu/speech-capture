@@ -25,11 +25,12 @@ Work/Speech Notes/
     07/
       2026-07-21-project-review--sp_01J.../
         note.md
+        timeline.md
         transcript.md
+        note.evidence.md
         speech-record.json
         transcript.raw.json
-        source/
-          original.m4a
+        artifact-manifest.json
   Undated/
     source-title--sp_01J.../
       ...
@@ -40,7 +41,7 @@ Rules:
 - `Work/Speech Notes/` is the personal default, not a hardcoded product requirement.
 - `_Tasks/` contains lightweight submission and processing records. It is not the evidence archive.
 - The date directory represents the recording date, not the import or processing date.
-- `source/` is absent unless the user explicitly enables source archiving.
+- Source audio is not part of the default published package.
 - The deterministic `speech_id` suffix prevents collisions and survives title changes.
 - Publication writes to a temporary sibling directory, verifies hashes, and renames atomically.
 
@@ -75,7 +76,7 @@ Changing a confirmed recording date may move the package, but it does not change
 - It includes model, prompt, vocabulary, decoding, and source-range provenance.
 - It may be large and is not optimized for direct reading.
 
-The Worker core already enforces this attempt-level boundary before final package rendering: each normalized-audio chunk attempt has an immutable private JSON file, SHA-256, model and range metadata, and a one-based attempt number. Visible stable segments are materialized only after the corresponding raw file is durable. The publication layer will assemble those private attempt files into the versioned `transcript.raw.json` artifact without rewriting prior attempts.
+The Worker core enforces this attempt-level boundary before final package rendering: each normalized-audio chunk attempt has an immutable private JSON file, SHA-256, model and range metadata, and a one-based attempt number. Visible stable segments are materialized only after the corresponding raw file is durable. Artifact generation assembles those private attempts into versioned `transcript.raw.json` without rewriting prior attempts.
 
 ### 4.2 Evidence transcript
 
@@ -114,7 +115,9 @@ The JSON record drives deterministic Markdown rendering. Future agents should pr
 
 ### 4.4 Human-facing note
 
-`note.md` is the primary reading surface. It is concise, content-type aware, and evidence-linked.
+`note.md` is the primary clean reading surface. It is concise and content-type aware, without
+inline evidence links. `note.evidence.md` carries the matching auditable links, while `timeline.md`
+summarizes the complete corrected transcript in recording order.
 
 Generated sections can be refreshed from the reviewed transcript. User-owned sections are protected.
 
@@ -329,7 +332,10 @@ The renderer replaces only the machine-generated Markdown before this heading. I
 
 Before treating an artifact checkpoint as idempotent, the Worker verifies all six generated file hashes. A manual edit therefore triggers deterministic regeneration and a new manifest hash while preserving the terminal section. If an existing clean Note is not UTF-8, is not a regular file, exceeds the safety limit, is a symlink, or lacks the terminal heading, regeneration fails before writing any artifact. This is intentionally safer than guessing which content belongs to the user.
 
-Vault-side conflict handling remains part of the later publication protocol. It is not implemented by the Worker artifact renderer yet.
+Vault publication verifies all six artifacts and the manifest before claiming publication. It writes
+the complete seven-file package to a temporary sibling directory, verifies it, and atomically renames
+the directory. A pre-existing target is accepted only when every expected file matches; user edits,
+extra files, symlinks, path escape, or checksum differences are preserved and reported as conflicts.
 
 ## 11. Evidence rules for summaries
 

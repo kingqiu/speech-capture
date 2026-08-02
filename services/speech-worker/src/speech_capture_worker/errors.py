@@ -143,5 +143,17 @@ class ArtifactGenerationFailed(WorkerCoreError):
     code = "ARTIFACT_GENERATION_FAILED"
 
 
+class PublicationLeaseConflict(WorkerCoreError):
+    code = "PUBLICATION_LEASE_CONFLICT"
+
+
+class PublicationConflict(WorkerCoreError):
+    code = "VAULT_PUBLICATION_CONFLICT"
+
+
+class PublicationVerificationFailed(WorkerCoreError):
+    code = "PUBLICATION_VERIFICATION_FAILED"
+
+
 class GapRetranscriptionFailed(WorkerCoreError):
     code = "GAP_RETRANSCRIPTION_FAILED"
