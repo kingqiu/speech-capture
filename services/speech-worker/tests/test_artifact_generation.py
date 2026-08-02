@@ -73,9 +73,7 @@ def test_speech_actions_require_independent_action_evidence() -> None:
         content_type="speech",
     )
 
-    assert filtered["actions"] == [
-        {"task": "明确安排", "evidence": ["seg_action"]}
-    ]
+    assert filtered["actions"] == [{"task": "明确安排", "evidence": ["seg_action"]}]
     assert len(document["actions"]) == 2
 
 
@@ -202,9 +200,7 @@ class FakeStructuringEngine:
                     "evidence": evidence,
                 },
             ],
-            "highlights": [
-                {"text": f"{text}{index}", "evidence": evidence} for index in range(5)
-            ],
+            "highlights": [{"text": f"{text}{index}", "evidence": evidence} for index in range(5)],
             "topics": [
                 {
                     "title": f"平台规划{index}",
@@ -213,6 +209,15 @@ class FakeStructuringEngine:
                     "evidence": evidence,
                 }
                 for index in range(5)
+            ],
+            "timeline_sections": [
+                {
+                    "title": "平台规划",
+                    "summary": text,
+                    "details": [text],
+                    "start_segment_id": segments[0]["segment_id"],
+                    "end_segment_id": segments[-1]["segment_id"],
+                }
             ],
             "speaker_summaries": [],
             "decisions": decisions,
@@ -258,12 +263,29 @@ class FakeStructuringEngine:
             }
         ]
 
+    def synthesize_missing_scene_sections(self, document, findings, segments, *, content_type):
+        return []
+
+    def refine_interview_document(self, document, segments):
+        return dict(document)
+
+    def refine_voice_memo_document(self, document, segments):
+        return dict(document)
+
     def reconcile_decisions(self, document, segments, *, content_type):
         return list(document.get("decisions", []))
 
     def polish_transcript_batch(self, segments):
         return [
-            {"segment_id": item["segment_id"], "text": item["text"] + "。"} for item in segments
+            {
+                "segment_id": item["segment_id"],
+                "text": (
+                    "假设先验证付费意愿是否成立。"
+                    if self.content_type == "voice_memo"
+                    else item["text"] + "。"
+                ),
+            }
+            for item in segments
         ]
 
 
@@ -349,7 +371,7 @@ def create_quality_check_job(
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")
-def test_artifact_generation_writes_four_files_and_advances_to_processed(
+def test_artifact_generation_writes_four_markdown_files_and_two_machine_records(
     tmp_path,
 ) -> None:
     with JobStore(
@@ -368,16 +390,20 @@ def test_artifact_generation_writes_four_files_and_advances_to_processed(
         transcript = (package / "transcript.md").read_text("utf-8")
         speech_record = json.loads((package / "speech-record.json").read_text("utf-8"))
         note = (package / "note.md").read_text("utf-8")
+        evidence_note = (package / "note.evidence.md").read_text("utf-8")
+        timeline = (package / "timeline.md").read_text("utf-8")
 
         assert result.outcome is ArtifactOutcome.GENERATED
         assert result.job.state is JobState.PROCESSED
-        assert result.artifact_count == 4
-        assert manifest["artifact_count"] == 4
+        assert result.artifact_count == 6
+        assert manifest["artifact_count"] == 6
         for name in (
             "transcript.raw.json",
             "transcript.md",
             "speech-record.json",
             "note.md",
+            "note.evidence.md",
+            "timeline.md",
         ):
             content = (package / name).read_bytes()
             assert manifest["files"][name] == hashlib.sha256(content).hexdigest()
@@ -391,16 +417,28 @@ def test_artifact_generation_writes_four_files_and_advances_to_processed(
         assert speech_record["content"]["source"] == "automatic"
         assert speech_record["content"]["automatic_type"] == "meeting"
         assert speech_record["document"]["title"] == "平台规划会议"
+        assert speech_record["document"]["timeline_sections"]
         assert speech_record["segments"]
         assert speech_record["segments"][0]["raw_text"]
         assert speech_record["findings"][0]["evidence"]
         assert "## 我的补充" in note
+        assert note.startswith("# 平台规划会议\n")
+        assert "## 内容总结" in note
         assert "## 背景与参与方" in note
         assert "## 议题与讨论" in note
         assert "## 讨论演变与当前方向" in note
         assert "最初建议从销售预测切入" in note
         assert "当前方向转向计划排程" in note
-        assert "[[transcript#^sp-" in note
+        assert "[[transcript" not in note
+        assert "依据：" not in note
+        assert "## 章节导航" not in note
+        assert "## 会议信息" not in note
+        assert "## 我的补充" not in evidence_note
+        assert "[[transcript#^sp-" in evidence_note
+        assert "## 章节导航" in evidence_note
+        assert timeline.startswith("# 按时间阅读\n")
+        assert "## 00:00:00–00:01:35｜平台规划" in timeline
+        assert "[[transcript" not in timeline
         assert result.speech_id == speech_record["speech_id"]
 
 
@@ -421,7 +459,7 @@ def test_artifact_generation_writes_four_files_and_advances_to_processed(
         ("generic", "insight", "材料的主要发现", "内容结构", "核心信息"),
     ],
 )
-def test_each_nonmeeting_profile_renders_its_own_evidence_linked_note_structure(
+def test_each_nonmeeting_profile_renders_clean_and_evidence_note_structures(
     tmp_path,
     content_type: str,
     scene_kind: str,
@@ -444,13 +482,19 @@ def test_each_nonmeeting_profile_renders_its_own_evidence_linked_note_structure(
         ArtifactGenerator(store).generate(job.job_id)
         package = store.get_job_stage_directory(job.job_id, stage="artifacts")
         note = (package / "note.md").read_text("utf-8")
+        evidence_note = (package / "note.evidence.md").read_text("utf-8")
         speech_record = json.loads((package / "speech-record.json").read_text("utf-8"))
 
     assert speech_record["content"]["type"] == content_type
     assert speech_record["document"]["scene_sections"][0]["kind"] == scene_kind
     assert f"## {body_heading}" in note
-    assert f"{kind_label}｜{scene_title}" in note
-    assert "[[transcript#^sp-" in note
+    if content_type in {"voice_memo", "generic"}:
+        assert f"### 1. {scene_title}" in note
+        assert f"{kind_label}｜{scene_title}" not in note
+    else:
+        assert f"{kind_label}｜{scene_title}" in note
+    assert "[[transcript" not in note
+    assert "[[transcript#^sp-" in evidence_note
     assert "## 议题与讨论" not in note
     assert "## 参与者与各方观点" not in note
     assert "暂无明确待办" not in note
@@ -474,6 +518,38 @@ def test_artifact_generation_is_idempotent_after_restart(tmp_path) -> None:
         result = ArtifactGenerator(restarted).generate(job.job_id)
         assert result.outcome is ArtifactOutcome.ALREADY_GENERATED
         assert result.job.state is JobState.PROCESSED
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")
+def test_processed_job_regenerates_when_artifact_schema_changes(tmp_path) -> None:
+    with JobStore(
+        tmp_path / "worker.sqlite3",
+        source_probe=source_probe_for(95),
+    ) as store:
+        job = create_quality_check_job(
+            store,
+            duration_seconds=95,
+            suffix="artifact-schema-upgrade",
+        )
+        ArtifactGenerator(store).generate(job.job_id)
+        checkpoint = next(
+            item
+            for item in store.list_checkpoints(job.job_id, stage="artifacts")
+            if item.checkpoint_key == "artifacts_generation"
+        )
+        legacy_payload = dict(checkpoint.payload)
+        legacy_payload["schema_version"] = "1.3.0"
+        store.put_checkpoint(
+            job.job_id,
+            stage="artifacts",
+            checkpoint_key="artifacts_generation",
+            payload=legacy_payload,
+        )
+
+        result = ArtifactGenerator(store).generate(job.job_id)
+
+    assert result.outcome is ArtifactOutcome.REGENERATED
+    assert result.artifact_count == 6
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")
@@ -505,9 +581,10 @@ def test_processed_job_can_restructure_and_regenerate_useful_note(tmp_path) -> N
             engine,
             boundary_preflight=preflight(),
         ).run(job.job_id, force=True)
-        regenerated = ArtifactGenerator(store).generate(job.job_id, force=True)
+        regenerated = ArtifactGenerator(store).generate(job.job_id)
         package = store.get_job_stage_directory(job.job_id, stage="artifacts")
         note = (package / "note.md").read_text("utf-8")
+        evidence_note = (package / "note.evidence.md").read_text("utf-8")
         manifest = json.loads((package / "artifact-manifest.json").read_text("utf-8"))
 
     assert structured.outcome.value == "regenerated"
@@ -515,9 +592,11 @@ def test_processed_job_can_restructure_and_regenerate_useful_note(tmp_path) -> N
     assert regenerated.outcome is ArtifactOutcome.REGENERATED
     assert regenerated.job.state is JobState.PROCESSED
     assert regenerated.manifest_sha256 != first.manifest_sha256
-    assert "> [!abstract] 内容总结" in note
+    assert "## 内容总结" in note
+    assert "> [!abstract] 内容总结" in evidence_note
     assert "重新生成后的有效结论。" in note
-    assert "[[transcript#^sp-" in note
+    assert "[[transcript" not in note
+    assert "[[transcript#^sp-" in evidence_note
     assert manifest["structuring_checkpoint_generation"] == 2
 
 

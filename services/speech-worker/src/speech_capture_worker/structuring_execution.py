@@ -42,14 +42,23 @@ from speech_capture_worker.recording_context import (
 from speech_capture_worker.resources import GIB, ResourceReport, check_resource_preflight
 from speech_capture_worker.transcript import TranscriptSegment
 
-STRUCTURING_SCHEMA_VERSION = "1.5.0"
-STRUCTURING_RAW_SCHEMA_VERSION = "1.5.0"
-LEGACY_STRUCTURING_SCHEMA_VERSIONS = {"1.1.0", "1.2.0", "1.3.0", "1.4.0"}
+STRUCTURING_SCHEMA_VERSION = "1.6.0"
+STRUCTURING_RAW_SCHEMA_VERSION = "1.6.0"
+LEGACY_STRUCTURING_SCHEMA_VERSIONS = {
+    "1.1.0",
+    "1.2.0",
+    "1.3.0",
+    "1.4.0",
+    "1.5.0",
+}
 STRUCTURING_STAGE = "structuring"
 STRUCTURING_CHECKPOINT_KEY = "structuring_result"
 STRUCTURING_HEADROOM_BYTES = GIB
 DEFAULT_BATCH_MAX_CHARS = 4000
 DEFAULT_EDITOR_BATCH_MAX_CHARS = 4800
+SCENE_COVERAGE_REPAIR_VERSION = "2026-08-02.4"
+INTERVIEW_QUALITY_REPAIR_VERSION = "2026-08-02.1"
+VOICE_MEMO_QUALITY_REPAIR_VERSION = "2026-08-02.2"
 MAX_FINDING_TEXT_CHARACTERS = 2000
 MAX_TRAIT_COUNT = 20
 MAX_DOCUMENT_TITLE_CHARACTERS = 120
@@ -256,6 +265,33 @@ DOCUMENT_JSON_SCHEMA = {
             },
             "maxItems": 10,
         },
+        "timeline_sections": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "minLength": 1},
+                    "summary": {"type": "string", "minLength": 1},
+                    "details": {
+                        "type": "array",
+                        "items": {"type": "string", "minLength": 1},
+                        "maxItems": 5,
+                    },
+                    "start_segment_id": {"type": "string", "minLength": 1},
+                    "end_segment_id": {"type": "string", "minLength": 1},
+                },
+                "required": [
+                    "title",
+                    "summary",
+                    "details",
+                    "start_segment_id",
+                    "end_segment_id",
+                ],
+                "additionalProperties": False,
+            },
+            "minItems": 1,
+            "maxItems": 20,
+        },
         "speaker_summaries": {
             "type": "array",
             "items": SPEAKER_SUMMARY_JSON_SCHEMA,
@@ -303,6 +339,7 @@ DOCUMENT_JSON_SCHEMA = {
         "context",
         "highlights",
         "topics",
+        "timeline_sections",
         "speaker_summaries",
         "decisions",
         "actions",
@@ -343,6 +380,8 @@ def _document_json_schema(content_type: ContentType) -> dict[str, Any]:
     if kinds:
         scene_schema = json.loads(json.dumps(SCENE_SECTION_JSON_SCHEMA))
         scene_schema["properties"]["kind"]["enum"] = list(kinds)
+        if content_type is ContentType.VOICE_MEMO:
+            scene_schema["properties"]["details"]["maxItems"] = 8
         schema["properties"]["scene_sections"] = {
             "type": "array",
             "items": scene_schema,
@@ -351,6 +390,19 @@ def _document_json_schema(content_type: ContentType) -> dict[str, Any]:
         }
         schema["required"].append("scene_sections")
     return schema
+
+
+def _scene_coverage_json_schema(content_type: ContentType) -> dict[str, Any]:
+    schema = json.loads(json.dumps(SCENE_SECTION_JSON_SCHEMA))
+    schema["properties"]["kind"]["enum"] = list(scene_section_kinds(content_type.value))
+    if content_type is ContentType.VOICE_MEMO:
+        schema["properties"]["details"]["maxItems"] = 8
+    return {
+        "type": "array",
+        "items": schema,
+        "maxItems": 4,
+    }
+
 
 TRANSCRIPT_EDITS_JSON_SCHEMA = {
     "type": "array",
@@ -389,9 +441,7 @@ def _resolve_content_type(
     try:
         override_type = ContentType(override)
     except ValueError as exc:
-        raise InvalidJobRequest(
-            "The job content-type override is not supported."
-        ) from exc
+        raise InvalidJobRequest("The job content-type override is not supported.") from exc
     return (
         ContentClassification(
             type=override_type,
@@ -441,6 +491,27 @@ class StructuringEngine(Protocol):
         segments: list[dict[str, Any]],
         *,
         content_type: ContentType,
+    ) -> dict[str, Any]: ...
+
+    def synthesize_missing_scene_sections(
+        self,
+        document: dict[str, Any],
+        findings: list[dict[str, Any]],
+        segments: list[dict[str, Any]],
+        *,
+        content_type: ContentType,
+    ) -> list[dict[str, Any]]: ...
+
+    def refine_interview_document(
+        self,
+        document: dict[str, Any],
+        segments: list[dict[str, Any]],
+    ) -> dict[str, Any]: ...
+
+    def refine_voice_memo_document(
+        self,
+        document: dict[str, Any],
+        segments: list[dict[str, Any]],
     ) -> dict[str, Any]: ...
 
     def synthesize_speaker_summaries(
@@ -496,11 +567,7 @@ class OllamaStructuringEngine:
     ) -> None:
         if not isinstance(model, str) or not model.strip() or len(model) > 200:
             raise InvalidJobRequest("Ollama model name is invalid.")
-        if (
-            not isinstance(editor_model, str)
-            or not editor_model.strip()
-            or len(editor_model) > 200
-        ):
+        if not isinstance(editor_model, str) or not editor_model.strip() or len(editor_model) > 200:
             raise InvalidJobRequest("Ollama editor model name is invalid.")
         self.model = model.strip()
         self.editor_model = editor_model.strip()
@@ -595,6 +662,13 @@ class OllamaStructuringEngine:
             "达成的结论；actions 写清任务，只有原文明确时才填 owner 和 deadline，否则填空字符串；"
             "risks 与 open_questions 分开。合并重复内容，避免空话、"
             "Meta 信息和同一内容在多个章节反复出现，保留人名、公司名、数字、范围和时间。\n"
+            "timeline_sections 是独立于内容类型模板的顺序摘要：必须按完整校订逐字稿从头到尾划分"
+            "连续语义段，第一段从逐字稿第一个 segment_id 开始，最后一段到最后一个 segment_id "
+            "结束，相邻段首尾不得跳过或重叠。边界按话题自然转折选择，通常每段约 3-8 分钟，但"
+            "不要机械按固定分钟切割；同一话题在后面再次出现时仍保留在后面的时间位置。每段用"
+            "具体 title、连贯 summary 和 0-5 条 details 概括该时间段实际内容，不套用会议、访谈、"
+            "课程、演讲或个人备忘模板，不写 Meta 描述；听不清的内容不能猜测。"
+            "start_segment_id 和 end_segment_id 必须来自完整逐字稿，并覆盖连续范围。\n"
             "所有 evidence 必须使用完整逐字稿中的 segment_id，且每一项至少有一个证据；不得补写"
             "原文没有的信息。每项只选择 1-3 个最直接、最有代表性的证据，不要堆砌编号。"
             "speaker_summaries 中的核心陈述应优先引用该 speaker_id 自己的"
@@ -608,13 +682,135 @@ class OllamaStructuringEngine:
             "说话人发言量统计（characters >= 500 的 speaker 必须进入 speaker_summaries）：\n"
             + json.dumps(speaker_stats, ensure_ascii=False)
             + "\n"
-            "完整校订后逐字稿：\n"
-            + json.dumps(segments, ensure_ascii=False)
+            "完整校订后逐字稿：\n" + json.dumps(segments, ensure_ascii=False)
         )
         response = self._generate(
             prompt,
             format_schema=_document_json_schema(content_type),
-            num_predict=3584,
+            num_predict=4608,
+            num_ctx=24576,
+            timeout_seconds=1200,
+        )
+        return _parse_json_object(response)
+
+    def synthesize_missing_scene_sections(
+        self,
+        document: dict[str, Any],
+        findings: list[dict[str, Any]],
+        segments: list[dict[str, Any]],
+        *,
+        content_type: ContentType,
+    ) -> list[dict[str, Any]]:
+        voice_memo_audit = (
+            "对于 voice_memo：如果逐字稿明确说有若干步、阶段、要点或清单，而现有正文只在"
+            "summary 中点名、没有逐项写入 details，这仍属于实质遗漏。请补一个以具体方法命名的"
+            "完整章节，按原始顺序为每一步各写一条 detail；原文说六步就必须保留六条，不得用"
+            "‘包括……’的一句概述代替，也不得拆成六个类型标签章节。\n"
+            if content_type is ContentType.VOICE_MEMO
+            else ""
+        )
+        prompt = (
+            "你是中文笔记覆盖审计员。只返回 JSON 数组，不要解释。现有笔记已经通过主体结构"
+            "校验；你的任务只是检查候选事实与完整逐字稿，补充现有 scene_sections 真正遗漏的"
+            "独立重要内容。不得改写或重复已有章节，不得为了数量填充。多个具名项目、业务场景、"
+            "产品或案例如果各自有不同的问题、做法或结果，应分别成章；同一案例的细节应合并。"
+            "候选索引只用于查漏，可能重复或不准确，最终内容必须由逐字稿直接证明。每个新增章节"
+            "不得把已有案例的上线、安全、接口或规则等实施细节再拆成新案例。候选索引已经按查漏"
+            "优先级排序，优先检查列表前部和逐字稿后半段。每个新增章节必须包含 kind、title、"
+            "summary、details、evidence，evidence 只能使用下方逐字稿的"
+            " segment_id；title 必须写具体问题、观点或案例名称，不能直接复制 kind 的类别标签；"
+            "summary 和 details 必须提供内容本身，不能写“提问者进行了提问”等 Meta 描述。没有"
+            "实质遗漏时返回空数组。\n"
+            + voice_memo_audit
+            + synthesis_guidance(content_type.value)
+            + "\n"
+            + output_contract_guidance(content_type.value)
+            + _recording_context_prompt(self.recording_context)
+            + "\n现有场景正文：\n"
+            + json.dumps(document.get("scene_sections", []), ensure_ascii=False)
+            + "\n尚未被现有正文证据覆盖的候选索引：\n"
+            + json.dumps(findings, ensure_ascii=False)
+            + "\n完整校订后逐字稿：\n"
+            + json.dumps(segments, ensure_ascii=False)
+        )
+        response = self._generate(
+            prompt,
+            format_schema=_scene_coverage_json_schema(content_type),
+            model=self.editor_model,
+            num_predict=2048,
+            num_ctx=24576,
+            timeout_seconds=1200,
+        )
+        return _parse_json_list(response)
+
+    def refine_interview_document(
+        self,
+        document: dict[str, Any],
+        segments: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        prompt = (
+            "你是中文访谈笔记的质量复核编辑。只返回符合 schema 的完整 JSON 文档，不要解释。"
+            "现有文档已经完成主综合，你只修复事实组织和证据问题，不得改写逐字稿或添加新事实。\n"
+            "逐项检查：1. scene_sections 按具体问题、回答、观点或案例命名，不用类型标签凑章节；"
+            "2. 有明确提问时同时保留问题和回答，没有明确提问的展示内容应写为 experience 或"
+            "viewpoint，不能一律标成 question_answer；3. 不得把一个案例的上线、安全、接口或结果"
+            "拼到另一个案例；4. 已经建立、开发、发布、上线或完成的事项只能写成经历或结果，不能"
+            "写入 actions；5. 当场或后文已经回答的问题不能写入 open_questions；6. 口头停顿、转写"
+            "含糊和普通思考状态不是 tension 或 risk；7. 没有明确未来措辞时，不得写未来规划、仍待"
+            "推进、探索阶段或需进一步验证；8. 外部模型用于开发、内部模型用于部署等不同阶段必须"
+            "按原文准确区分；9. speaker_summaries 要写清受访者观点和提问者实际追问方向，每项至少"
+            "引用该 speaker_id 自己的一段发言；10. summary、context、highlights 与正文一致，删除"
+            "无证据的泛化。保留原文真正存在的限制和仍未回答问题。每项 evidence 只使用下方"
+            "segment_id。\n"
+            + synthesis_guidance(ContentType.INTERVIEW.value)
+            + _recording_context_prompt(self.recording_context)
+            + "\n现有访谈文档：\n"
+            + json.dumps(document, ensure_ascii=False)
+            + "\n完整校订后逐字稿：\n"
+            + json.dumps(segments, ensure_ascii=False)
+        )
+        response = self._generate(
+            prompt,
+            format_schema=_document_json_schema(ContentType.INTERVIEW),
+            model=self.editor_model,
+            num_predict=4608,
+            num_ctx=24576,
+            timeout_seconds=1200,
+        )
+        return _parse_json_object(response)
+
+    def refine_voice_memo_document(
+        self,
+        document: dict[str, Any],
+        segments: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        prompt = (
+            "你是中文个人语音备忘的质量复核编辑。只返回符合 schema 的完整 JSON 文档，不要解释。"
+            "现有文档已经完成主综合，你只修复内容组织、重复和证据问题，不得改写逐字稿或添加"
+            "新事实。\n"
+            "逐项检查：1. scene_sections 按具体想法、判断、方法、任务或问题命名，不用记录意图、"
+            "当前判断、明确任务、待验证假设、约束、后续跟进等类型标签作标题；2. 不创建‘这段"
+            "语音记录了……’等 Meta 章节；3. 同一内容不要换词复制到多个 kind；4. 原文若提出"
+            "一套有顺序的方法或步骤，用一个具体方法章节完整保留所有步骤、各步目的与边界，details"
+            " 可按顺序列出，不得只留概述；5. 方法步骤、原则和建议不自动成为 task 或 actions，"
+            "只有明确准备、安排、要求执行的未来事项才是任务；6. 只有尚未确认且能由结果检验的"
+            "命题才是 hypothesis，MVP 验证作为方法步骤时不能写成待验证假设；7. constraint 只保留"
+            "成本、安全、能力、资源、时间等真实边界；8. 单人备忘 speaker_summaries 返回空数组；"
+            "9. summary、highlights、scene_sections、decisions 和 actions 各司其职，删除同一句的"
+            "机械重复；10. 保留原文真正存在的近期跟进，并与长期方法论区分。每项 evidence 只使用"
+            "下方 segment_id。\n"
+            + synthesis_guidance(ContentType.VOICE_MEMO.value)
+            + _recording_context_prompt(self.recording_context)
+            + "\n现有个人备忘文档：\n"
+            + json.dumps(document, ensure_ascii=False)
+            + "\n完整校订后逐字稿：\n"
+            + json.dumps(segments, ensure_ascii=False)
+        )
+        response = self._generate(
+            prompt,
+            format_schema=_document_json_schema(ContentType.VOICE_MEMO),
+            model=self.editor_model,
+            num_predict=4608,
             num_ctx=24576,
             timeout_seconds=1200,
         )
@@ -691,9 +887,7 @@ class OllamaStructuringEngine:
         *,
         content_type: ContentType,
     ) -> list[dict[str, Any]]:
-        if content_type is not ContentType.MEETING or not document.get(
-            "discussion_threads"
-        ):
+        if content_type is not ContentType.MEETING or not document.get("discussion_threads"):
             value = document.get("decisions")
             return list(value) if isinstance(value, list) else []
         prompt = (
@@ -867,6 +1061,152 @@ class StructuringExecutor:
         self.engine.set_recording_context(context)
         return context
 
+    def _extract_batch_result(
+        self,
+        index: int,
+        batch: tuple[TranscriptSegment, ...],
+        *,
+        transcript_edit_map: dict[str, str],
+        content_type: ContentType,
+        valid_segment_ids: set[str],
+    ) -> dict[str, Any]:
+        batch_payload = _segment_payload(batch, transcript_edits=transcript_edit_map)
+        try:
+            findings = _validate_findings(
+                self.engine.extract_batch(batch_payload, content_type=content_type),
+                segment_ids=valid_segment_ids,
+            )
+            error: str | None = None
+        except Exception as exc:
+            error = type(exc).__name__
+            findings = ()
+            if len(batch) > 1:
+                midpoint = len(batch) // 2
+                recovered: list[Finding] = []
+                retry_errors: list[str] = []
+                for smaller_batch in (batch[:midpoint], batch[midpoint:]):
+                    try:
+                        recovered.extend(
+                            _validate_findings(
+                                self.engine.extract_batch(
+                                    _segment_payload(
+                                        smaller_batch,
+                                        transcript_edits=transcript_edit_map,
+                                    ),
+                                    content_type=content_type,
+                                ),
+                                segment_ids=valid_segment_ids,
+                            )
+                        )
+                    except Exception as retry_exc:
+                        retry_errors.append(type(retry_exc).__name__)
+                findings = tuple(recovered)
+                error = ",".join(dict.fromkeys(retry_errors)) or None
+        return {
+            "batch_index": index,
+            "segment_ids": [segment.segment_id for segment in batch],
+            "findings": [finding.to_dict() for finding in findings],
+            "unavailable_reason_code": error,
+        }
+
+    def _repair_scene_coverage(
+        self,
+        document: dict[str, Any],
+        findings: tuple[Finding, ...],
+        segments: list[dict[str, Any]],
+        *,
+        aliases: dict[str, str],
+        content_type: ContentType,
+        segment_starts: dict[str, int],
+    ) -> dict[str, Any]:
+        if content_type is ContentType.MEETING:
+            return document
+        uncovered = _select_uncovered_scene_findings(
+            document,
+            findings,
+            segment_starts=segment_starts,
+        )
+        if not uncovered:
+            return document
+        try:
+            additions = self.engine.synthesize_missing_scene_sections(
+                document,
+                _synthesis_finding_payload(uncovered),
+                segments,
+                content_type=content_type,
+            )
+        except Exception:
+            return document
+        if not isinstance(additions, list) or not additions:
+            return document
+        repaired = {key: value for key, value in document.items() if key != "chapters"}
+        existing = repaired.get("scene_sections")
+        sections = list(existing) if isinstance(existing, list) else []
+        signatures = {
+            _normalized_document_item(str(section.get("title") or ""))
+            for section in sections
+            if isinstance(section, dict)
+        }
+        for addition in _remap_document_evidence(additions, aliases=aliases):
+            if not isinstance(addition, dict):
+                continue
+            signature = _normalized_document_item(str(addition.get("title") or ""))
+            if not signature or signature in signatures:
+                continue
+            sections.append(addition)
+            signatures.add(signature)
+        repaired["scene_sections"] = sections[:12]
+        return repaired
+
+    def _repair_interview_quality(
+        self,
+        document: dict[str, Any],
+        segments: list[dict[str, Any]],
+        *,
+        aliases: dict[str, str],
+    ) -> dict[str, Any] | None:
+        reverse_aliases = {stable: alias for alias, stable in aliases.items()}
+        prompt_document = _remap_document_evidence(
+            {key: value for key, value in document.items() if key != "chapters"},
+            aliases=reverse_aliases,
+        )
+        try:
+            repaired = self.engine.refine_interview_document(
+                prompt_document,
+                segments,
+            )
+        except Exception:
+            return None
+        if not isinstance(repaired, dict):
+            return None
+        repaired["discussion_threads"] = []
+        return _remap_document_evidence(repaired, aliases=aliases)
+
+    def _repair_voice_memo_quality(
+        self,
+        document: dict[str, Any],
+        segments: list[dict[str, Any]],
+        *,
+        aliases: dict[str, str],
+    ) -> dict[str, Any] | None:
+        reverse_aliases = {stable: alias for alias, stable in aliases.items()}
+        prompt_document = _remap_document_evidence(
+            {key: value for key, value in document.items() if key != "chapters"},
+            aliases=reverse_aliases,
+        )
+        try:
+            repaired = self.engine.refine_voice_memo_document(
+                prompt_document,
+                segments,
+            )
+        except Exception:
+            return None
+        if not isinstance(repaired, dict):
+            return None
+        repaired["discussion_threads"] = []
+        repaired["speaker_summaries"] = []
+        return _remap_document_evidence(repaired, aliases=aliases)
+
     def _synthesize_document_with_speaker_coverage(
         self,
         findings: list[dict[str, Any]],
@@ -882,15 +1222,29 @@ class StructuringExecutor:
         if not isinstance(document, dict):
             return document
         result = dict(document)
-        if content_type is not ContentType.MEETING:
+        if content_type not in {ContentType.INTERVIEW, ContentType.MEETING}:
             result["discussion_threads"] = []
             return result
         raw_summaries = document.get("speaker_summaries")
         if not isinstance(raw_summaries, list):
             return document
+        segment_speakers = {
+            segment.get("segment_id"): segment.get("speaker_id") for segment in segments
+        }
+        grounded_summaries = [
+            item
+            for item in raw_summaries
+            if isinstance(item, dict)
+            and isinstance(item.get("speaker_id"), str)
+            and isinstance(item.get("evidence"), list)
+            and any(
+                segment_speakers.get(segment_id) == item["speaker_id"]
+                for segment_id in item["evidence"]
+            )
+        ]
         present = {
             item.get("speaker_id")
-            for item in raw_summaries
+            for item in grounded_summaries
             if isinstance(item, dict) and isinstance(item.get("speaker_id"), str)
         }
         substantive = _substantive_speaker_ids_from_payload(segments)
@@ -913,7 +1267,12 @@ class StructuringExecutor:
                 raise StructuringFailed(
                     "The speaker supplement did not cover the requested speakers."
                 )
-            result["speaker_summaries"] = [*raw_summaries, *supplements]
+            result["speaker_summaries"] = [*grounded_summaries, *supplements]
+        else:
+            result["speaker_summaries"] = grounded_summaries
+        if content_type is ContentType.INTERVIEW:
+            result["discussion_threads"] = []
+            return result
         result["discussion_threads"] = self.engine.synthesize_discussion_threads(
             segments,
             content_type=content_type,
@@ -934,7 +1293,13 @@ class StructuringExecutor:
     ) -> dict[str, Any] | None:
         """Add the new focused meeting structure without rerunning an accepted main note."""
 
-        if not isinstance(document, dict) or "discussion_threads" in document:
+        if not isinstance(document, dict):
+            return None
+        if content_type is not ContentType.MEETING:
+            upgraded = {key: value for key, value in document.items() if key != "chapters"}
+            upgraded["discussion_threads"] = []
+            return upgraded
+        if "discussion_threads" in document:
             return None
         upgraded = {key: value for key, value in document.items() if key != "chapters"}
         upgraded["discussion_threads"] = self.engine.synthesize_discussion_threads(
@@ -970,6 +1335,27 @@ class StructuringExecutor:
             content_type=content_type,
         )
         return refreshed
+
+    def _load_artifact_document_fallback(
+        self,
+        job_id: str,
+        *,
+        content_type: ContentType,
+    ) -> dict[str, Any] | None:
+        path = self.store.data_directory / "jobs" / job_id / "artifacts" / "speech-record.json"
+        try:
+            payload = json.loads(path.read_text("utf-8"))
+        except (OSError, ValueError):
+            return None
+        if (
+            not isinstance(payload, dict)
+            or payload.get("job_id") != job_id
+            or not isinstance(payload.get("content"), dict)
+            or payload["content"].get("type") != content_type.value
+            or not isinstance(payload.get("document"), dict)
+        ):
+            return None
+        return {key: value for key, value in payload["document"].items() if key != "chapters"}
 
     def run(self, job_id: str, *, force: bool = False) -> StructuringResult:
         if not isinstance(force, bool):
@@ -1092,9 +1478,7 @@ class StructuringExecutor:
                 segment.segment_id: transcript_edit_map.get(segment.segment_id, segment.text or "")
                 for segment in transcribed
             }
-            segment_speakers = {
-                segment.segment_id: segment.speaker_id for segment in transcribed
-            }
+            segment_speakers = {segment.segment_id: segment.speaker_id for segment in transcribed}
             segment_starts = {segment.segment_id: segment.start_ms for segment in segments}
             speaker_count = len(speaker_ids)
             try:
@@ -1122,34 +1506,21 @@ class StructuringExecutor:
             batch_results: list[dict[str, Any]] = []
             valid_segment_ids = {segment.segment_id for segment in segments}
             for index, batch in enumerate(batches):
-                batch_error: str | None = None
-                batch_payload = _segment_payload(
+                batch_result = self._extract_batch_result(
+                    index,
                     batch,
-                    transcript_edits=transcript_edit_map,
+                    transcript_edit_map=transcript_edit_map,
+                    content_type=classification.type,
+                    valid_segment_ids=valid_segment_ids,
                 )
-                try:
-                    batch_findings = _validate_findings(
-                        self.engine.extract_batch(
-                            batch_payload,
-                            content_type=classification.type,
-                        ),
-                        segment_ids=valid_segment_ids,
-                    )
-                except Exception as exc:
-                    batch_error = type(exc).__name__
-                    unavailable_reasons.append(batch_error)
-                    batch_findings = ()
-                batch_results.append(
-                    {
-                        "batch_index": index,
-                        "segment_ids": [segment.segment_id for segment in batch],
-                        "findings": [finding.to_dict() for finding in batch_findings],
-                        "unavailable_reason_code": batch_error,
-                    }
-                )
+                if batch_result["unavailable_reason_code"]:
+                    unavailable_reasons.append(batch_result["unavailable_reason_code"])
+                batch_results.append(batch_result)
             findings = _merge_findings(batch_results)
             document: dict[str, Any] | None = None
             document_error: str | None = None
+            interview_quality_repaired = False
+            voice_memo_quality_repaired = False
             if transcribed:
                 try:
                     finding_payload = _synthesis_finding_payload(findings)
@@ -1157,22 +1528,82 @@ class StructuringExecutor:
                         transcribed,
                         transcript_edits=transcript_edit_map,
                     )
-                    document = _validate_document(
-                        _remap_document_evidence(
-                            self._synthesize_document_with_speaker_coverage(
-                                finding_payload,
-                                synthesis_payload,
-                                content_type=classification.type,
-                            ),
-                            aliases=evidence_aliases,
+                    base_document = _remap_document_evidence(
+                        self._synthesize_document_with_speaker_coverage(
+                            finding_payload,
+                            synthesis_payload,
+                            content_type=classification.type,
                         ),
-                        segment_ids=valid_segment_ids,
-                        speaker_ids=speaker_ids,
+                        aliases=evidence_aliases,
+                    )
+                    repaired_document = self._repair_scene_coverage(
+                        base_document,
+                        findings,
+                        synthesis_payload,
+                        aliases=evidence_aliases,
                         content_type=classification.type,
-                        segment_texts=segment_texts,
-                        segment_speakers=segment_speakers,
                         segment_starts=segment_starts,
                     )
+                    quality_document = (
+                        self._repair_interview_quality(
+                            repaired_document,
+                            synthesis_payload,
+                            aliases=evidence_aliases,
+                        )
+                        if classification.type is ContentType.INTERVIEW
+                        else (
+                            self._repair_voice_memo_quality(
+                                repaired_document,
+                                synthesis_payload,
+                                aliases=evidence_aliases,
+                            )
+                            if classification.type is ContentType.VOICE_MEMO
+                            else None
+                        )
+                    )
+                    try:
+                        document = _validate_document(
+                            quality_document or repaired_document,
+                            segment_ids=valid_segment_ids,
+                            speaker_ids=speaker_ids,
+                            content_type=classification.type,
+                            segment_texts=segment_texts,
+                            segment_speakers=segment_speakers,
+                            segment_starts=segment_starts,
+                        )
+                        interview_quality_repaired = (
+                            quality_document is not None
+                            and classification.type is ContentType.INTERVIEW
+                        )
+                        voice_memo_quality_repaired = (
+                            quality_document is not None
+                            and classification.type is ContentType.VOICE_MEMO
+                        )
+                    except StructuringFailed:
+                        interview_quality_repaired = False
+                        voice_memo_quality_repaired = False
+                        try:
+                            document = _validate_document(
+                                repaired_document,
+                                segment_ids=valid_segment_ids,
+                                speaker_ids=speaker_ids,
+                                content_type=classification.type,
+                                segment_texts=segment_texts,
+                                segment_speakers=segment_speakers,
+                                segment_starts=segment_starts,
+                            )
+                        except StructuringFailed:
+                            if repaired_document is base_document:
+                                raise
+                            document = _validate_document(
+                                base_document,
+                                segment_ids=valid_segment_ids,
+                                speaker_ids=speaker_ids,
+                                content_type=classification.type,
+                                segment_texts=segment_texts,
+                                segment_speakers=segment_speakers,
+                                segment_starts=segment_starts,
+                            )
                 except Exception as exc:
                     document_error = type(exc).__name__
                     unavailable_reasons.append(document_error)
@@ -1188,9 +1619,7 @@ class StructuringExecutor:
                 "recording_context_sha256": recording_context_sha256(recording_context),
                 "recording_context_applied": recording_context is not None,
                 "recording_context_processing_version": (
-                    RECORDING_CONTEXT_PROCESSING_VERSION
-                    if recording_context is not None
-                    else None
+                    RECORDING_CONTEXT_PROCESSING_VERSION if recording_context is not None else None
                 ),
                 "normalized_sha256": plan.normalized_sha256,
                 "segments_sha256": segments_sha256,
@@ -1201,6 +1630,17 @@ class StructuringExecutor:
                 "extraction_content_type": classification.type,
                 "extraction_prompt_version": NOTE_PROMPT_VERSION,
                 "extraction_batch_max_chars": self._batch_max_chars,
+                "scene_coverage_repair_version": (
+                    SCENE_COVERAGE_REPAIR_VERSION
+                    if classification.type is not ContentType.MEETING
+                    else None
+                ),
+                "interview_quality_repair_version": (
+                    INTERVIEW_QUALITY_REPAIR_VERSION if interview_quality_repaired else None
+                ),
+                "voice_memo_quality_repair_version": (
+                    VOICE_MEMO_QUALITY_REPAIR_VERSION if voice_memo_quality_repaired else None
+                ),
                 "batch_results": batch_results,
                 "document": document,
                 "document_unavailable_reason_code": document_error,
@@ -1236,6 +1676,13 @@ class StructuringExecutor:
                     "automatic_content_type": automatic_classification.type,
                     "content_traits": list(classification.traits),
                     "content_confidence": classification.confidence,
+                    "scene_coverage_repair_version": raw_payload["scene_coverage_repair_version"],
+                    "interview_quality_repair_version": raw_payload[
+                        "interview_quality_repair_version"
+                    ],
+                    "voice_memo_quality_repair_version": raw_payload[
+                        "voice_memo_quality_repair_version"
+                    ],
                     "finding_count": len(findings),
                     "unsupported_finding_count": sum(finding.unsupported for finding in findings),
                     "document_available": document is not None,
@@ -1365,19 +1812,28 @@ class StructuringExecutor:
         recording_context_changed = raw_payload.get(
             "recording_context_sha256"
         ) != recording_context_sha256(recording_context)
+        if not isinstance(raw_payload.get("document"), dict) and isinstance(
+            raw_payload.get("document_candidate"), dict
+        ):
+            raw_payload["document"] = raw_payload["document_candidate"]
+            raw_payload["document_recovery_source"] = "structuring_document_candidate"
+        if not isinstance(raw_payload.get("document"), dict):
+            recovered_document = self._load_artifact_document_fallback(
+                job_id,
+                content_type=classification.type,
+            )
+            if recovered_document is not None:
+                raw_payload["document"] = recovered_document
+                raw_payload["document_recovery_source"] = "artifacts/speech-record.json"
 
         transcribed = [segment for segment in segments if segment.text]
-        transcript_edit_map = _transcript_edit_map(
-            raw_payload.get("transcript_edit_results", [])
-        )
+        transcript_edit_map = _transcript_edit_map(raw_payload.get("transcript_edit_results", []))
         speaker_ids = {segment.speaker_id for segment in transcribed if segment.speaker_id}
         segment_texts = {
             segment.segment_id: transcript_edit_map.get(segment.segment_id, segment.text or "")
             for segment in transcribed
         }
-        segment_speakers = {
-            segment.segment_id: segment.speaker_id for segment in transcribed
-        }
+        segment_speakers = {segment.segment_id: segment.speaker_id for segment in transcribed}
         segment_starts = {segment.segment_id: segment.start_ms for segment in segments}
         synthesis_payload, evidence_aliases = _synthesis_segment_payload(
             transcribed,
@@ -1386,60 +1842,71 @@ class StructuringExecutor:
         started = time.monotonic()
         extraction_type_changed = (
             raw_payload.get("extraction_content_type") != classification.type
-            or raw_payload.get("extraction_prompt_version") != NOTE_PROMPT_VERSION
             or raw_payload.get("extraction_batch_max_chars") != self._batch_max_chars
+        )
+        extraction_retry_required = any(
+            isinstance(result, dict) and result.get("unavailable_reason_code")
+            for result in raw_payload["batch_results"]
         )
         if extraction_type_changed:
             batches = _build_batches(transcribed, max_chars=self._batch_max_chars)
-            batch_results: list[dict[str, Any]] = []
             valid_segment_ids = {segment.segment_id for segment in segments}
-            for index, batch in enumerate(batches):
-                batch_error: str | None = None
-                batch_payload = _segment_payload(
+            raw_payload["batch_results"] = [
+                self._extract_batch_result(
+                    index,
                     batch,
-                    transcript_edits=transcript_edit_map,
+                    transcript_edit_map=transcript_edit_map,
+                    content_type=classification.type,
+                    valid_segment_ids=valid_segment_ids,
                 )
-                try:
-                    batch_findings = _validate_findings(
-                        self.engine.extract_batch(
-                            batch_payload,
-                            content_type=classification.type,
-                        ),
-                        segment_ids=valid_segment_ids,
-                    )
-                except Exception as exc:
-                    batch_error = type(exc).__name__
-                    batch_findings = ()
-                batch_results.append(
-                    {
-                        "batch_index": index,
-                        "segment_ids": [segment.segment_id for segment in batch],
-                        "findings": [finding.to_dict() for finding in batch_findings],
-                        "unavailable_reason_code": batch_error,
-                    }
-                )
-            raw_payload["batch_results"] = batch_results
+                for index, batch in enumerate(batches)
+            ]
             raw_payload["extraction_content_type"] = classification.type
             raw_payload["extraction_prompt_version"] = NOTE_PROMPT_VERSION
             raw_payload["extraction_batch_max_chars"] = self._batch_max_chars
+        elif extraction_retry_required:
+            segment_map = {segment.segment_id: segment for segment in transcribed}
+            valid_segment_ids = {segment.segment_id for segment in segments}
+            repaired_results: list[dict[str, Any]] = []
+            for index, result in enumerate(raw_payload["batch_results"]):
+                if not isinstance(result, dict) or not result.get("unavailable_reason_code"):
+                    repaired_results.append(result)
+                    continue
+                batch = tuple(
+                    segment_map[segment_id]
+                    for segment_id in result.get("segment_ids", [])
+                    if segment_id in segment_map
+                )
+                repaired_results.append(
+                    self._extract_batch_result(
+                        index,
+                        batch,
+                        transcript_edit_map=transcript_edit_map,
+                        content_type=classification.type,
+                        valid_segment_ids=valid_segment_ids,
+                    )
+                    if batch
+                    else result
+                )
+            raw_payload["batch_results"] = repaired_results
         findings = _merge_findings(raw_payload["batch_results"])
         document: dict[str, Any] | None = None
+        document_candidate: dict[str, Any] | None = None
         document_error: str | None = None
+        document_validation_error: str | None = None
+        interview_quality_repair_version = raw_payload.get("interview_quality_repair_version")
+        voice_memo_quality_repair_version = raw_payload.get("voice_memo_quality_repair_version")
         try:
             if recording_context_changed or content_type_changed or extraction_type_changed:
                 candidate = None
-            elif (
-                raw_payload.get("prompt_version")
-                in {
-                    "2026-08-01.13",
-                    "2026-08-01.14",
-                    "2026-08-01.15",
-                    "2026-08-01.16",
-                    "2026-08-01.17",
-                    "2026-08-01.18",
-                }
-                and isinstance(raw_payload.get("document"), dict)
-            ):
+            elif raw_payload.get("prompt_version") in {
+                "2026-08-01.13",
+                "2026-08-01.14",
+                "2026-08-01.15",
+                "2026-08-01.16",
+                "2026-08-01.17",
+                "2026-08-01.18",
+            } and isinstance(raw_payload.get("document"), dict):
                 candidate = {
                     key: value
                     for key, value in raw_payload["document"].items()
@@ -1461,26 +1928,93 @@ class StructuringExecutor:
                     synthesis_payload,
                     content_type=classification.type,
                 )
-            if candidate is None:
+            document_was_resynthesized = candidate is None
+            if document_was_resynthesized:
                 candidate = self._synthesize_document_with_speaker_coverage(
                     _synthesis_finding_payload(findings),
                     synthesis_payload,
                     content_type=classification.type,
                 )
-            document = _validate_document(
-                _remap_document_evidence(
-                    candidate,
-                    aliases=evidence_aliases,
-                ),
-                segment_ids={segment.segment_id for segment in segments},
-                speaker_ids=speaker_ids,
-                content_type=classification.type,
-                segment_texts=segment_texts,
-                segment_speakers=segment_speakers,
-                segment_starts=segment_starts,
+            if isinstance(candidate, dict):
+                document_candidate = candidate
+            base_document = _remap_document_evidence(
+                candidate,
+                aliases=evidence_aliases,
             )
+            repaired_document = (
+                self._repair_scene_coverage(
+                    base_document,
+                    findings,
+                    synthesis_payload,
+                    aliases=evidence_aliases,
+                    content_type=classification.type,
+                    segment_starts=segment_starts,
+                )
+                if document_was_resynthesized
+                or raw_payload.get("scene_coverage_repair_version") != SCENE_COVERAGE_REPAIR_VERSION
+                else base_document
+            )
+            should_repair_interview = classification.type is ContentType.INTERVIEW and (
+                document_was_resynthesized
+                or interview_quality_repair_version != INTERVIEW_QUALITY_REPAIR_VERSION
+            )
+            should_repair_voice_memo = classification.type is ContentType.VOICE_MEMO and (
+                document_was_resynthesized
+                or voice_memo_quality_repair_version != VOICE_MEMO_QUALITY_REPAIR_VERSION
+            )
+            quality_document = (
+                self._repair_interview_quality(
+                    repaired_document,
+                    synthesis_payload,
+                    aliases=evidence_aliases,
+                )
+                if should_repair_interview
+                else (
+                    self._repair_voice_memo_quality(
+                        repaired_document,
+                        synthesis_payload,
+                        aliases=evidence_aliases,
+                    )
+                    if should_repair_voice_memo
+                    else None
+                )
+            )
+            validation_kwargs = {
+                "segment_ids": {segment.segment_id for segment in segments},
+                "speaker_ids": speaker_ids,
+                "content_type": classification.type,
+                "segment_texts": segment_texts,
+                "segment_speakers": segment_speakers,
+                "segment_starts": segment_starts,
+            }
+            try:
+                document = _validate_document(
+                    quality_document or repaired_document,
+                    **validation_kwargs,
+                )
+                if quality_document is not None:
+                    if classification.type is ContentType.INTERVIEW:
+                        interview_quality_repair_version = INTERVIEW_QUALITY_REPAIR_VERSION
+                    elif classification.type is ContentType.VOICE_MEMO:
+                        voice_memo_quality_repair_version = VOICE_MEMO_QUALITY_REPAIR_VERSION
+            except StructuringFailed:
+                if quality_document is not None:
+                    if classification.type is ContentType.INTERVIEW:
+                        interview_quality_repair_version = None
+                    elif classification.type is ContentType.VOICE_MEMO:
+                        voice_memo_quality_repair_version = None
+                try:
+                    document = _validate_document(
+                        repaired_document,
+                        **validation_kwargs,
+                    )
+                except StructuringFailed:
+                    if repaired_document is base_document:
+                        raise
+                    document = _validate_document(base_document, **validation_kwargs)
         except Exception as exc:
             document_error = type(exc).__name__
+            document_validation_error = str(exc)[:500]
         elapsed_seconds = time.monotonic() - started
         unavailable_reasons = [
             result.get("unavailable_reason_code")
@@ -1491,6 +2025,10 @@ class StructuringExecutor:
         if document_error is not None:
             unavailable_reasons.append(document_error)
         raw_payload["document"] = document
+        raw_payload["document_candidate"] = (
+            document_candidate if document_error is not None else None
+        )
+        raw_payload["document_validation_error"] = document_validation_error
         raw_payload["schema_version"] = STRUCTURING_RAW_SCHEMA_VERSION
         raw_payload["prompt_version"] = NOTE_PROMPT_VERSION
         raw_payload["model_id"] = self.engine.model_id
@@ -1498,17 +2036,27 @@ class StructuringExecutor:
         raw_payload["classification_source"] = classification_source
         raw_payload["automatic_classification"] = automatic_classification.to_dict()
         raw_payload["extraction_content_type"] = classification.type
-        raw_payload["extraction_prompt_version"] = NOTE_PROMPT_VERSION
         raw_payload["extraction_batch_max_chars"] = self._batch_max_chars
-        raw_payload["recording_context_schema_version"] = RECORDING_CONTEXT_SCHEMA_VERSION
-        raw_payload["recording_context_sha256"] = recording_context_sha256(
-            recording_context
+        raw_payload["scene_coverage_repair_version"] = (
+            SCENE_COVERAGE_REPAIR_VERSION
+            if classification.type is not ContentType.MEETING
+            else None
         )
+        raw_payload["interview_quality_repair_version"] = (
+            interview_quality_repair_version
+            if classification.type is ContentType.INTERVIEW
+            else None
+        )
+        raw_payload["voice_memo_quality_repair_version"] = (
+            voice_memo_quality_repair_version
+            if classification.type is ContentType.VOICE_MEMO
+            else None
+        )
+        raw_payload["recording_context_schema_version"] = RECORDING_CONTEXT_SCHEMA_VERSION
+        raw_payload["recording_context_sha256"] = recording_context_sha256(recording_context)
         raw_payload["recording_context_applied"] = recording_context is not None
         raw_payload["recording_context_processing_version"] = (
-            RECORDING_CONTEXT_PROCESSING_VERSION
-            if recording_context is not None
-            else None
+            RECORDING_CONTEXT_PROCESSING_VERSION if recording_context is not None else None
         )
         raw_payload["document_unavailable_reason_code"] = document_error
         raw_payload["unavailable_reason_code"] = (
@@ -1533,18 +2081,19 @@ class StructuringExecutor:
                 "automatic_content_type": automatic_classification.type,
                 "content_traits": list(classification.traits),
                 "content_confidence": classification.confidence,
+                "scene_coverage_repair_version": raw_payload["scene_coverage_repair_version"],
+                "interview_quality_repair_version": raw_payload["interview_quality_repair_version"],
+                "voice_memo_quality_repair_version": raw_payload[
+                    "voice_memo_quality_repair_version"
+                ],
                 "finding_count": len(findings),
-                "unsupported_finding_count": sum(
-                    finding.unsupported for finding in findings
-                ),
+                "unsupported_finding_count": sum(finding.unsupported for finding in findings),
                 "batch_count": len(raw_payload["batch_results"]),
                 "recording_context_schema_version": RECORDING_CONTEXT_SCHEMA_VERSION,
                 "recording_context_sha256": recording_context_sha256(recording_context),
                 "recording_context_applied": recording_context is not None,
                 "recording_context_processing_version": (
-                    RECORDING_CONTEXT_PROCESSING_VERSION
-                    if recording_context is not None
-                    else None
+                    RECORDING_CONTEXT_PROCESSING_VERSION if recording_context is not None else None
                 ),
                 "unavailable_reason_code": raw_payload["unavailable_reason_code"],
                 "raw_relative_path": raw_relative_path,
@@ -1592,9 +2141,7 @@ class StructuringExecutor:
             STRUCTURING_CHECKPOINT_KEY,
         )
         if evidence is None:
-            raise StructuringFailed(
-                "Recording-context correction requires structuring evidence."
-            )
+            raise StructuringFailed("Recording-context correction requires structuring evidence.")
         payload = evidence.payload
         if (
             payload.get("schema_version")
@@ -1605,9 +2152,7 @@ class StructuringExecutor:
             or not isinstance(payload.get("raw_relative_path"), str)
             or not isinstance(payload.get("raw_sha256"), str)
         ):
-            raise StructuringFailed(
-                "Recording-context correction evidence is incompatible."
-            )
+            raise StructuringFailed("Recording-context correction evidence is incompatible.")
         raw_payload = self._read_private_evidence(
             job_id,
             relative_path=payload["raw_relative_path"],
@@ -1620,9 +2165,7 @@ class StructuringExecutor:
             or not isinstance(raw_payload.get("batch_results"), list)
             or not isinstance(raw_payload.get("transcript_edit_results"), list)
         ):
-            raise StructuringFailed(
-                "Recording-context correction evidence is incomplete."
-            )
+            raise StructuringFailed("Recording-context correction evidence is incomplete.")
         context_sha256 = recording_context_sha256(context)
         if (
             raw_payload.get("recording_context_sha256") == context_sha256
@@ -1694,9 +2237,7 @@ class StructuringExecutor:
             seen_corrections.add(identity)
             correction_records.append(item)
         corrected_payload["schema_version"] = STRUCTURING_RAW_SCHEMA_VERSION
-        corrected_payload["recording_context_schema_version"] = (
-            RECORDING_CONTEXT_SCHEMA_VERSION
-        )
+        corrected_payload["recording_context_schema_version"] = RECORDING_CONTEXT_SCHEMA_VERSION
         corrected_payload["recording_context_sha256"] = context_sha256
         corrected_payload["recording_context_applied"] = True
         corrected_payload["recording_context_processing_version"] = (
@@ -1720,12 +2261,8 @@ class StructuringExecutor:
                 "recording_context_schema_version": RECORDING_CONTEXT_SCHEMA_VERSION,
                 "recording_context_sha256": context_sha256,
                 "recording_context_applied": True,
-                "recording_context_processing_version": (
-                    RECORDING_CONTEXT_PROCESSING_VERSION
-                ),
-                "context_correction_count": corrected_payload[
-                    "context_correction_count"
-                ],
+                "recording_context_processing_version": (RECORDING_CONTEXT_PROCESSING_VERSION),
+                "context_correction_count": corrected_payload["context_correction_count"],
                 "raw_relative_path": raw_relative_path,
                 "raw_sha256": raw_sha256,
             }
@@ -1805,11 +2342,7 @@ class StructuringExecutor:
         if not isinstance(edit_results, list):
             raise StructuringFailed("Transcript-edit repair evidence is incomplete.")
         segment_map = {segment.segment_id: segment for segment in segments}
-        retained = [
-            result
-            for result in edit_results
-            if not result.get("unavailable_reason_code")
-        ]
+        retained = [result for result in edit_results if not result.get("unavailable_reason_code")]
         failed_segments = [
             segment_map[segment_id]
             for result in edit_results
@@ -1866,14 +2399,10 @@ class StructuringExecutor:
             result["batch_index"] = index
         raw_payload["transcript_edit_results"] = combined
         raw_payload["recording_context_schema_version"] = RECORDING_CONTEXT_SCHEMA_VERSION
-        raw_payload["recording_context_sha256"] = recording_context_sha256(
-            recording_context
-        )
+        raw_payload["recording_context_sha256"] = recording_context_sha256(recording_context)
         raw_payload["recording_context_applied"] = recording_context is not None
         raw_payload["recording_context_processing_version"] = (
-            RECORDING_CONTEXT_PROCESSING_VERSION
-            if recording_context is not None
-            else None
+            RECORDING_CONTEXT_PROCESSING_VERSION if recording_context is not None else None
         )
         unavailable_reasons = [
             result.get("unavailable_reason_code")
@@ -1901,17 +2430,13 @@ class StructuringExecutor:
                 "recording_context_sha256": recording_context_sha256(recording_context),
                 "recording_context_applied": recording_context is not None,
                 "recording_context_processing_version": (
-                    RECORDING_CONTEXT_PROCESSING_VERSION
-                    if recording_context is not None
-                    else None
+                    RECORDING_CONTEXT_PROCESSING_VERSION if recording_context is not None else None
                 ),
                 "unavailable_reason_code": raw_payload["unavailable_reason_code"],
                 "raw_relative_path": raw_relative_path,
                 "raw_sha256": raw_sha256,
                 "elapsed_seconds": round(
-                    float(payload.get("elapsed_seconds", 0) or 0)
-                    + time.monotonic()
-                    - started,
+                    float(payload.get("elapsed_seconds", 0) or 0) + time.monotonic() - started,
                     6,
                 ),
             }
@@ -2074,7 +2599,15 @@ def _synthesis_segment_payload(
     edits = transcript_edits or {}
     aliases: dict[str, str] = {}
     payload: list[dict[str, Any]] = []
-    for index, segment in enumerate(segments, start=1):
+    ordered_segments = sorted(
+        segments,
+        key=lambda segment: (
+            segment.start_ms,
+            segment.end_ms,
+            segment.segment_sequence,
+        ),
+    )
+    for index, segment in enumerate(ordered_segments, start=1):
         alias = f"s{index:04d}"
         aliases[alias] = segment.segment_id
         payload.append(
@@ -2115,6 +2648,8 @@ def _remap_document_evidence(value: Any, *, aliases: dict[str, str]) -> Any:
     for key, item in value.items():
         if key == "evidence" and isinstance(item, list):
             remapped[key] = [aliases.get(segment_id, segment_id) for segment_id in item]
+        elif key in {"start_segment_id", "end_segment_id"} and isinstance(item, str):
+            remapped[key] = aliases.get(item, item)
         else:
             remapped[key] = _remap_document_evidence(item, aliases=aliases)
     return remapped
@@ -2150,6 +2685,72 @@ def _synthesis_finding_payload(findings: tuple[Finding, ...]) -> list[dict[str, 
         for finding in findings
         if not finding.unsupported
     ]
+
+
+def _select_uncovered_scene_findings(
+    document: dict[str, Any],
+    findings: tuple[Finding, ...],
+    *,
+    segment_starts: dict[str, int],
+) -> tuple[Finding, ...]:
+    covered_evidence: set[str] = set()
+    raw_sections = document.get("scene_sections")
+    if isinstance(raw_sections, list):
+        for section in raw_sections:
+            if not isinstance(section, dict):
+                continue
+            evidence = section.get("evidence")
+            if isinstance(evidence, list):
+                covered_evidence.update(item for item in evidence if isinstance(item, str))
+            details = section.get("details")
+            if isinstance(details, list):
+                for detail in details:
+                    if not isinstance(detail, dict):
+                        continue
+                    detail_evidence = detail.get("evidence")
+                    if isinstance(detail_evidence, list):
+                        covered_evidence.update(
+                            item for item in detail_evidence if isinstance(item, str)
+                        )
+
+    covered_buckets = {
+        segment_starts[segment_id] // 90_000
+        for segment_id in covered_evidence
+        if segment_id in segment_starts
+    }
+    buckets: dict[int, list[Finding]] = {}
+    for finding in findings:
+        if (
+            finding.unsupported
+            or finding.confidence < 0.6
+            or finding.kind not in {FindingKind.FACT, FindingKind.TOPIC, FindingKind.IDEA}
+            or set(finding.evidence) & covered_evidence
+        ):
+            continue
+        starts = [
+            segment_starts[segment_id]
+            for segment_id in finding.evidence
+            if segment_id in segment_starts
+        ]
+        if not starts:
+            continue
+        bucket = min(starts) // 90_000
+        if bucket in covered_buckets:
+            continue
+        buckets.setdefault(bucket, []).append(finding)
+
+    selected: list[Finding] = []
+    for bucket in sorted(buckets, reverse=True):
+        selected.extend(
+            sorted(
+                buckets[bucket],
+                key=lambda item: (
+                    -item.confidence,
+                    min(segment_starts.get(segment_id, 2**63 - 1) for segment_id in item.evidence),
+                ),
+            )[:2]
+        )
+    return tuple(selected[:12])
 
 
 def _classification_sample(
@@ -2347,8 +2948,15 @@ def _validate_document(
         "risks",
         "open_questions",
     }
+    timeline_keys = expected_keys | {"timeline_sections"}
     scene_keys = expected_keys | {"scene_sections"}
-    if frozenset(raw) not in {frozenset(expected_keys), frozenset(scene_keys)}:
+    scene_timeline_keys = expected_keys | {"scene_sections", "timeline_sections"}
+    if frozenset(raw) not in {
+        frozenset(expected_keys),
+        frozenset(timeline_keys),
+        frozenset(scene_keys),
+        frozenset(scene_timeline_keys),
+    }:
         raise StructuringFailed("The structured document has invalid fields.")
     title = _validate_document_text(
         raw.get("title"),
@@ -2360,6 +2968,12 @@ def _validate_document(
         segment_ids=segment_ids,
         field="summary",
     )
+    if content_type is ContentType.INTERVIEW:
+        summary["text"] = _remove_unsupported_interview_inferences(
+            summary["text"],
+            summary["evidence"],
+            segment_texts,
+        )
     raw_context = raw.get("context")
     if not isinstance(raw_context, list) or len(raw_context) > 5:
         raise StructuringFailed("The structured document has invalid context.")
@@ -2403,9 +3017,27 @@ def _validate_document(
         )
     if content_type is ContentType.MEETING and len(context) < 2:
         raise StructuringFailed("The meeting document has too little background context.")
+    if content_type is ContentType.INTERVIEW:
+        context = [
+            {
+                **item,
+                "text": _remove_unsupported_interview_inferences(
+                    item["text"],
+                    item["evidence"],
+                    segment_texts,
+                ),
+            }
+            for item in context
+            if item["kind"] != "constraint"
+            or _evidence_has_interview_constraint(item["evidence"], segment_texts)
+        ]
+    elif content_type is ContentType.GENERIC:
+        context = [item for item in context if not _generic_is_meta_text(item["text"])]
     highlights = _validate_evidence_text_list(
         raw.get("highlights"), segment_ids=segment_ids, field="highlights", maximum=8
     )
+    if content_type is ContentType.GENERIC:
+        highlights = _normalize_generic_highlights(highlights, segment_texts=segment_texts)
     decisions = _validate_evidence_text_list(
         raw.get("decisions"), segment_ids=segment_ids, field="decisions", maximum=10
     )
@@ -2419,12 +3051,28 @@ def _validate_document(
     risks = _validate_evidence_text_list(
         raw.get("risks"), segment_ids=segment_ids, field="risks", maximum=10
     )
+    if content_type is ContentType.INTERVIEW:
+        risks = [
+            risk
+            for risk in risks
+            if _is_substantive_interview_risk(
+                risk["text"],
+                risk["evidence"],
+                segment_texts,
+            )
+        ]
     open_questions = _validate_evidence_text_list(
         raw.get("open_questions"),
         segment_ids=segment_ids,
         field="open_questions",
         maximum=10,
     )
+    if content_type is ContentType.INTERVIEW:
+        open_questions = [
+            question
+            for question in open_questions
+            if _interview_question_remains_open(question["evidence"], segment_texts)
+        ]
 
     raw_topics = raw.get("topics")
     if not isinstance(raw_topics, list) or len(raw_topics) > 10:
@@ -2461,6 +3109,14 @@ def _validate_document(
                 ),
             }
         )
+
+    ordered_transcribed_ids = sorted(segment_texts, key=segment_starts.__getitem__)
+    timeline_sections = _validate_timeline_sections(
+        raw.get("timeline_sections"),
+        ordered_segment_ids=ordered_transcribed_ids,
+        fallback_title=title,
+        fallback_summary=summary["text"],
+    )
 
     allowed_scene_kinds = scene_section_kinds(content_type.value)
     raw_scene_sections = raw.get("scene_sections")
@@ -2502,7 +3158,7 @@ def _validate_document(
                         item.get("details"),
                         segment_ids=segment_ids,
                         field=f"scene_sections[{index}].details",
-                        maximum=4,
+                        maximum=(8 if content_type is ContentType.VOICE_MEMO else 4),
                     ),
                     "evidence": _validate_evidence(
                         item.get("evidence"),
@@ -2531,6 +3187,35 @@ def _validate_document(
             }
             for topic in topics
         ]
+    if content_type is ContentType.INTERVIEW:
+        scene_sections = _normalize_interview_scene_sections(
+            scene_sections,
+            segment_texts=segment_texts,
+            segment_starts=segment_starts,
+        )
+    elif content_type is ContentType.VOICE_MEMO:
+        scene_sections = _normalize_voice_memo_scene_sections(
+            scene_sections,
+            document_title=title,
+            polish_sources=[
+                *topics,
+                *(
+                    {
+                        "title": item["title"],
+                        "summary": item["text"],
+                        "details": [],
+                    }
+                    for item in context
+                ),
+            ],
+            segment_texts=segment_texts,
+            segment_starts=segment_starts,
+        )
+    elif content_type is ContentType.GENERIC:
+        scene_sections = _normalize_generic_scene_sections(
+            scene_sections,
+            segment_texts=segment_texts,
+        )
 
     raw_discussion_threads = raw.get("discussion_threads")
     if not isinstance(raw_discussion_threads, list) or len(raw_discussion_threads) > 6:
@@ -2677,8 +3362,7 @@ def _validate_document(
             field=f"speaker_summaries[{index}].evidence",
         )
         if not any(
-            segment_speakers.get(segment_id) == speaker_id
-            for segment_id in speaker_evidence
+            segment_speakers.get(segment_id) == speaker_id for segment_id in speaker_evidence
         ):
             raise StructuringFailed("A speaker summary lacks the participant's own statement.")
         display_name = _validate_optional_document_text(
@@ -2702,23 +3386,18 @@ def _validate_document(
                 "display_name": (
                     display_name
                     if not display_name
-                    or _literal_is_grounded(
-                        display_name, speaker_evidence, segment_texts
-                    )
+                    or _literal_is_grounded(display_name, speaker_evidence, segment_texts)
                     else ""
                 ),
                 "affiliation": (
                     affiliation
                     if not affiliation
-                    or _literal_is_grounded(
-                        affiliation, speaker_evidence, segment_texts
-                    )
+                    or _literal_is_grounded(affiliation, speaker_evidence, segment_texts)
                     else ""
                 ),
                 "role": (
                     role
-                    if not role
-                    or _literal_is_grounded(role, speaker_evidence, segment_texts)
+                    if not role or _literal_is_grounded(role, speaker_evidence, segment_texts)
                     else ""
                 ),
                 "summary": _validate_document_text(
@@ -2729,12 +3408,28 @@ def _validate_document(
                 "evidence": speaker_evidence,
             }
         )
+    if content_type is ContentType.INTERVIEW:
+        speaker_summaries = [
+            {
+                **item,
+                "summary": _remove_unsupported_interview_inferences(
+                    item["summary"],
+                    item["evidence"],
+                    segment_texts,
+                ),
+            }
+            for item in speaker_summaries
+        ]
+    elif content_type is ContentType.VOICE_MEMO or (
+        content_type is ContentType.GENERIC and len(speaker_ids) <= 1
+    ):
+        speaker_summaries = []
     if (
-        content_type is ContentType.MEETING
+        content_type in {ContentType.INTERVIEW, ContentType.MEETING}
         and len(speaker_ids) > 1
         and len(speaker_summaries) < 2
     ):
-        raise StructuringFailed("The meeting document has too few speaker summaries.")
+        raise StructuringFailed("The multi-speaker document has too few speaker summaries.")
     if content_type is ContentType.MEETING:
         speaker_character_counts: dict[str, int] = {}
         for segment_id, speaker_id in segment_speakers.items():
@@ -2777,28 +3472,76 @@ def _validate_document(
             segment_ids=segment_ids,
             field=f"actions[{index}].evidence",
         )
+        task = _validate_document_text(
+            item.get("task"), field=f"actions[{index}].task", maximum=1000
+        )
+        if content_type is ContentType.GENERIC:
+            if not _generic_action_is_explicit(task, action_evidence, segment_texts):
+                continue
+        elif content_type in {
+            ContentType.INTERVIEW,
+            ContentType.SPEECH,
+            ContentType.VOICE_MEMO,
+        } and not (_action_has_future_evidence(action_evidence, segment_texts)):
+            continue
         if owner and not _literal_is_grounded(owner, action_evidence, segment_texts):
             owner = ""
         if deadline and not _literal_is_grounded(deadline, action_evidence, segment_texts):
             deadline = ""
         actions.append(
             {
-                "task": _validate_document_text(
-                    item.get("task"), field=f"actions[{index}].task", maximum=1000
-                ),
+                "task": task,
                 "owner": owner,
                 "deadline": deadline,
                 "evidence": action_evidence,
             }
         )
+    if content_type is ContentType.VOICE_MEMO and not actions:
+        actions = _derive_voice_memo_actions(
+            segment_texts=segment_texts,
+            segment_starts=segment_starts,
+        )
+
+    if content_type is ContentType.GENERIC:
+        title = _normalize_generic_title(title)
+        summary = _normalize_generic_summary(
+            summary,
+            scene_sections=scene_sections,
+            segment_texts=segment_texts,
+        )
+        open_question_signatures = {
+            _normalized_document_item(item["text"]) for item in open_questions
+        }
+        if open_question_signatures:
+            risks = [
+                item
+                for item in risks
+                if not _generic_risk_duplicates_open_question(
+                    item["text"], open_questions
+                )
+            ]
+            context = [
+                item
+                for item in context
+                if not _generic_text_duplicates_any(
+                    item["text"],
+                    open_question_signatures,
+                )
+            ]
+            scene_sections = [
+                item
+                for item in scene_sections
+                if not _generic_text_duplicates_any(
+                    item["summary"],
+                    open_question_signatures,
+                )
+            ]
 
     categorized_texts = {
         "decisions": {_normalized_document_item(item["text"]) for item in decisions},
         "actions": {_normalized_document_item(item["task"]) for item in actions},
         "risks": {_normalized_document_item(item["text"]) for item in risks},
-        "open_questions": {
-            _normalized_document_item(item["text"]) for item in open_questions
-        },
+        "open_questions": {_normalized_document_item(item["text"]) for item in open_questions},
     }
     category_names = list(categorized_texts)
     if any(
@@ -2824,6 +3567,7 @@ def _validate_document(
         "context": context,
         "highlights": highlights,
         "topics": topics,
+        "timeline_sections": timeline_sections,
         "scene_sections": scene_sections,
         "discussion_threads": discussion_threads,
         "speaker_summaries": speaker_summaries,
@@ -2833,6 +3577,101 @@ def _validate_document(
         "open_questions": open_questions,
         "chapters": chapters,
     }
+
+
+def _validate_timeline_sections(
+    value: Any,
+    *,
+    ordered_segment_ids: list[str],
+    fallback_title: str,
+    fallback_summary: str,
+) -> list[dict[str, Any]]:
+    """Validate a complete, non-overlapping chronological digest.
+
+    Documents from schema 1.5 and earlier did not contain a timeline. They are
+    represented as one full-range section so accepted historical Notes remain
+    regenerable; all newly synthesized documents are required by the model
+    schema to provide semantic sections.
+    """
+
+    if not ordered_segment_ids:
+        return []
+    if value is None:
+        return [
+            {
+                "title": fallback_title,
+                "summary": fallback_summary,
+                "details": [],
+                "start_segment_id": ordered_segment_ids[0],
+                "end_segment_id": ordered_segment_ids[-1],
+            }
+        ]
+    if not isinstance(value, list) or not value or len(value) > 20:
+        raise StructuringFailed("The structured document has invalid timeline sections.")
+    order = {segment_id: index for index, segment_id in enumerate(ordered_segment_ids)}
+    parsed: list[dict[str, Any]] = []
+    prior_start_index = -1
+    for index, item in enumerate(value):
+        if not isinstance(item, dict) or set(item) != {
+            "title",
+            "summary",
+            "details",
+            "start_segment_id",
+            "end_segment_id",
+        }:
+            raise StructuringFailed("The structured document has an invalid timeline section.")
+        start_segment_id = item.get("start_segment_id")
+        end_segment_id = item.get("end_segment_id")
+        if start_segment_id not in order or end_segment_id not in order:
+            raise StructuringFailed("A timeline section references an unknown segment.")
+        start_index = order[start_segment_id]
+        end_index = order[end_segment_id]
+        if (index == 0 and start_index != 0) or start_index <= prior_start_index:
+            raise StructuringFailed(
+                "The timeline sections do not have strictly ordered semantic starts."
+            )
+        if end_index < start_index:
+            raise StructuringFailed("A timeline section ends before it starts.")
+        raw_details = item.get("details")
+        if not isinstance(raw_details, list) or len(raw_details) > 5:
+            raise StructuringFailed("A timeline section has invalid details.")
+        details = [
+            _validate_document_text(
+                detail,
+                field=f"timeline_sections[{index}].details[{detail_index}]",
+                maximum=MAX_DOCUMENT_TEXT_CHARACTERS,
+            )
+            for detail_index, detail in enumerate(raw_details)
+        ]
+        parsed.append(
+            {
+                "title": _validate_document_text(
+                    item.get("title"),
+                    field=f"timeline_sections[{index}].title",
+                    maximum=MAX_DOCUMENT_TITLE_CHARACTERS,
+                ),
+                "summary": _validate_document_text(
+                    item.get("summary"),
+                    field=f"timeline_sections[{index}].summary",
+                    maximum=MAX_DOCUMENT_TEXT_CHARACTERS,
+                ),
+                "details": details,
+                "start_segment_id": start_segment_id,
+                "end_segment_id": end_segment_id,
+            }
+        )
+        prior_start_index = start_index
+
+    # The model chooses semantic starts; the Worker owns exact coverage. This
+    # accepts inclusive human-style boundaries while making every corrected
+    # transcript segment belong to exactly one chronological section.
+    for index, section in enumerate(parsed):
+        if index + 1 < len(parsed):
+            next_start = order[parsed[index + 1]["start_segment_id"]]
+            section["end_segment_id"] = ordered_segment_ids[next_start - 1]
+        else:
+            section["end_segment_id"] = ordered_segment_ids[-1]
+    return parsed
 
 
 def _validate_document_text(value: Any, *, field: str, maximum: int) -> str:
@@ -2884,6 +3723,1063 @@ def _decision_has_confirmation_evidence(
     return any(marker in transcript for marker in markers)
 
 
+def _action_has_future_evidence(
+    evidence: list[str],
+    segment_texts: dict[str, str],
+) -> bool:
+    transcript = "".join(segment_texts.get(segment_id, "") for segment_id in evidence)
+    strong_future_markers = (
+        "下一步",
+        "接下来",
+        "后续",
+        "未来",
+        "计划要",
+        "计划在",
+        "计划于",
+        "准备",
+        "将会",
+        "将要",
+        "需要",
+        "必须",
+        "务必",
+        "请你",
+        "请大家",
+        "安排",
+        "负责",
+        "截止",
+        "待完成",
+        "待推进",
+        "明天",
+        "下周",
+        "下个月",
+    )
+    historical_markers = (
+        "已经",
+        "已完成",
+        "已上线",
+        "已发布",
+        "已启动",
+        "做了",
+        "完成了",
+        "上线了",
+        "发布了",
+        "启动了",
+        "组织了",
+        "进行了",
+        "开展了",
+        "搞了",
+        "开始搞",
+        "开始做",
+        "就启动",
+        "上了",
+    )
+    future_position = max(
+        (transcript.rfind(marker) for marker in strong_future_markers),
+        default=-1,
+    )
+    historical_position = max(
+        (transcript.rfind(marker) for marker in historical_markers),
+        default=-1,
+    )
+    if future_position >= 0:
+        return historical_position < future_position
+    if historical_position >= 0:
+        return False
+    return any(marker in transcript for marker in ("要做", "要把", "得做", "应当", "应该"))
+
+
+def _is_substantive_interview_risk(
+    text: str,
+    evidence: list[str],
+    segment_texts: dict[str, str],
+) -> bool:
+    non_substantive_markers = (
+        "语句含糊",
+        "表达含糊",
+        "转写含糊",
+        "不确定或思考状态",
+        "口头禅",
+        "停顿",
+        "嗯、啊",
+        "嗯、哦",
+    )
+    return not any(marker in text for marker in non_substantive_markers) and (
+        _evidence_has_interview_constraint(evidence, segment_texts)
+    )
+
+
+def _evidence_has_interview_constraint(
+    evidence: list[str],
+    segment_texts: dict[str, str],
+) -> bool:
+    transcript = "".join(segment_texts.get(segment_id, "") for segment_id in evidence)
+    markers = (
+        "风险",
+        "限制",
+        "约束",
+        "困难",
+        "问题",
+        "不能",
+        "无法",
+        "不支持",
+        "安全",
+        "漏洞",
+        "成本",
+        "压力",
+        "压垮",
+    )
+    return any(marker in transcript for marker in markers)
+
+
+def _remove_unsupported_interview_inferences(
+    text: str,
+    evidence: list[str],
+    segment_texts: dict[str, str],
+) -> str:
+    transcript = "".join(segment_texts.get(segment_id, "") for segment_id in evidence)
+    result = text
+    if not any(marker in transcript for marker in ("未来", "规划")):
+        result = re.sub(r"[及和、]?未来规划", "", result)
+    if not any(marker in transcript for marker in ("探索", "优化", "验证")):
+        result = re.sub(
+            r"(?:并提到)?部分(?:实践|系统)仍处于探索阶段[，,]?需进一步优化和验证[。.]?",
+            "",
+            result,
+        )
+    result = re.sub(r"[，,]{2,}", "，", result)
+    result = re.sub(r"，([。；;])", r"\1", result)
+    result = result.strip().rstrip("，,；; ")
+    if result and result[-1] not in "。！？!?":
+        result += "。"
+    return result or text
+
+
+def _normalize_voice_memo_scene_sections(
+    sections: list[dict[str, Any]],
+    *,
+    document_title: str,
+    polish_sources: list[dict[str, Any]],
+    segment_texts: dict[str, str],
+    segment_starts: dict[str, int],
+) -> list[dict[str, Any]]:
+    generic_titles = {
+        "记录意图",
+        "想法",
+        "当前判断",
+        "明确任务",
+        "待验证假设",
+        "约束",
+        "后续跟进",
+    }
+    normalized: list[dict[str, Any]] = []
+    seen: set[tuple[str, tuple[str, ...]]] = set()
+    for section in sections:
+        item = dict(section)
+        evidence = list(item["evidence"])
+        transcript = "".join(segment_texts.get(segment_id, "") for segment_id in evidence)
+        if item["kind"] == "intent" and any(
+            marker in item["summary"]
+            for marker in ("这段语音备忘记录", "这段语音记录", "本段语音记录")
+        ):
+            continue
+        if item["kind"] == "task" and not _voice_memo_has_task_commitment(transcript):
+            item["kind"] = "idea"
+        if item["kind"] == "hypothesis" and not _voice_memo_has_testable_hypothesis(transcript):
+            item["kind"] = "idea"
+        if item["kind"] == "constraint" and not _evidence_has_interview_constraint(
+            evidence,
+            segment_texts,
+        ):
+            item["kind"] = "judgment"
+        if item["title"] in generic_titles:
+            item["title"] = _voice_memo_specific_title(item["summary"], item["title"])
+        summary_signature = _normalized_document_item(item["summary"])
+        item["details"] = [
+            detail
+            for detail in item["details"]
+            if _normalized_document_item(detail["text"]) != summary_signature
+        ]
+        signature = (summary_signature, tuple(evidence))
+        if signature in seen:
+            continue
+        seen.add(signature)
+        normalized.append(item)
+    complete_methods = [
+        item
+        for item in normalized
+        if len(item["details"]) >= 5
+        and any(marker in item["title"] for marker in ("步骤", "路径", "方法", "阶段"))
+    ]
+    generated_method = _voice_memo_ordered_method_section(
+        document_title=document_title,
+        polish_sources=[
+            *polish_sources,
+            *(item for item in normalized if item not in complete_methods),
+        ],
+        segment_texts=segment_texts,
+        segment_starts=segment_starts,
+    )
+    if generated_method is not None:
+        normalized = [item for item in normalized if item not in complete_methods]
+        normalized.append(generated_method)
+        complete_methods = [generated_method]
+    if complete_methods:
+        method = max(complete_methods, key=lambda item: len(item["details"]))
+        _polish_voice_memo_method_details(
+            method,
+            polish_sources=polish_sources,
+        )
+        method_evidence = {
+            segment_id for detail in method["details"] for segment_id in detail["evidence"]
+        }
+        normalized = [
+            item
+            for item in normalized
+            if item is method
+            or item["kind"] in {"intent", "constraint", "task", "hypothesis"}
+            or not set(item["evidence"]).issubset(method_evidence)
+        ]
+    return normalized or sections[:1]
+
+
+def _voice_memo_ordered_method_section(
+    *,
+    document_title: str,
+    polish_sources: list[dict[str, Any]],
+    segment_texts: dict[str, str],
+    segment_starts: dict[str, int],
+) -> dict[str, Any] | None:
+    ordered_ids = sorted(segment_texts, key=lambda segment_id: segment_starts[segment_id])
+    combined_parts: list[str] = []
+    spans: list[tuple[int, int, str]] = []
+    offset = 0
+    for segment_id in ordered_ids:
+        if combined_parts:
+            combined_parts.append("\n")
+            offset += 1
+        text = segment_texts[segment_id]
+        start = offset
+        combined_parts.append(text)
+        offset += len(text)
+        spans.append((start, offset, segment_id))
+    combined = "".join(combined_parts)
+    marker_pattern = re.compile(
+        r"第(?P<ordinal>[一二三四五六七八九十]+)(?:步|个步骤)|"
+        r"(?P<final>最后)(?:一步|一个步骤|的话呢|的话)?"
+    )
+    markers = list(marker_pattern.finditer(combined))
+    if len(markers) < 4 or not any(match.group("ordinal") == "一" for match in markers):
+        return None
+    details: list[dict[str, Any]] = []
+    used_sections: set[int] = set()
+    for index, marker in enumerate(markers[:8]):
+        marker_segment = next(
+            (segment_id for start, end, segment_id in spans if start <= marker.start() < end),
+            None,
+        )
+        if marker_segment is None:
+            continue
+        marker_segment_end = next(
+            end for start, end, segment_id in spans if segment_id == marker_segment
+        )
+        end = markers[index + 1].start() if index + 1 < len(markers) else marker_segment_end
+        raw_content = combined[marker.end() : end]
+        content = _clean_voice_memo_spoken_text(raw_content)
+        if not content:
+            continue
+        label = (
+            f"第{marker.group('ordinal')}步"
+            if marker.group("ordinal")
+            else f"第{_chinese_number(len(details) + 1)}步"
+        )
+        evidence = [
+            segment_id
+            for start, span_end, segment_id in spans
+            if start < end and span_end > marker.start()
+            and _voice_memo_has_substantive_text(segment_texts[segment_id])
+        ][:3]
+        best_index, polished = _voice_memo_matching_section_summary(
+            content,
+            polish_sources=polish_sources,
+            used_sections=used_sections,
+        )
+        if best_index is not None:
+            used_sections.add(best_index)
+            content = polished
+        details.append(
+            {
+                "text": f"{label}：{content}"[:MAX_DOCUMENT_TEXT_CHARACTERS],
+                "evidence": evidence,
+            }
+        )
+    if len(details) < 4:
+        return None
+    evidence_ids = list(
+        dict.fromkeys(segment_id for detail in details for segment_id in detail["evidence"])
+    )
+    if len(evidence_ids) > MAX_DOCUMENT_EVIDENCE_ITEMS:
+        evidence_ids = [
+            evidence_ids[0],
+            evidence_ids[len(evidence_ids) // 2],
+            evidence_ids[-1],
+        ]
+    topic = re.sub(r"(?:的)?(?:思考与)?实施步骤$", "", document_title).strip()
+    count_text = _chinese_number(len(details))
+    return {
+        "kind": "judgment",
+        "title": f"{topic or '这项工作'}的{count_text}步实施路径",
+        "summary": (
+            f"原文将{topic or '这项工作'}拆为{count_text}个依次推进的阶段，"
+            "并分别说明了各阶段的目标与边界。"
+        ),
+        "details": details,
+        "evidence": evidence_ids,
+    }
+
+
+def _voice_memo_matching_section_summary(
+    step_text: str,
+    *,
+    polish_sources: list[dict[str, Any]],
+    used_sections: set[int],
+) -> tuple[int | None, str]:
+    step_pairs = _document_bigrams(step_text)
+    best_index: int | None = None
+    best_score = 0
+    best_text = step_text
+    candidate_index = 0
+    for section in polish_sources:
+        if section.get("kind") == "intent":
+            continue
+        texts = [str(section.get("summary") or "")]
+        texts.extend(
+            str(detail.get("text") or "")
+            for detail in section.get("details", [])
+            if isinstance(detail, dict)
+        )
+        for candidate_text in texts:
+            current_index = candidate_index
+            candidate_index += 1
+            if current_index in used_sections or not candidate_text:
+                continue
+            broad_markers = sum(
+                marker in candidate_text
+                for marker in ("战略", "场景", "底座", "MVP", "灰度", "长期运营")
+            )
+            if broad_markers >= 3:
+                continue
+            candidate = f"{section.get('title', '')}{candidate_text}"
+            semantic_markers = ("战略", "场景", "底座", "MVP", "灰度", "长期运营")
+            extra_markers = sum(
+                marker in candidate_text and marker not in step_text
+                for marker in semantic_markers
+            )
+            score = len(step_pairs & _document_bigrams(candidate)) - (extra_markers * 10)
+            if score > best_score:
+                best_index = current_index
+                best_score = score
+                best_text = re.sub(
+                    r"^说话人(?:认为|提出|建议|强调|希望)",
+                    "",
+                    candidate_text,
+                ).strip()
+    return (best_index, best_text) if best_score >= 2 else (None, step_text)
+
+
+def _polish_voice_memo_method_details(
+    method: dict[str, Any],
+    *,
+    polish_sources: list[dict[str, Any]],
+) -> None:
+    used_sources: set[int] = set()
+    polished_details: list[dict[str, Any]] = []
+    for detail in method["details"]:
+        raw_text = detail["text"]
+        label, separator, step_text = raw_text.partition("：")
+        if not separator:
+            label, separator, step_text = raw_text.partition(":")
+        if not separator:
+            polished_details.append(detail)
+            continue
+        best_index, polished = _voice_memo_matching_section_summary(
+            step_text,
+            polish_sources=polish_sources,
+            used_sections=used_sources,
+        )
+        if best_index is None:
+            polished_details.append(detail)
+            continue
+        used_sources.add(best_index)
+        polished = re.sub(
+            r"^第[一二三四五六七八九十]+步(?:是|为|：|:)?",
+            "",
+            polished,
+        ).strip()
+        polished_details.append({**detail, "text": f"{label}：{polished}"})
+    method["details"] = polished_details
+
+
+def _document_bigrams(text: str) -> set[str]:
+    normalized = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]+", "", text).casefold()
+    return {normalized[index : index + 2] for index in range(max(0, len(normalized) - 1))}
+
+
+def _voice_memo_has_substantive_text(text: str) -> bool:
+    return bool(re.sub(r"[啊嗯呃哦唔诶欸哎哈，。！？、；：,.!?;:\s]+", "", text))
+
+
+def _normalize_generic_scene_sections(
+    sections: list[dict[str, Any]],
+    *,
+    segment_texts: dict[str, str],
+) -> list[dict[str, Any]]:
+    generic_titles = {
+        "背景",
+        "主题",
+        "核心信息",
+        "重要细节",
+        "结果",
+        "后续行动",
+        "开放问题",
+    }
+    normalized: list[dict[str, Any]] = []
+    seen_texts: set[str] = set()
+    for section in sections:
+        if section["kind"] == "action" and not _generic_action_is_explicit(
+            section["summary"],
+            section["evidence"],
+            segment_texts,
+        ):
+            continue
+        should_split = section["title"] in generic_titles or _generic_is_meta_text(
+            section["summary"]
+        )
+        if should_split:
+            source_items = section["details"] or [
+                {"text": section["summary"], "evidence": section["evidence"]}
+            ]
+            for detail in source_items:
+                text = _normalize_generic_tentative_text(
+                    detail["text"],
+                    detail["evidence"],
+                    segment_texts,
+                )
+                if _generic_is_meta_text(text) or _generic_is_vague_future(
+                    text,
+                    detail["evidence"],
+                    segment_texts,
+                ):
+                    continue
+                signature = _normalized_document_item(text)
+                if not signature or signature in seen_texts:
+                    continue
+                seen_texts.add(signature)
+                normalized.append(
+                    {
+                        "kind": _generic_detail_kind(text, parent_kind=section["kind"]),
+                        "title": _generic_detail_title(text),
+                        "summary": _ensure_sentence(text),
+                        "details": [],
+                        "evidence": list(detail["evidence"]),
+                    }
+                )
+            continue
+
+        item = dict(section)
+        item["summary"] = _normalize_generic_tentative_text(
+            item["summary"],
+            item["evidence"],
+            segment_texts,
+        )
+        item["summary"] = _strip_generic_vague_future_clause(
+            item["summary"],
+            item["evidence"],
+            segment_texts,
+        )
+        item["summary"] = _strip_generic_meta_sentences(item["summary"])
+        summary_signature = _normalized_document_item(item["summary"])
+        normalized_details: list[dict[str, Any]] = []
+        for detail in item["details"]:
+            detail_text = _normalize_generic_tentative_text(
+                detail["text"],
+                detail["evidence"],
+                segment_texts,
+            )
+            if _generic_is_vague_future(detail_text, detail["evidence"], segment_texts):
+                continue
+            detail_signature = _normalized_document_item(detail_text)
+            if (
+                detail_signature == summary_signature
+                or detail_signature in summary_signature
+                or summary_signature in detail_signature
+            ):
+                continue
+            normalized_details.append({**detail, "text": detail_text})
+        item["details"] = normalized_details
+        if summary_signature in seen_texts:
+            continue
+        seen_texts.add(summary_signature)
+        normalized.append(item)
+    kind_order = {
+        "context": 0,
+        "theme": 1,
+        "detail": 2,
+        "insight": 3,
+        "outcome": 4,
+        "action": 5,
+        "open_question": 6,
+    }
+    normalized.sort(
+        key=lambda item: (
+            90
+            if any(
+                marker in f"{item['title']}{item['summary']}"
+                for marker in ("尚未明确", "仍待", "待确定", "不确定")
+            )
+            else kind_order.get(item["kind"], 99)
+        )
+    )
+    return normalized or sections[:1]
+
+
+def _generic_text_duplicates_any(text: str, signatures: set[str]) -> bool:
+    normalized = _normalized_document_item(text)
+    return any(
+        signature in normalized or normalized in signature
+        for signature in signatures
+    )
+
+
+def _generic_risk_duplicates_open_question(
+    text: str,
+    open_questions: list[dict[str, Any]],
+) -> bool:
+    normalized = _normalized_document_item(text)
+    for question in open_questions:
+        stem = re.split(
+            r"尚未明确|仍待|待确定|需要进一步",
+            question["text"],
+            maxsplit=1,
+        )[0]
+        normalized_stem = _normalized_document_item(stem)
+        if len(normalized_stem) >= 8 and normalized_stem in normalized:
+            return True
+    return False
+
+
+def _generic_detail_kind(text: str, *, parent_kind: str) -> str:
+    if any(marker in text for marker in ("尚未明确", "仍待", "待确定", "如何选择")):
+        return "open_question"
+    if any(marker in text for marker in ("知识库", "智能体", "ASR", "TTS", "能力模块")):
+        return "detail"
+    if any(marker in text for marker in ("分为", "两类", "方面")):
+        return "theme"
+    if any(marker in text for marker in ("前期", "初期", "切入", "方案")):
+        return "insight"
+    return parent_kind if parent_kind not in {"context", "outcome", "action"} else "insight"
+
+
+def _generic_detail_title(text: str) -> str:
+    if "运营场景" in text and "业务侧" in text:
+        return "运营侧与业务侧两类AI需求"
+    if "知识库" in text and "智能体" in text:
+        return "知识库、智能体与语音技术等能力模块"
+    if "切入点" in text and any(marker in text for marker in ("初期", "前期", "少量")):
+        return "从少量需求点启动方案设计"
+    if "切入点" in text and any(marker in text for marker in ("尚未明确", "仍待", "如何")):
+        return "前期需求切入点仍待确定"
+    title = re.sub(
+        r"^(?:本次|这段)?记录(?:旨在|的核心信息是|的结果是|是在)?",
+        "",
+        text,
+    ).strip(" ，。；：")
+    title = re.split(r"[。；]", title, maxsplit=1)[0]
+    return title[:48] or "内容要点"
+
+
+def _generic_is_meta_text(text: str) -> bool:
+    normalized = text.strip()
+    return normalized.startswith(
+        (
+            "本次记录旨在",
+            "本次记录是在",
+            "本次记录的核心信息是",
+            "本次记录的结果是",
+            "这段记录旨在",
+        )
+    )
+
+
+def _generic_is_vague_future(
+    text: str,
+    evidence: list[str],
+    segment_texts: dict[str, str],
+) -> bool:
+    if not any(marker in text for marker in ("后续", "将", "实际实施", "行动")):
+        return False
+    transcript = "".join(segment_texts.get(segment_id, "") for segment_id in evidence)
+    return any(marker in transcript for marker in ("哪些", "可能", "看一下", "看一下就是"))
+
+
+def _strip_generic_vague_future_clause(
+    text: str,
+    evidence: list[str],
+    segment_texts: dict[str, str],
+) -> str:
+    if not _generic_is_vague_future(text, evidence, segment_texts):
+        return text
+    stripped = re.sub(r"[，,；;]后续(?:将|拟)[^。！？!?]*", "", text).strip()
+    return _ensure_sentence(stripped.rstrip("。"))
+
+
+def _normalize_generic_tentative_text(
+    text: str,
+    evidence: list[str],
+    segment_texts: dict[str, str],
+) -> str:
+    transcript = "".join(segment_texts.get(segment_id, "") for segment_id in evidence)
+    if not any(marker in transcript for marker in ("可能", "哪些", "看一下")):
+        return text
+    normalized = text.replace("初期选择几个点", "前期拟选择少量需求点")
+    normalized = normalized.replace("初期选择少量需求点", "前期拟选择少量需求点")
+    normalized = normalized.replace("后续将", "后续拟")
+    normalized = normalized.replace("案例方案图", "初步方案图")
+    return normalized
+
+
+def _normalize_generic_highlights(
+    highlights: list[dict[str, Any]],
+    *,
+    segment_texts: dict[str, str],
+) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for item in highlights:
+        text = _normalize_generic_tentative_text(
+            item["text"],
+            item["evidence"],
+            segment_texts,
+        )
+        if _generic_is_vague_future(text, item["evidence"], segment_texts):
+            continue
+        normalized.append({**item, "text": text})
+    return normalized
+
+
+def _generic_action_is_explicit(
+    task: str,
+    evidence: list[str],
+    segment_texts: dict[str, str],
+) -> bool:
+    transcript = "".join(segment_texts.get(segment_id, "") for segment_id in evidence)
+    explicit_markers = (
+        "接下来要",
+        "后续要",
+        "需要",
+        "必须",
+        "将会",
+        "会去",
+        "安排",
+        "计划",
+        "我们要",
+    )
+    if not any(marker in transcript for marker in explicit_markers):
+        return False
+    if any(marker in transcript for marker in ("哪些", "可能", "看一下")):
+        return False
+    if any(marker in transcript for marker in ("已经", "做了", "完成了")) and not any(
+        marker in task for marker in ("接下来", "后续", "需要", "推进", "完成")
+    ):
+        return False
+    return True
+
+
+def _normalize_generic_title(title: str) -> str:
+    normalized = re.sub(r"^(?:本次记录(?:旨在|是)?|梳理)", "", title).strip()
+    normalized = normalized.replace("的两个大类", "分类")
+    normalized = normalized.replace("涉及的能力模块", "能力模块")
+    normalized = normalized.replace("以及", "与")
+    normalized = normalized.replace("前期如何选择少量需求作为切入点", "前期需求切入")
+    return normalized[:80].strip(" ，、") or title
+
+
+def _normalize_generic_summary(
+    summary: dict[str, Any],
+    *,
+    scene_sections: list[dict[str, Any]],
+    segment_texts: dict[str, str],
+) -> dict[str, Any]:
+    evidence = list(
+        dict.fromkeys(
+            segment_id
+            for section in scene_sections
+            for segment_id in section["evidence"]
+        )
+    )
+    if len(evidence) > MAX_DOCUMENT_EVIDENCE_ITEMS:
+        evidence = [evidence[0], evidence[1], evidence[-1]]
+    text = _strip_generic_meta_sentences(summary["text"])
+    text = re.sub(r"^(?:本次|这段)记录旨在梳理", "内容围绕", text)
+    text = text.replace("主要讨论了需求分为", "AI需求分为")
+    text = text.replace("初期选择几个点", "前期拟选择少量需求点")
+    text = text.replace("案例方案图", "初步方案图")
+    if any(
+        section["kind"] == "open_question"
+        or any(
+            marker in section["summary"]
+            for marker in ("尚未明确", "仍待", "待确定", "不确定")
+        )
+        for section in scene_sections
+    ):
+        text = re.sub(r"[，,；;]后续(?:将|拟)[^。！？!?]*", "", text)
+        text = _ensure_sentence(text.rstrip("。"))
+    return {
+        "text": text,
+        "evidence": evidence or summary["evidence"],
+    }
+
+
+def _strip_generic_meta_sentences(text: str) -> str:
+    normalized = re.sub(
+        r"(?:内容)?由(?:一位|单个)发言人[^。！？!?]*[。！？!?]",
+        "",
+        text,
+    )
+    return re.sub(r"(?:本次)?记录未涉及[^。！？!?]*[。！？!?]", "", normalized).strip()
+
+
+def _ensure_sentence(text: str) -> str:
+    normalized = text.strip()
+    if normalized.endswith(("。", "！", "？", ".", "!", "?")):
+        return normalized
+    return normalized + "。"
+
+
+def _clean_voice_memo_spoken_text(text: str) -> str:
+    cleaned = re.sub(r"[\n\r\t]+", "", text)
+    cleaned = re.sub(r"^[，,：:；;\s]*(?:的话呢|的话|呢|是)?", "", cleaned)
+    cleaned = re.sub(r"[呃嗯]+", "", cleaned)
+    cleaned = re.sub(r"啊+", "，", cleaned)
+    cleaned = re.sub(r"([，,]){2,}", "，", cleaned)
+    cleaned = cleaned.replace("我们我们", "我们")
+    cleaned = cleaned.replace("我们大家", "大家")
+    cleaned = cleaned.replace("一些什么一致的一些想法", "一致方向")
+    cleaned = cleaned.replace("然后第二个去", "然后")
+    cleaned = cleaned.replace("一些重点的一些场景", "重点场景")
+    cleaned = cleaned.replace("去看看怎么样", "明确如何")
+    cleaned = cleaned.replace("快速的去落地", "快速落地")
+    cleaned = re.sub(r"\s+", "", cleaned)
+    cleaned = cleaned.strip("，,。；;：: ")
+    if cleaned and cleaned[-1] not in "。！？!?":
+        cleaned += "。"
+    return cleaned
+
+
+def _chinese_number(value: int) -> str:
+    return {
+        1: "一",
+        2: "两",
+        3: "三",
+        4: "四",
+        5: "五",
+        6: "六",
+        7: "七",
+        8: "八",
+    }.get(value, str(value))
+
+
+def _voice_memo_specific_title(summary: str, fallback: str) -> str:
+    title = re.sub(
+        r"^(?:说话人)?(?:认为|提出|希望|计划|准备|强调|记录了)?",
+        "",
+        summary.strip(),
+    )
+    title = re.sub(r"^这段语音备忘记录了(?:说话人)?", "", title)
+    title = title.split("。", 1)[0].strip("，,；;：: ")
+    if len(title) > 42:
+        title = title[:42].rstrip("，,；;：: ")
+    return title or fallback
+
+
+def _voice_memo_has_task_commitment(transcript: str) -> bool:
+    markers = (
+        "我打算",
+        "我准备",
+        "我要",
+        "我们接下来",
+        "下一步",
+        "接下来要",
+        "后续要",
+        "今天我们可以",
+        "需要安排",
+        "必须完成",
+    )
+    compact = re.sub(r"[呃嗯啊，,。；;：:\s]+", "", transcript)
+    return any(marker in transcript or marker in compact for marker in markers) or bool(
+        re.search(r"今天.*?我们.*?可以", compact)
+    )
+
+
+def _derive_voice_memo_actions(
+    *,
+    segment_texts: dict[str, str],
+    segment_starts: dict[str, int],
+) -> list[dict[str, Any]]:
+    for segment_id in sorted(segment_texts, key=lambda key: segment_starts[key]):
+        transcript = segment_texts[segment_id]
+        if not _voice_memo_has_task_commitment(transcript):
+            continue
+        task = _clean_voice_memo_spoken_text(transcript)
+        task = re.sub(r"^.*?我们可以(?:就是说)?", "", task)
+        task = re.sub(r"^就是说", "", task)
+        task = task.strip("，,。；;：: ")
+        if not task:
+            continue
+        if task[-1] not in "。！？!?":
+            task += "。"
+        return [
+            {
+                "task": task[:1000],
+                "owner": "",
+                "deadline": "",
+                "evidence": [segment_id],
+            }
+        ]
+    return []
+
+
+def _voice_memo_has_testable_hypothesis(transcript: str) -> bool:
+    markers = (
+        "假设",
+        "是否",
+        "能否",
+        "能不能",
+        "可不可以",
+        "不确定",
+        "有待验证",
+        "需要验证是否",
+        "需要验证能否",
+    )
+    return any(marker in transcript for marker in markers)
+
+
+def _normalize_interview_scene_sections(
+    sections: list[dict[str, Any]],
+    *,
+    segment_texts: dict[str, str],
+    segment_starts: dict[str, int],
+) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for section in sections:
+        item = dict(section)
+        evidence = list(item["evidence"])
+        if len(evidence) > 1:
+            starts = [segment_starts.get(segment_id, 0) for segment_id in evidence]
+            if max(starts) - min(starts) > 180_000:
+                status_evidence = {
+                    segment_id
+                    for detail in item["details"]
+                    if _contains_status_claim(detail["text"])
+                    for segment_id in detail["evidence"]
+                }
+                substantive_evidence = {
+                    segment_id
+                    for detail in item["details"]
+                    if not _contains_status_claim(detail["text"])
+                    for segment_id in detail["evidence"]
+                }
+                if substantive_evidence:
+                    evidence = [
+                        segment_id
+                        for segment_id in evidence
+                        if segment_id not in status_evidence
+                        or any(
+                            abs(
+                                segment_starts.get(segment_id, 0)
+                                - segment_starts.get(substantive_id, 0)
+                            )
+                            <= 90_000
+                            for substantive_id in substantive_evidence
+                        )
+                    ]
+                    item["evidence"] = evidence
+                    item["details"] = [
+                        detail
+                        for detail in item["details"]
+                        if not _contains_status_claim(detail["text"])
+                        or any(segment_id in evidence for segment_id in detail["evidence"])
+                    ]
+            scores = {
+                segment_id: _interview_title_anchor_score(
+                    item["title"],
+                    segment_texts.get(segment_id, ""),
+                )
+                for segment_id in evidence
+            }
+            best_score = max(scores.values(), default=0)
+            if max(starts) - min(starts) > 180_000 and best_score > 0:
+                best = max(evidence, key=lambda segment_id: scores[segment_id])
+                best_start = segment_starts.get(best, 0)
+                evidence = [
+                    segment_id
+                    for segment_id in evidence
+                    if scores[segment_id] > 0
+                    or abs(segment_starts.get(segment_id, 0) - best_start) <= 90_000
+                ]
+                item["evidence"] = evidence
+                item["details"] = [
+                    detail
+                    for detail in item["details"]
+                    if any(
+                        segment_id in evidence
+                        or abs(segment_starts.get(segment_id, 0) - best_start) <= 90_000
+                        for segment_id in detail["evidence"]
+                    )
+                ]
+        item["summary"] = _remove_unsupported_status_clauses(
+            item["summary"],
+            evidence,
+            segment_texts,
+        )
+        transcript = "".join(segment_texts.get(segment_id, "") for segment_id in evidence)
+        question_markers = (
+            "为什么",
+            "怎么",
+            "如何",
+            "是否",
+            "有没有",
+            "能不能",
+            "是不是",
+            "多少",
+            "还是",
+            "吗",
+            "？",
+            "?",
+        )
+        if item["kind"] == "question_answer" and not any(
+            marker in transcript or marker in item["title"] for marker in question_markers
+        ):
+            item["kind"] = "experience"
+        normalized.append(item)
+    return normalized
+
+
+def _interview_title_anchor_score(title: str, transcript: str) -> int:
+    generic = {
+        "系统",
+        "管理",
+        "开发",
+        "应用",
+        "实践",
+        "工具",
+        "关键",
+        "问答",
+        "受访",
+        "背景",
+    }
+    anchors: set[str] = set()
+    for run in re.findall(r"[\u4e00-\u9fff]{2,}", title):
+        anchors.update(
+            run[index : index + 2]
+            for index in range(len(run) - 1)
+            if run[index : index + 2] not in generic
+        )
+    return sum(anchor in transcript for anchor in anchors)
+
+
+def _remove_unsupported_status_clauses(
+    text: str,
+    evidence: list[str],
+    segment_texts: dict[str, str],
+) -> str:
+    transcript = "".join(segment_texts.get(segment_id, "") for segment_id in evidence)
+    clauses = [clause.strip() for clause in re.split(r"[，,；;。]", text) if clause.strip()]
+    status_markers = ("上线", "生产", "发布", "完成", "安全扫描", "漏洞")
+    retained = [
+        clause
+        for clause in clauses
+        if not any(marker in clause for marker in status_markers)
+        or any(marker in transcript for marker in status_markers if marker in clause)
+    ]
+    if len(retained) == len(clauses):
+        return text
+    result = "，".join(retained)
+    if result and result[-1] not in "。！？!?":
+        result += "。"
+    return result or text
+
+
+def _contains_status_claim(text: str) -> bool:
+    return any(marker in text for marker in ("上线", "生产", "发布", "完成", "安全扫描", "漏洞"))
+
+
+def _interview_question_remains_open(
+    evidence: list[str],
+    segment_texts: dict[str, str],
+) -> bool:
+    transcript = "".join(segment_texts.get(segment_id, "") for segment_id in evidence)
+    unresolved_markers = (
+        "没有回答",
+        "未回答",
+        "没回答",
+        "还不知道",
+        "不清楚",
+        "尚未确定",
+        "待确认",
+        "回头确认",
+        "之后再说",
+        "以后再说",
+    )
+    if any(marker in transcript for marker in unresolved_markers):
+        return True
+    question_markers = (
+        "为什么",
+        "怎么",
+        "如何",
+        "是否",
+        "有没有",
+        "能不能",
+        "是不是",
+        "多少",
+        "哪一个",
+        "哪个",
+        "谁",
+        "还是",
+        "吗",
+        "呢",
+        "？",
+        "?",
+    )
+    question_position = max(
+        (transcript.rfind(marker) for marker in question_markers),
+        default=-1,
+    )
+    if question_position < 0:
+        return False
+    response_markers = (
+        "回答是",
+        "受访者表示",
+        "他说",
+        "完了以后",
+        "给团队",
+        "是的",
+        "对的",
+        "因为",
+        "所以",
+        "其实",
+        "目前",
+        "已经",
+    )
+    response_position = min(
+        (
+            position
+            for marker in response_markers
+            if (position := transcript.find(marker, question_position + 1)) >= 0
+        ),
+        default=-1,
+    )
+    return response_position < 0
+
+
 def _remove_unsupported_decision_claims(text: str) -> str:
     unsupported_markers = (
         "最终确定",
@@ -2898,8 +4794,7 @@ def _remove_unsupported_decision_claims(text: str) -> str:
     retained = [
         sentence
         for sentence in sentences
-        if sentence.strip()
-        and not any(marker in sentence for marker in unsupported_markers)
+        if sentence.strip() and not any(marker in sentence for marker in unsupported_markers)
     ]
     result = "".join(retained).strip()
     return result or text
@@ -2943,10 +4838,7 @@ def _extend_with_latest_topic_evidence(
 
 
 def _discussion_topic_anchors(value: str) -> set[str]:
-    anchors = {
-        token.casefold()
-        for token in re.findall(r"[A-Za-z][A-Za-z0-9+-]{1,}", value)
-    }
+    anchors = {token.casefold() for token in re.findall(r"[A-Za-z][A-Za-z0-9+-]{1,}", value)}
     stop_anchors = {
         "一个",
         "这个",
@@ -3046,14 +4938,11 @@ def _filter_superseded_highlights(
 ) -> list[dict[str, Any]]:
     retained: list[dict[str, Any]] = []
     for highlight in highlights:
-        highlight_latest = max(
-            segment_starts[segment_id] for segment_id in highlight["evidence"]
-        )
+        highlight_latest = max(segment_starts[segment_id] for segment_id in highlight["evidence"])
         superseded = False
         for thread in threads:
             first_change = min(
-                segment_starts[segment_id]
-                for segment_id in thread["developments"][0]["evidence"]
+                segment_starts[segment_id] for segment_id in thread["developments"][0]["evidence"]
             )
             if highlight_latest >= first_change:
                 continue

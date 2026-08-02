@@ -41,7 +41,7 @@ from speech_capture_worker.transcript import (
     TranscriptSegment,
 )
 
-ARTIFACT_SCHEMA_VERSION = "1.3.0"
+ARTIFACT_SCHEMA_VERSION = "1.4.0"
 RAW_TRANSCRIPT_SCHEMA_VERSION = "1.0.0"
 ARTIFACT_STAGE = "artifacts"
 ARTIFACT_CHECKPOINT_KEY = "artifacts_generation"
@@ -50,11 +50,15 @@ RAW_TRANSCRIPT = "transcript.raw.json"
 TRANSCRIPT_MARKDOWN = "transcript.md"
 SPEECH_RECORD = "speech-record.json"
 NOTE_MARKDOWN = "note.md"
+NOTE_EVIDENCE_MARKDOWN = "note.evidence.md"
+TIMELINE_MARKDOWN = "timeline.md"
 ARTIFACT_FILES = (
     RAW_TRANSCRIPT,
     TRANSCRIPT_MARKDOWN,
     SPEECH_RECORD,
     NOTE_MARKDOWN,
+    NOTE_EVIDENCE_MARKDOWN,
+    TIMELINE_MARKDOWN,
 )
 
 
@@ -80,7 +84,7 @@ class ArtifactResult:
 
 
 class ArtifactGenerator:
-    """Generate the four backend artifacts plus a checksummed manifest."""
+    """Generate four user Markdown files and two machine records plus a manifest."""
 
     def __init__(
         self,
@@ -95,6 +99,7 @@ class ArtifactGenerator:
         if not isinstance(force, bool):
             raise InvalidJobRequest("force must be a boolean.")
         job = self.store.get_job(job_id)
+        regenerating_processed = False
         if job.state is JobState.PROCESSED and not force:
             checkpoint = _checkpoint_by_key(
                 self.store.list_checkpoints(job_id, stage=ARTIFACT_STAGE),
@@ -104,14 +109,25 @@ class ArtifactGenerator:
                 raise ArtifactGenerationFailed(
                     "A processed job is missing its artifact checkpoint."
                 )
-            return ArtifactResult(
-                outcome=ArtifactOutcome.ALREADY_GENERATED,
-                job=job,
-                speech_id=checkpoint.payload["speech_id"],
-                artifact_count=int(checkpoint.payload["artifact_count"]),
-                manifest_sha256=checkpoint.payload["manifest_sha256"],
-                package_relative_path=checkpoint.payload["package_relative_path"],
+            current_structuring = _checkpoint_by_key(
+                self.store.list_checkpoints(job_id, stage=STRUCTURING_STAGE),
+                STRUCTURING_CHECKPOINT_KEY,
             )
+            if (
+                current_structuring is not None
+                and checkpoint.payload.get("schema_version") == ARTIFACT_SCHEMA_VERSION
+                and checkpoint.payload.get("structuring_checkpoint_generation")
+                == current_structuring.generation
+            ):
+                return ArtifactResult(
+                    outcome=ArtifactOutcome.ALREADY_GENERATED,
+                    job=job,
+                    speech_id=checkpoint.payload["speech_id"],
+                    artifact_count=int(checkpoint.payload["artifact_count"]),
+                    manifest_sha256=checkpoint.payload["manifest_sha256"],
+                    package_relative_path=checkpoint.payload["package_relative_path"],
+                )
+            regenerating_processed = True
         if job.state not in {JobState.QUALITY_CHECK, JobState.PROCESSED}:
             raise InvalidJobRequest(
                 "Artifact generation requires a quality-check or processed job."
@@ -156,6 +172,11 @@ class ArtifactGenerator:
             structuring_raw.get("document"),
             findings=findings,
             content_type=classification.get("type"),
+        )
+        document = _with_legacy_timeline_sections(
+            document,
+            segments=segments,
+            source_title=job.source_display_name,
         )
         transcript_edits = _transcript_edits(
             structuring_raw.get("transcript_edit_results", structuring_raw["batch_results"])
@@ -211,12 +232,33 @@ class ArtifactGenerator:
             classification=classification,
             document=document,
             alignment_report=alignment_checkpoint.payload,
+            include_evidence=False,
+        )
+        evidence_note_markdown = _build_note_markdown(
+            job=job,
+            speech_id=speech_id,
+            upload=upload,
+            segments=segments,
+            block_ids=block_ids,
+            findings=findings,
+            classification=classification,
+            document=document,
+            alignment_report=alignment_checkpoint.payload,
+            include_evidence=True,
+        )
+        timeline_markdown = _build_timeline_markdown(
+            job=job,
+            segments=segments,
+            transcript_edits=transcript_edits,
+            document=document,
         )
         contents = {
             RAW_TRANSCRIPT: _canonical_json(raw_transcript).encode("utf-8") + b"\n",
             TRANSCRIPT_MARKDOWN: transcript_markdown.encode("utf-8"),
             SPEECH_RECORD: _canonical_json(speech_record).encode("utf-8") + b"\n",
             NOTE_MARKDOWN: note_markdown.encode("utf-8"),
+            NOTE_EVIDENCE_MARKDOWN: evidence_note_markdown.encode("utf-8"),
+            TIMELINE_MARKDOWN: timeline_markdown.encode("utf-8"),
         }
         hashes = {name: hashlib.sha256(content).hexdigest() for name, content in contents.items()}
         for name, content in contents.items():
@@ -245,6 +287,8 @@ class ArtifactGenerator:
                 "manifest_sha256": manifest_sha256,
                 "package_relative_path": package_relative_path,
                 "files": hashes,
+                "alignment_report_generation": alignment_checkpoint.generation,
+                "structuring_checkpoint_generation": structuring_checkpoint.generation,
             },
         )
         current = self.store.get_job(job_id)
@@ -259,7 +303,11 @@ class ArtifactGenerator:
         else:
             result_job = current
         return ArtifactResult(
-            outcome=(ArtifactOutcome.REGENERATED if force else ArtifactOutcome.GENERATED),
+            outcome=(
+                ArtifactOutcome.REGENERATED
+                if force or regenerating_processed
+                else ArtifactOutcome.GENERATED
+            ),
             job=result_job,
             speech_id=speech_id,
             artifact_count=len(contents),
@@ -328,8 +376,7 @@ def _filter_scene_actions(
     action_evidence = {
         segment_id
         for finding in findings
-        if not finding.unsupported
-        and finding.kind.value in {"action_item", "next_step"}
+        if not finding.unsupported and finding.kind.value in {"action_item", "next_step"}
         for segment_id in finding.evidence
     }
     filtered = dict(document)
@@ -433,12 +480,17 @@ def _show_transcript_segment(segment: TranscriptSegment) -> bool:
         return True
     if duration_ms <= 10:
         return False
-    if segment.language and segment.language.casefold() not in {
-        "chinese",
-        "mandarin",
-        "zh",
-        "zh-cn",
-    } and duration_ms < 1000:
+    if (
+        segment.language
+        and segment.language.casefold()
+        not in {
+            "chinese",
+            "mandarin",
+            "zh",
+            "zh-cn",
+        }
+        and duration_ms < 1000
+    ):
         return False
     if duration_ms < 300 and (segment.text or "").strip("，。！？,.!? ") in {
         "啊",
@@ -449,6 +501,53 @@ def _show_transcript_segment(segment: TranscriptSegment) -> bool:
     }:
         return False
     return True
+
+
+def _with_legacy_timeline_sections(
+    document: Any,
+    *,
+    segments: list[TranscriptSegment],
+    source_title: str,
+) -> Any:
+    """Add a deterministic full-range timeline to accepted pre-1.6 documents."""
+
+    if not isinstance(document, dict):
+        return document
+    existing = document.get("timeline_sections")
+    if isinstance(existing, list) and existing:
+        return document
+    transcribed = sorted(
+        (
+            segment
+            for segment in segments
+            if segment.outcome is TranscriptOutcome.TRANSCRIBED and (segment.text or "").strip()
+        ),
+        key=lambda segment: (
+            segment.start_ms,
+            segment.end_ms,
+            segment.segment_sequence,
+        ),
+    )
+    if not transcribed:
+        return document
+    title = document.get("title")
+    if not isinstance(title, str) or not title.strip():
+        title = source_title
+    raw_summary = document.get("summary")
+    summary = raw_summary.get("text") if isinstance(raw_summary, dict) else None
+    if not isinstance(summary, str) or not summary.strip():
+        summary = "本时间段的内容请结合完整校订逐字稿阅读。"
+    upgraded = dict(document)
+    upgraded["timeline_sections"] = [
+        {
+            "title": title.strip(),
+            "summary": summary.strip(),
+            "details": [],
+            "start_segment_id": transcribed[0].segment_id,
+            "end_segment_id": transcribed[-1].segment_id,
+        }
+    ]
+    return upgraded
 
 
 def _build_speech_record(
@@ -537,12 +636,8 @@ def _build_speech_record(
             "worker_package_version": _package_version(),
             "structuring_model_id": structuring_checkpoint.get("model_id"),
             "alignment_report_generation": alignment_report_generation,
-            "recording_context_supplied": (
-                recording_context_from_options(job.options) is not None
-            ),
-            "recording_context_sha256": structuring_checkpoint.get(
-                "recording_context_sha256"
-            ),
+            "recording_context_supplied": (recording_context_from_options(job.options) is not None),
+            "recording_context_sha256": structuring_checkpoint.get("recording_context_sha256"),
             "recording_context_applied": structuring_checkpoint.get(
                 "recording_context_applied", False
             ),
@@ -571,6 +666,7 @@ def _build_note_markdown(
     classification: dict[str, Any],
     document: Any,
     alignment_report: dict[str, Any],
+    include_evidence: bool = True,
 ) -> str:
     content_type = classification.get("type") or "generic"
     supported = [finding for finding in findings if not finding.unsupported]
@@ -591,38 +687,53 @@ def _build_note_markdown(
     )
     headings = render_headings(content_type)
     title = structured["title"]
-    lines = [
-        "---",
-        f"title: {json.dumps(title, ensure_ascii=False)}",
-        f"speech_id: {speech_id}",
-        f"status: {status}",
-        f"content_type: {content_type}",
-        f"duration_seconds: {duration_seconds}",
-        "speakers:",
-    ]
-    lines.extend(f"  - {speaker}" for speaker in speakers)
-    lines.extend(
-        [
-            "tags:",
-            "  - speech-capture",
-            "  - speech-capture/note",
-            "---",
-            "",
-            f"# {title}",
-            "",
-            "> [!abstract] 内容总结",
-            "> " + structured["summary"]["text"],
-            ">",
-            "> 依据：" + _evidence_links(structured["summary"]["evidence"], block_ids, segment_map),
-            "",
-        ]
-    )
+    lines: list[str] = []
+    if include_evidence:
+        lines.extend(
+            [
+                "---",
+                f"title: {json.dumps(title, ensure_ascii=False)}",
+                f"status: {status}",
+                f"content_type: {content_type}",
+                f"speech_id: {speech_id}",
+                f"duration_seconds: {duration_seconds}",
+                "speakers:",
+            ]
+        )
+        lines.extend(f"  - {speaker}" for speaker in speakers)
+        lines.extend(
+            [
+                "tags:",
+                "  - speech-capture",
+                "  - speech-capture/note-evidence",
+                "---",
+                "",
+            ]
+        )
+    lines.extend([f"# {title}", ""])
+    if include_evidence:
+        lines.extend(
+            [
+                "> [!abstract] 内容总结",
+                "> " + structured["summary"]["text"],
+                ">",
+                "> 依据："
+                + _evidence_links(
+                    structured["summary"]["evidence"], block_ids, segment_map
+                ),
+            ]
+        )
+    else:
+        lines.extend(["## 内容总结", "", structured["summary"]["text"]])
+    lines.append("")
     if structured["context"]:
         lines.extend([f"## {headings['context']}", ""])
         for item in structured["context"]:
             lines.append(
-                f"- **{item['title']}**：{item['text']} "
-                f"（{_evidence_links(item['evidence'], block_ids, segment_map)}）"
+                f"- **{item['title']}**：{item['text']}"
+                + _note_evidence_suffix(
+                    item["evidence"], block_ids, segment_map, include_evidence
+                )
             )
         lines.append("")
 
@@ -630,22 +741,21 @@ def _build_note_markdown(
     if structured["highlights"]:
         for item in _unique_evidence_items(structured["highlights"]):
             lines.append(
-                f"- {item['text']} （{_evidence_links(item['evidence'], block_ids, segment_map)}）"
+                f"- {item['text']}"
+                + _note_evidence_suffix(
+                    item["evidence"], block_ids, segment_map, include_evidence
+                )
             )
     else:
         lines.append("暂无可靠的核心结论。")
 
     lines.extend(["", f"## {headings['body']}", ""])
-    body_items = (
-        structured["topics"]
-        if content_type == "meeting"
-        else structured["scene_sections"]
-    )
+    body_items = structured["topics"] if content_type == "meeting" else structured["scene_sections"]
     if body_items:
         kind_labels = scene_section_labels(content_type)
         for index, topic in enumerate(body_items, start=1):
             section_title = topic["title"]
-            if content_type != "meeting":
+            if content_type not in {"meeting", "voice_memo", "generic"}:
                 label = kind_labels.get(topic.get("kind", ""), "内容")
                 section_title = f"{label}｜{section_title}"
             lines.extend(
@@ -653,15 +763,18 @@ def _build_note_markdown(
                     f"### {index}. {section_title}",
                     "",
                     topic["summary"]
-                    + " "
-                    + f"（{_evidence_links(topic['evidence'], block_ids, segment_map)}）",
+                    + _note_evidence_suffix(
+                        topic["evidence"], block_ids, segment_map, include_evidence
+                    ),
                     "",
                 ]
             )
             for detail in _unique_evidence_items(topic["details"]):
                 lines.append(
-                    f"- {detail['text']} "
-                    f"（{_evidence_links(detail['evidence'], block_ids, segment_map)}）"
+                    f"- {detail['text']}"
+                    + _note_evidence_suffix(
+                        detail["evidence"], block_ids, segment_map, include_evidence
+                    )
                 )
             lines.append("")
     else:
@@ -675,35 +788,38 @@ def _build_note_markdown(
         }
         lines.extend(["## 讨论演变与当前方向", ""])
         for thread in structured["discussion_threads"]:
-            initial_evidence = _evidence_links(
-                thread["initial_position"]["evidence"], block_ids, segment_map
-            )
             lines.extend(
                 [
                     f"### {thread['title']}",
                     "",
                     "- **最初建议**："
                     + thread["initial_position"]["text"]
-                    + " "
-                    + f"（{initial_evidence}）",
+                    + _note_evidence_suffix(
+                        thread["initial_position"]["evidence"],
+                        block_ids,
+                        segment_map,
+                        include_evidence,
+                    ),
                 ]
             )
             for development in thread["developments"]:
                 lines.append(
                     "- **后续修正**："
                     + development["text"]
-                    + " "
-                    + f"（{_evidence_links(development['evidence'], block_ids, segment_map)}）"
+                    + _note_evidence_suffix(
+                        development["evidence"], block_ids, segment_map, include_evidence
+                    )
                 )
-            current_evidence = _evidence_links(
-                thread["current_direction"]["evidence"], block_ids, segment_map
-            )
             lines.extend(
                 [
                     "- **当前方向**："
                     + thread["current_direction"]["text"]
-                    + " "
-                    + f"（{current_evidence}）",
+                    + _note_evidence_suffix(
+                        thread["current_direction"]["evidence"],
+                        block_ids,
+                        segment_map,
+                        include_evidence,
+                    ),
                     f"- **状态**：{status_labels[thread['status']]}",
                     "",
                 ]
@@ -713,9 +829,7 @@ def _build_note_markdown(
         lines.extend([f"## {headings['speakers']}", ""])
         for speaker in structured["speaker_summaries"]:
             identity = speaker["display_name"] or speaker["speaker_id"]
-            descriptors = [
-                value for value in (speaker["affiliation"], speaker["role"]) if value
-            ]
+            descriptors = [value for value in (speaker["affiliation"], speaker["role"]) if value]
             if descriptors:
                 identity += f"（{' · '.join(descriptors)}）"
             lines.extend(
@@ -723,8 +837,9 @@ def _build_note_markdown(
                     f"### {identity}",
                     "",
                     speaker["summary"]
-                    + " "
-                    + f"（{_evidence_links(speaker['evidence'], block_ids, segment_map)}）",
+                    + _note_evidence_suffix(
+                        speaker["evidence"], block_ids, segment_map, include_evidence
+                    ),
                     "",
                 ]
             )
@@ -734,7 +849,10 @@ def _build_note_markdown(
         lines.extend([f"## {headings['decisions']}", ""])
         for item in _unique_evidence_items(structured["decisions"]):
             lines.append(
-                f"- {item['text']} （{_evidence_links(item['evidence'], block_ids, segment_map)}）"
+                f"- {item['text']}"
+                + _note_evidence_suffix(
+                    item["evidence"], block_ids, segment_map, include_evidence
+                )
             )
         lines.append("")
 
@@ -748,8 +866,10 @@ def _build_note_markdown(
                 attributes.append(f"截止：{action['deadline']}")
             suffix = f"；{'；'.join(attributes)}" if attributes else ""
             lines.append(
-                f"- [ ] {action['task']}{suffix} "
-                f"（{_evidence_links(action['evidence'], block_ids, segment_map)}）"
+                f"- [ ] {action['task']}{suffix}"
+                + _note_evidence_suffix(
+                    action["evidence"], block_ids, segment_map, include_evidence
+                )
             )
         lines.append("")
     elif content_type == "meeting":
@@ -761,7 +881,10 @@ def _build_note_markdown(
         lines.extend([f"## {headings['risks']}", ""])
         for item in _unique_evidence_items(structured["risks"]):
             lines.append(
-                f"- {item['text']} （{_evidence_links(item['evidence'], block_ids, segment_map)}）"
+                f"- {item['text']}"
+                + _note_evidence_suffix(
+                    item["evidence"], block_ids, segment_map, include_evidence
+                )
             )
         lines.append("")
 
@@ -778,34 +901,36 @@ def _build_note_markdown(
         lines.extend([f"## {headings['questions']}", ""])
         for item in _unique_evidence_items(open_questions):
             lines.append(
-                f"- {item['text']} （{_evidence_links(item['evidence'], block_ids, segment_map)}）"
+                f"- {item['text']}"
+                + _note_evidence_suffix(
+                    item["evidence"], block_ids, segment_map, include_evidence
+                )
             )
         lines.append("")
 
-    if structured["chapters"]:
+    if include_evidence and structured["chapters"]:
         lines.extend(["## 章节导航", ""])
         for chapter in _sort_chapters(structured["chapters"], segment_map):
-            anchor = _evidence_links(
-                chapter["evidence"], block_ids, segment_map
-            ).split("、", 1)[0]
+            anchor = _evidence_links(chapter["evidence"], block_ids, segment_map).split("、", 1)[0]
             lines.append(f"- {anchor} **{chapter['title']}** — {chapter['summary']}")
         lines.append("")
 
-    lines.extend(
-        [
-            "## 会议信息" if content_type == "meeting" else "## 记录信息",
-            "",
-            "| 项目 | 内容 |",
-            "| --- | --- |",
-            f"| 录音文件 | {job.source_display_name} |",
-            f"| 录音时长 | {_format_duration(round(duration_seconds * 1000))} |",
-            f"| 参与者 | {', '.join(speakers) if speakers else '未识别'} |",
-            f"| 完整度 | {'完整' if alignment_report.get('transcript_complete') else '部分'} |",
-            "",
-            "完整逐字稿：[[transcript|打开 transcript.md]]",
-            "",
-        ]
-    )
+    if include_evidence:
+        lines.extend(
+            [
+                "## 会议信息" if content_type == "meeting" else "## 记录信息",
+                "",
+                "| 项目 | 内容 |",
+                "| --- | --- |",
+                f"| 录音文件 | {job.source_display_name} |",
+                f"| 录音时长 | {_format_duration(round(duration_seconds * 1000))} |",
+                f"| 参与者 | {', '.join(speakers) if speakers else '未识别'} |",
+                f"| 完整度 | {'完整' if alignment_report.get('transcript_complete') else '部分'} |",
+                "",
+                "完整逐字稿：[[transcript|打开 transcript.md]]",
+                "",
+            ]
+        )
 
     uncertain_segments = [
         segment
@@ -813,22 +938,29 @@ def _build_note_markdown(
         if segment.outcome in {TranscriptOutcome.INAUDIBLE, TranscriptOutcome.FAILED}
     ]
     if uncertain_segments or unsupported:
-        lines.extend(["> [!warning]- 转写不确定与遗漏"])
+        if include_evidence:
+            lines.extend(["> [!warning]- 转写不确定与遗漏"])
+        else:
+            lines.extend(["## 内容完整度说明", ""])
         if uncertain_segments:
             uncertain_duration_ms = sum(
                 segment.end_ms - segment.start_ms for segment in uncertain_segments
             )
-            lines.append(
-                f"> 共有 {len(uncertain_segments)} 处未稳定转写，合计约 "
-                f"{_format_duration(uncertain_duration_ms)}；"
-                "具体位置已在 [[transcript]] 中标为「听不清」。"
+            uncertainty_text = (
+                f"共有 {len(uncertain_segments)} 处未稳定转写，合计"
+                f"{_format_approximate_duration(uncertain_duration_ms)}。"
             )
+            if include_evidence:
+                uncertainty_text = uncertainty_text.rstrip("。") + (
+                    "；具体位置已在 [[transcript]] 中标为「听不清」。"
+                )
+            lines.append(("> " if include_evidence else "") + uncertainty_text)
             significant = [
                 segment
                 for segment in uncertain_segments
                 if segment.end_ms - segment.start_ms >= 2000
             ]
-            if significant:
+            if include_evidence and significant:
                 lines.append(
                     "> 较长区间："
                     + "、".join(
@@ -836,15 +968,110 @@ def _build_note_markdown(
                     )
                 )
         if unsupported:
-            lines.append(f"> {len(unsupported)} 条提炼结论证据不足，未写入正文。")
+            lines.append(
+                ("> " if include_evidence else "")
+                + f"{len(unsupported)} 条提炼结论证据不足，未写入正文。"
+            )
         lines.append("")
-    lines.extend(
-        [
-            "## 我的补充",
-            "",
-            "",
+    if not include_evidence:
+        lines.extend(
+            [
+                "## 我的补充",
+                "",
+                "",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def _note_evidence_suffix(
+    evidence: list[str] | tuple[str, ...],
+    block_ids: dict[str, str],
+    segment_map: dict[str, TranscriptSegment],
+    include_evidence: bool,
+) -> str:
+    if not include_evidence:
+        return ""
+    return f" （{_evidence_links(evidence, block_ids, segment_map)}）"
+
+
+def _build_timeline_markdown(
+    *,
+    job: JobRecord,
+    segments: list[TranscriptSegment],
+    transcript_edits: dict[str, str],
+    document: Any,
+) -> str:
+    """Render a scene-neutral chronological digest of the corrected transcript."""
+
+    transcribed = [
+        segment
+        for segment in segments
+        if segment.outcome is TranscriptOutcome.TRANSCRIBED
+        and (transcript_edits.get(segment.segment_id, segment.text) or "").strip()
+    ]
+    raw_sections = document.get("timeline_sections") if isinstance(document, dict) else None
+    timeline_sections = raw_sections if isinstance(raw_sections, list) else []
+    if not timeline_sections and transcribed:
+        fallback = _usable_document(document)
+        fallback_summary = (
+            fallback["summary"]["text"]
+            if fallback is not None
+            else "本时间段的内容请结合完整校订逐字稿阅读。"
+        )
+        timeline_sections = [
+            {
+                "title": fallback["title"] if fallback is not None else job.source_display_name,
+                "summary": fallback_summary,
+                "details": [],
+                "start_segment_id": transcribed[0].segment_id,
+                "end_segment_id": transcribed[-1].segment_id,
+            }
         ]
-    )
+
+    segment_map = {segment.segment_id: segment for segment in segments}
+    lines = ["# 按时间阅读", ""]
+    if not timeline_sections:
+        lines.extend(["没有可供提炼的有效语音内容。", ""])
+        return "\n".join(lines)
+
+    for section in timeline_sections:
+        if not isinstance(section, dict):
+            continue
+        start = segment_map.get(section.get("start_segment_id"))
+        end = segment_map.get(section.get("end_segment_id"))
+        title = str(section.get("title") or "未命名时段").strip()
+        summary = str(section.get("summary") or "").strip()
+        if start is None or end is None or not summary:
+            continue
+        lines.extend(
+            [
+                f"## {_format_duration(start.start_ms)}–{_format_duration(end.end_ms)}｜{title}",
+                "",
+                summary,
+                "",
+            ]
+        )
+        details = section.get("details")
+        if isinstance(details, list):
+            for detail in details:
+                if isinstance(detail, str) and detail.strip():
+                    lines.append(f"- {detail.strip()}")
+            if details:
+                lines.append("")
+        uncertain_count = sum(
+            segment.outcome in {TranscriptOutcome.INAUDIBLE, TranscriptOutcome.FAILED}
+            and segment.start_ms < end.end_ms
+            and segment.end_ms > start.start_ms
+            for segment in segments
+        )
+        if uncertain_count:
+            lines.extend(
+                [
+                    f"> 本时段有 {uncertain_count} 处内容未能稳定识别，摘要未对其作推测。",
+                    "",
+                ]
+            )
     return "\n".join(lines)
 
 
@@ -867,6 +1094,7 @@ def _usable_document(value: Any) -> dict[str, Any] | None:
         return None
     normalized = dict(value)
     normalized.setdefault("scene_sections", [])
+    normalized.setdefault("timeline_sections", [])
     return normalized
 
 
@@ -1154,6 +1382,12 @@ def _format_duration(ms: int) -> str:
     hours, remainder = divmod(total_seconds, 3600)
     minutes, seconds = divmod(remainder, 60)
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def _format_approximate_duration(ms: int) -> str:
+    if 0 < ms < 1000:
+        return "不足 1 秒"
+    return f"约 {_format_duration(ms)}"
 
 
 def _speech_id(job_id: str) -> str:
