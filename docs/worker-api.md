@@ -22,9 +22,9 @@ It gives the plugin one consistent interface for local and remote processing whi
 
 ## 3. Planned resources
 
-The canonical implemented schema is checked in at `packages/protocol/openapi.json`. The first Stage F slice only
-implements the three non-private discovery endpoints below; all other resource groups remain reserved until their
-authentication and authorization boundaries are implemented.
+The canonical implemented schema is checked in at `packages/protocol/openapi.json`. Routes shown below are either
+implemented with their authentication and authorization boundaries or explicitly retained as later-stage reserved
+resources.
 
 ```text
 GET    /v1/health
@@ -35,6 +35,8 @@ POST   /v1/pairing/sessions
 POST   /v1/pairing/confirm
 GET    /v1/devices
 DELETE /v1/devices/{device_id}
+POST   /v1/devices/{device_id}/credential-rotations
+POST   /v1/device-credential-rotations/activate
 
 POST   /v1/uploads
 GET    /v1/uploads/{upload_id}
@@ -66,10 +68,10 @@ POST   /v1/diagnostics/export
 
 ### 3.1 Implemented Stage F surface
 
-The checked-in OpenAPI now implements uploads, jobs, lifecycle actions, bounded snapshots and updates, artifact
-listing, and integrity-checked artifact download. Upload status includes exact missing part numbers; the update feed
-is bounded and deliberately excludes transcript text. Pairing, device management, model management, diagnostics,
-and publication lease HTTP routes remain reserved.
+The checked-in OpenAPI now implements pairing, authenticated device management, two-phase credential rotation,
+uploads, jobs, lifecycle actions, bounded snapshots and updates, artifact listing, and integrity-checked artifact
+download. Upload status includes exact missing part numbers; the update feed is bounded and deliberately excludes
+transcript text. Model management, diagnostics, and publication lease HTTP routes remain reserved.
 
 ## 4. Authentication
 
@@ -77,8 +79,9 @@ and publication lease HTTP routes remain reserved.
 
 Local calls still use an application credential. Loopback is not treated as proof of identity.
 
-The initial health, capability, and compatibility-negotiation endpoints contain no job or user content and are the
-only pre-authentication surface. Stateful and private-data endpoints must not be added without credential checks.
+Health, capability, and compatibility negotiation contain no job or user content. Pairing confirmation is also
+pre-authenticated but requires a short-lived, attempt-limited pairing secret. Stateful and private-data endpoints
+must not be added without credential checks.
 
 ### Remote
 
@@ -93,10 +96,11 @@ Pairing creates a per-device revocable credential. Restarting or upgrading the W
 
 Credentials are not stored in the synchronized Vault.
 
-The current API boundary accepts an injected digest-only credential verifier and an explicit Vault allowlist. This
-foundation now has a durable Worker implementation: a local CLI creates a short-lived pairing session,
-`POST /v1/pairing/confirm` returns a per-device token once, and only its digest plus Vault allowlist persists.
-Rotation and authenticated device-management routes remain the next Stage F work items.
+The durable Worker security store retains only credential and pairing-secret digests plus explicit Vault allowlists.
+An authorized device can create a pairing session only within its own Vault scope, list only devices fully contained
+in that scope, and revoke those devices immediately. Rotation is a two-phase handoff: preparation leaves the old
+credential active; activation proves possession of the replacement and atomically switches credentials. A lost
+activation response is safely replayable with the now-active replacement token.
 
 ## 5. Idempotency
 

@@ -17,6 +17,10 @@ from uuid import uuid4
 from speech_capture_worker.api_auth import ApiPrincipal
 from speech_capture_worker.domain import SAFE_IDENTIFIER_PATTERN
 from speech_capture_worker.errors import (
+    CredentialRotationConflict,
+    CredentialRotationExpired,
+    CredentialRotationInvalid,
+    CredentialRotationNotFound,
     DeviceAlreadyPaired,
     DeviceNotFound,
     InvalidJobRequest,
@@ -25,10 +29,12 @@ from speech_capture_worker.errors import (
     PairingSessionNotFound,
 )
 
-SECURITY_SCHEMA_VERSION = 1
+SECURITY_SCHEMA_VERSION = 2
 DEFAULT_PAIRING_TTL_SECONDS = 300
 MAX_PAIRING_TTL_SECONDS = 900
 MAX_PAIRING_ATTEMPTS = 5
+DEFAULT_ROTATION_TTL_SECONDS = 600
+MAX_ROTATION_TTL_SECONDS = 3600
 
 
 @dataclass(frozen=True)
@@ -59,6 +65,24 @@ class PairedDevice:
     created_at: str
     last_used_at: str | None
     revoked_at: str | None
+
+
+@dataclass(frozen=True)
+class PreparedCredentialRotation:
+    rotation_id: str
+    device_id: str
+    bearer_token: str
+    generation: int
+    expires_at: str
+
+
+@dataclass(frozen=True)
+class ActivatedCredentialRotation:
+    rotation_id: str
+    device_id: str
+    credential_id: str
+    generation: int
+    activated_at: str
 
 
 class DeviceSecurityStore:
@@ -246,9 +270,36 @@ class DeviceSecurityStore:
     def list_devices(self) -> list[PairedDevice]:
         with self._lock:
             rows = self._connection.execute(
-                "SELECT * FROM device_credentials ORDER BY created_at, credential_id"
+                """
+                SELECT credentials.*
+                FROM device_credentials AS credentials
+                INNER JOIN (
+                    SELECT device_id, MAX(generation) AS generation
+                    FROM device_credentials
+                    GROUP BY device_id
+                ) AS latest
+                ON latest.device_id = credentials.device_id
+                AND latest.generation = credentials.generation
+                ORDER BY credentials.created_at, credentials.credential_id
+                """
             ).fetchall()
             return [_row_to_device(row) for row in rows]
+
+    def get_device(self, device_id: str) -> PairedDevice:
+        _validate_device_id(device_id)
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT * FROM device_credentials
+                WHERE device_id = ?
+                ORDER BY generation DESC
+                LIMIT 1
+                """,
+                (device_id,),
+            ).fetchone()
+            if row is None:
+                raise DeviceNotFound("The paired device does not exist.")
+            return _row_to_device(row)
 
     def revoke_device(self, device_id: str) -> bool:
         _validate_device_id(device_id)
@@ -267,6 +318,155 @@ class DeviceSecurityStore:
                     raise DeviceNotFound("The paired device does not exist.")
                 return False
             return True
+
+    def prepare_credential_rotation(
+        self,
+        device_id: str,
+        *,
+        ttl_seconds: int = DEFAULT_ROTATION_TTL_SECONDS,
+    ) -> PreparedCredentialRotation:
+        _validate_device_id(device_id)
+        if not isinstance(ttl_seconds, int) or not 60 <= ttl_seconds <= MAX_ROTATION_TTL_SECONDS:
+            raise InvalidJobRequest("Rotation TTL must be between 60 and 3600 seconds.")
+        rotation_id = f"rot_{uuid4().hex}"
+        replacement_token = f"scw_{secrets.token_urlsafe(32)}"
+        replacement_credential_id = f"cred_{uuid4().hex}"
+        now = _utc_now()
+        expires_at = (datetime.fromisoformat(now) + timedelta(seconds=ttl_seconds)).isoformat()
+        generation: int | None = None
+        with self._transaction():
+            active = self._connection.execute(
+                "SELECT * FROM device_credentials "
+                "WHERE device_id = ? AND revoked_at IS NULL",
+                (device_id,),
+            ).fetchone()
+            if active is None:
+                raise DeviceNotFound("The paired device does not exist.")
+            generation = int(active["generation"]) + 1
+            self._connection.execute(
+                "DELETE FROM credential_rotations WHERE device_id = ?",
+                (device_id,),
+            )
+            self._connection.execute(
+                """
+                INSERT INTO credential_rotations (
+                    rotation_id, device_id, current_credential_id,
+                    replacement_credential_id, replacement_token_sha256,
+                    allowed_vault_ids_json, generation, expires_at, created_at, activated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                """,
+                (
+                    rotation_id,
+                    device_id,
+                    str(active["credential_id"]),
+                    replacement_credential_id,
+                    _sha256(replacement_token),
+                    str(active["allowed_vault_ids_json"]),
+                    generation,
+                    expires_at,
+                    now,
+                ),
+            )
+        assert generation is not None
+        return PreparedCredentialRotation(
+            rotation_id=rotation_id,
+            device_id=device_id,
+            bearer_token=replacement_token,
+            generation=generation,
+            expires_at=expires_at,
+        )
+
+    def activate_credential_rotation(
+        self,
+        *,
+        device_id: str,
+        replacement_token: str,
+    ) -> ActivatedCredentialRotation:
+        _validate_device_id(device_id)
+        if (
+            not isinstance(replacement_token, str)
+            or not replacement_token.startswith("scw_")
+            or len(replacement_token) > 512
+        ):
+            raise CredentialRotationInvalid("The replacement credential was not accepted.")
+        digest = _sha256(replacement_token)
+        activated: tuple[str, str, str, int, str] | None = None
+        with self._transaction():
+            rotation = self._connection.execute(
+                "SELECT * FROM credential_rotations WHERE device_id = ?",
+                (device_id,),
+            ).fetchone()
+            if rotation is None:
+                raise CredentialRotationNotFound("The credential rotation does not exist.")
+            if not secrets.compare_digest(
+                digest,
+                str(rotation["replacement_token_sha256"]),
+            ):
+                raise CredentialRotationInvalid("The replacement credential was not accepted.")
+            activated_at = rotation["activated_at"]
+            if activated_at is not None:
+                replacement = self._connection.execute(
+                    "SELECT 1 FROM device_credentials "
+                    "WHERE credential_id = ? AND token_sha256 = ?",
+                    (str(rotation["replacement_credential_id"]), digest),
+                ).fetchone()
+                if replacement is None:
+                    raise CredentialRotationConflict(
+                        "The credential rotation is no longer consistent."
+                    )
+                activated = (
+                    str(rotation["rotation_id"]),
+                    device_id,
+                    str(rotation["replacement_credential_id"]),
+                    int(rotation["generation"]),
+                    str(activated_at),
+                )
+            else:
+                now = _utc_now()
+                if str(rotation["expires_at"]) <= now:
+                    raise CredentialRotationExpired("The credential rotation has expired.")
+                current = self._connection.execute(
+                    "SELECT * FROM device_credentials "
+                    "WHERE credential_id = ? AND device_id = ? AND revoked_at IS NULL",
+                    (str(rotation["current_credential_id"]), device_id),
+                ).fetchone()
+                if current is None:
+                    raise CredentialRotationConflict(
+                        "The active device credential changed before rotation activation."
+                    )
+                self._connection.execute(
+                    "UPDATE device_credentials SET revoked_at = ? WHERE credential_id = ?",
+                    (now, str(current["credential_id"])),
+                )
+                self._connection.execute(
+                    """
+                    INSERT INTO device_credentials (
+                        credential_id, device_id, token_sha256, allowed_vault_ids_json,
+                        generation, created_at, last_used_at, revoked_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL)
+                    """,
+                    (
+                        str(rotation["replacement_credential_id"]),
+                        device_id,
+                        digest,
+                        str(rotation["allowed_vault_ids_json"]),
+                        int(rotation["generation"]),
+                        now,
+                    ),
+                )
+                self._connection.execute(
+                    "UPDATE credential_rotations SET activated_at = ? WHERE rotation_id = ?",
+                    (now, str(rotation["rotation_id"])),
+                )
+                activated = (
+                    str(rotation["rotation_id"]),
+                    device_id,
+                    str(rotation["replacement_credential_id"]),
+                    int(rotation["generation"]),
+                    now,
+                )
+        assert activated is not None
+        return ActivatedCredentialRotation(*activated)
 
     def _migrate(self) -> None:
         current = int(self._connection.execute("PRAGMA user_version").fetchone()[0])
@@ -299,7 +499,39 @@ class DeviceSecurityStore:
                 );
                 CREATE UNIQUE INDEX device_credentials_active_device_idx
                 ON device_credentials (device_id) WHERE revoked_at IS NULL;
-                PRAGMA user_version = 1;
+                CREATE TABLE credential_rotations (
+                    rotation_id TEXT PRIMARY KEY,
+                    device_id TEXT NOT NULL UNIQUE,
+                    current_credential_id TEXT NOT NULL,
+                    replacement_credential_id TEXT NOT NULL UNIQUE,
+                    replacement_token_sha256 TEXT NOT NULL UNIQUE,
+                    allowed_vault_ids_json TEXT NOT NULL,
+                    generation INTEGER NOT NULL CHECK (generation > 1),
+                    expires_at TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    activated_at TEXT
+                );
+                PRAGMA user_version = 2;
+                COMMIT;
+                """
+            )
+        elif current == 1:
+            self._connection.executescript(
+                """
+                BEGIN IMMEDIATE;
+                CREATE TABLE credential_rotations (
+                    rotation_id TEXT PRIMARY KEY,
+                    device_id TEXT NOT NULL UNIQUE,
+                    current_credential_id TEXT NOT NULL,
+                    replacement_credential_id TEXT NOT NULL UNIQUE,
+                    replacement_token_sha256 TEXT NOT NULL UNIQUE,
+                    allowed_vault_ids_json TEXT NOT NULL,
+                    generation INTEGER NOT NULL CHECK (generation > 1),
+                    expires_at TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    activated_at TEXT
+                );
+                PRAGMA user_version = 2;
                 COMMIT;
                 """
             )

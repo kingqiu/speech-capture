@@ -121,6 +121,20 @@ class PairingConfirmRequestSchema(PublicSchema):
     pairing_code: str = Field(min_length=1, max_length=128)
 
 
+class PairingSessionCreateSchema(PublicSchema):
+    device_id: SafeIdentifier
+    allowed_vault_ids: tuple[SafeIdentifier, ...] = Field(min_length=1, max_length=64)
+    ttl_seconds: int = Field(default=300, ge=30, le=900)
+
+
+class PairingSessionSecretSchema(PublicSchema):
+    session_id: str = Field(pattern=r"^pair_[0-9a-f]{32}$")
+    pairing_code: str
+    device_id: SafeIdentifier
+    allowed_vault_ids: tuple[SafeIdentifier, ...]
+    expires_at: str
+
+
 class IssuedDeviceCredentialSchema(PublicSchema):
     credential_id: str = Field(pattern=r"^cred_[0-9a-f]{32}$")
     device_id: SafeIdentifier
@@ -128,6 +142,49 @@ class IssuedDeviceCredentialSchema(PublicSchema):
     allowed_vault_ids: tuple[SafeIdentifier, ...]
     generation: int = Field(gt=0)
     created_at: str
+
+
+class PairedDeviceSchema(PublicSchema):
+    credential_id: str = Field(pattern=r"^cred_[0-9a-f]{32}$")
+    device_id: SafeIdentifier
+    allowed_vault_ids: tuple[SafeIdentifier, ...]
+    generation: int = Field(gt=0)
+    created_at: str
+    last_used_at: str | None
+    revoked_at: str | None
+
+
+class PairedDeviceListResponse(PublicSchema):
+    devices: tuple[PairedDeviceSchema, ...]
+
+
+class DeviceRevocationResponse(PublicSchema):
+    device_id: SafeIdentifier
+    revoked: bool
+
+
+class CredentialRotationPrepareRequestSchema(PublicSchema):
+    ttl_seconds: int = Field(default=600, ge=60, le=3600)
+
+
+class PreparedCredentialRotationSchema(PublicSchema):
+    rotation_id: str = Field(pattern=r"^rot_[0-9a-f]{32}$")
+    device_id: SafeIdentifier
+    bearer_token: str
+    generation: int = Field(gt=1)
+    expires_at: str
+
+
+class CredentialRotationActivateRequestSchema(PublicSchema):
+    device_id: SafeIdentifier
+
+
+class ActivatedCredentialRotationSchema(PublicSchema):
+    rotation_id: str = Field(pattern=r"^rot_[0-9a-f]{32}$")
+    device_id: SafeIdentifier
+    credential_id: str = Field(pattern=r"^cred_[0-9a-f]{32}$")
+    generation: int = Field(gt=1)
+    activated_at: str
 
 
 class UploadCreateSchema(PublicSchema):

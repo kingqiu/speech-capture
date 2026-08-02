@@ -1258,7 +1258,7 @@ FastAPI，并加入设备身份和 Vault 授权。阶段 H 的 Obsidian 前端�
 - [x] 实现设备配对。
 - [ ] 实现长期凭据的安全保存。
 - [x] 实现 Vault 级授权。
-- [ ] 实现设备撤销和凭据轮换。
+- [x] 实现设备撤销和凭据轮换。
 - [ ] 配置 HTTPS。
 - [ ] 编写 Tailscale 推荐接入方案，同时允许其他安全网络方案。
 - [ ] 对错误消息和诊断日志做脱敏。
@@ -2595,3 +2595,24 @@ Stage E 已在 `9872f20 Implement atomic Vault publication` 提交并推送到
 
 当前注入式验证器只完成 API 安全边界，不等同于持久设备身份。下一步严格实现设备配对，再完成
 长期凭据、Vault 授权管理、撤销/轮换、HTTPS 和安全网络接入；不得提前进入阶段 G 或前端。
+
+---
+
+## 48. 2026-08-02 Stage F 设备管理与两阶段凭据轮换
+
+Stage F 的设备管理、撤销和 Worker 侧凭据轮换已经完成：
+
+- 已认证设备只能在自身 Vault allowlist 的子集内创建新配对会话；跨 Vault 请求返回脱敏拒绝；
+- 设备列表仅显示调用者可管理的设备，不返回 token 或 hash；越权撤销隐藏为不存在，获授权撤销
+  立即使目标 token 失效；
+- `security.sqlite3` schema `2` 新增凭据轮换状态，只保存 replacement token SHA-256；旧 schema `1`
+  原位迁移且保留已有凭据；
+- 轮换分准备和激活两步：准备期间旧 token 继续工作，replacement token 尚不能访问私人 API；激活
+  在一个事务中撤销旧 token 并启用 replacement token；激活响应丢失后可安全重放；
+- 重复准备只替换尚未激活的候选，不撤销当前凭据；错误、过期或被替换的候选均不能改变当前
+  认证状态；
+- OpenAPI 与 Python/TypeScript 类型已同步；全套 `363` 项测试、Ruff、`compileall` 和类型漂移
+  检查通过。
+
+下一步严格进入 Stage F 的 HTTPS 配置与 Tailscale/其他安全网络接入说明，随后完成错误消息和诊断
+日志脱敏审计。客户端长期 token 的系统保护存储仍属于后续 Obsidian 端，不提前进入阶段 H。

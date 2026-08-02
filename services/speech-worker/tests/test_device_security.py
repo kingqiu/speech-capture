@@ -12,6 +12,8 @@ from speech_capture_worker.device_security import (
     DeviceSecurityStore,
 )
 from speech_capture_worker.errors import (
+    CredentialRotationExpired,
+    CredentialRotationInvalid,
     DeviceAlreadyPaired,
     PairingCodeInvalid,
     PairingSessionExpired,
@@ -150,3 +152,296 @@ def test_pairing_confirmation_api_issues_a_working_digest_backed_credential(tmp_
     assert confirmation.json()["device_id"] == "laptop_api"
     assert authorized.status_code == 200
     assert authorized.json() == {"jobs": []}
+
+
+def test_authorized_device_can_pair_list_and_revoke_only_within_its_vault_scope(
+    tmp_path,
+) -> None:
+    database = tmp_path / "security.sqlite3"
+    with (
+        DeviceSecurityStore(database) as security,
+        JobStore(tmp_path / "worker.sqlite3") as jobs,
+    ):
+        primary_session = security.create_pairing_session(
+            device_id="laptop_primary",
+            allowed_vault_ids=("vault_one", "vault_two"),
+        )
+        primary = security.confirm_pairing(
+            session_id=primary_session.session_id,
+            pairing_code=primary_session.pairing_code,
+        )
+        hidden_session = security.create_pairing_session(
+            device_id="laptop_hidden",
+            allowed_vault_ids=("vault_private",),
+        )
+        security.confirm_pairing(
+            session_id=hidden_session.session_id,
+            pairing_code=hidden_session.pairing_code,
+        )
+        client = TestClient(
+            create_app(
+                store=jobs,
+                credential_verifier=security,
+                device_security_store=security,
+            )
+        )
+        headers = {"Authorization": f"Bearer {primary.bearer_token}"}
+
+        denied = client.post(
+            "/v1/pairing/sessions",
+            json={
+                "device_id": "phone_denied",
+                "allowed_vault_ids": ["vault_private"],
+            },
+            headers=headers,
+        )
+        created = client.post(
+            "/v1/pairing/sessions",
+            json={
+                "device_id": "phone_secondary",
+                "allowed_vault_ids": ["vault_two"],
+            },
+            headers=headers,
+        )
+        confirmation = client.post(
+            "/v1/pairing/confirm",
+            json={
+                "session_id": created.json()["session_id"],
+                "pairing_code": created.json()["pairing_code"],
+            },
+        )
+        secondary_token = confirmation.json()["bearer_token"]
+        devices = client.get("/v1/devices", headers=headers)
+        hidden_revocation = client.delete("/v1/devices/laptop_hidden", headers=headers)
+        revocation = client.delete("/v1/devices/phone_secondary", headers=headers)
+        rejected = client.get(
+            "/v1/jobs",
+            params={"vault_id": "vault_two"},
+            headers={"Authorization": f"Bearer {secondary_token}"},
+        )
+
+    assert denied.status_code == 403
+    assert "vault_private" not in denied.text
+    assert created.status_code == 200
+    assert confirmation.status_code == 200
+    assert devices.status_code == 200
+    assert {device["device_id"] for device in devices.json()["devices"]} == {
+        "laptop_primary",
+        "phone_secondary",
+    }
+    assert "bearer_token" not in devices.text
+    assert "token_sha256" not in devices.text
+    assert hidden_revocation.status_code == 404
+    assert "vault_private" not in hidden_revocation.text
+    assert revocation.json() == {"device_id": "phone_secondary", "revoked": True}
+    assert rejected.status_code == 401
+
+
+def test_two_phase_rotation_keeps_old_token_until_replacement_is_activated(
+    tmp_path,
+) -> None:
+    database = tmp_path / "security.sqlite3"
+    with DeviceSecurityStore(database) as security:
+        session = security.create_pairing_session(
+            device_id="laptop_rotate",
+            allowed_vault_ids=("vault_one",),
+        )
+        original = security.confirm_pairing(
+            session_id=session.session_id,
+            pairing_code=session.pairing_code,
+        )
+        prepared = security.prepare_credential_rotation("laptop_rotate")
+
+        assert security.authenticate(original.bearer_token) is not None
+        assert security.authenticate(prepared.bearer_token) is None
+        with pytest.raises(CredentialRotationInvalid):
+            security.activate_credential_rotation(
+                device_id="laptop_rotate",
+                replacement_token="scw_wrong",
+            )
+
+    with DeviceSecurityStore(database) as restarted:
+        assert restarted.authenticate(original.bearer_token) is not None
+        activated = restarted.activate_credential_rotation(
+            device_id="laptop_rotate",
+            replacement_token=prepared.bearer_token,
+        )
+        replayed = restarted.activate_credential_rotation(
+            device_id="laptop_rotate",
+            replacement_token=prepared.bearer_token,
+        )
+
+        assert restarted.authenticate(original.bearer_token) is None
+        replacement_principal = restarted.authenticate(prepared.bearer_token)
+
+    assert activated == replayed
+    assert activated.generation == 2
+    assert replacement_principal is not None
+    assert replacement_principal.allowed_vault_ids == {"vault_one"}
+    database_text = database.read_bytes().decode("utf-8", errors="ignore")
+    assert original.bearer_token not in database_text
+    assert prepared.bearer_token not in database_text
+
+
+def test_expired_or_replaced_rotation_never_revokes_the_active_token(tmp_path) -> None:
+    database = tmp_path / "security.sqlite3"
+    with DeviceSecurityStore(database) as security:
+        session = security.create_pairing_session(
+            device_id="laptop_expiring",
+            allowed_vault_ids=("vault_one",),
+        )
+        original = security.confirm_pairing(
+            session_id=session.session_id,
+            pairing_code=session.pairing_code,
+        )
+        replaced = security.prepare_credential_rotation("laptop_expiring")
+        current = security.prepare_credential_rotation("laptop_expiring")
+
+        with pytest.raises(CredentialRotationInvalid):
+            security.activate_credential_rotation(
+                device_id="laptop_expiring",
+                replacement_token=replaced.bearer_token,
+            )
+
+    connection = sqlite3.connect(database)
+    connection.execute(
+        "UPDATE credential_rotations SET expires_at = ? WHERE rotation_id = ?",
+        ("2000-01-01T00:00:00+00:00", current.rotation_id),
+    )
+    connection.commit()
+    connection.close()
+
+    with DeviceSecurityStore(database) as restarted:
+        with pytest.raises(CredentialRotationExpired):
+            restarted.activate_credential_rotation(
+                device_id="laptop_expiring",
+                replacement_token=current.bearer_token,
+            )
+        assert restarted.authenticate(original.bearer_token) is not None
+
+
+def test_rotation_api_survives_lost_activation_response_and_switches_authentication(
+    tmp_path,
+) -> None:
+    with (
+        DeviceSecurityStore(tmp_path / "security.sqlite3") as security,
+        JobStore(tmp_path / "worker.sqlite3") as jobs,
+    ):
+        session = security.create_pairing_session(
+            device_id="laptop_api_rotate",
+            allowed_vault_ids=("vault_one",),
+        )
+        original = security.confirm_pairing(
+            session_id=session.session_id,
+            pairing_code=session.pairing_code,
+        )
+        client = TestClient(
+            create_app(
+                store=jobs,
+                credential_verifier=security,
+                device_security_store=security,
+            )
+        )
+        old_headers = {"Authorization": f"Bearer {original.bearer_token}"}
+        hidden = client.post(
+            "/v1/devices/another_device/credential-rotations",
+            json={},
+            headers=old_headers,
+        )
+        prepared = client.post(
+            "/v1/devices/laptop_api_rotate/credential-rotations",
+            json={},
+            headers=old_headers,
+        )
+        replacement_token = prepared.json()["bearer_token"]
+        replacement_headers = {"Authorization": f"Bearer {replacement_token}"}
+        before_activation = client.get(
+            "/v1/jobs",
+            params={"vault_id": "vault_one"},
+            headers=replacement_headers,
+        )
+        activation = client.post(
+            "/v1/device-credential-rotations/activate",
+            json={"device_id": "laptop_api_rotate"},
+            headers=replacement_headers,
+        )
+        replay = client.post(
+            "/v1/device-credential-rotations/activate",
+            json={"device_id": "laptop_api_rotate"},
+            headers=replacement_headers,
+        )
+        old_rejected = client.get(
+            "/v1/jobs",
+            params={"vault_id": "vault_one"},
+            headers=old_headers,
+        )
+        replacement_accepted = client.get(
+            "/v1/jobs",
+            params={"vault_id": "vault_one"},
+            headers=replacement_headers,
+        )
+
+    assert hidden.status_code == 404
+    assert prepared.status_code == 200
+    assert before_activation.status_code == 401
+    assert activation.status_code == 200
+    assert replay.json() == activation.json()
+    assert old_rejected.status_code == 401
+    assert replacement_accepted.status_code == 200
+
+
+def test_security_schema_one_is_migrated_without_losing_credentials(tmp_path) -> None:
+    database = tmp_path / "security.sqlite3"
+    connection = sqlite3.connect(database)
+    connection.executescript(
+        """
+        CREATE TABLE pairing_sessions (
+            session_id TEXT PRIMARY KEY,
+            code_sha256 TEXT NOT NULL,
+            device_id TEXT NOT NULL,
+            allowed_vault_ids_json TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            failed_attempts INTEGER NOT NULL CHECK (failed_attempts >= 0),
+            consumed_at TEXT,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE device_credentials (
+            credential_id TEXT PRIMARY KEY,
+            device_id TEXT NOT NULL,
+            token_sha256 TEXT NOT NULL UNIQUE,
+            allowed_vault_ids_json TEXT NOT NULL,
+            generation INTEGER NOT NULL CHECK (generation > 0),
+            created_at TEXT NOT NULL,
+            last_used_at TEXT,
+            revoked_at TEXT,
+            UNIQUE (device_id, generation)
+        );
+        CREATE UNIQUE INDEX device_credentials_active_device_idx
+        ON device_credentials (device_id) WHERE revoked_at IS NULL;
+        PRAGMA user_version = 1;
+        """
+    )
+    connection.close()
+
+    with DeviceSecurityStore(database) as security:
+        session = security.create_pairing_session(
+            device_id="laptop_migrated",
+            allowed_vault_ids=("vault_one",),
+        )
+        issued = security.confirm_pairing(
+            session_id=session.session_id,
+            pairing_code=session.pairing_code,
+        )
+        prepared = security.prepare_credential_rotation("laptop_migrated")
+
+        assert security.authenticate(issued.bearer_token) is not None
+        assert prepared.generation == 2
+
+    connection = sqlite3.connect(database)
+    version = connection.execute("PRAGMA user_version").fetchone()[0]
+    rotation_table = connection.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'credential_rotations'"
+    ).fetchone()
+    connection.close()
+    assert version == 2
+    assert rotation_table == ("credential_rotations",)

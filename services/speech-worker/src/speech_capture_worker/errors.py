@@ -171,6 +171,22 @@ class DeviceNotFound(WorkerCoreError):
     code = "DEVICE_NOT_FOUND"
 
 
+class CredentialRotationNotFound(WorkerCoreError):
+    code = "CREDENTIAL_ROTATION_NOT_FOUND"
+
+
+class CredentialRotationExpired(WorkerCoreError):
+    code = "CREDENTIAL_ROTATION_EXPIRED"
+
+
+class CredentialRotationInvalid(WorkerCoreError):
+    code = "CREDENTIAL_ROTATION_INVALID"
+
+
+class CredentialRotationConflict(WorkerCoreError):
+    code = "CREDENTIAL_ROTATION_CONFLICT"
+
+
 class PublicationLeaseConflict(WorkerCoreError):
     code = "PUBLICATION_LEASE_CONFLICT"
 

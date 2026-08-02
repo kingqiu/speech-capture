@@ -1,7 +1,15 @@
 // Generated Worker protocol wire types. Do not edit manually.
-export const OPENAPI_SHA256 = "f693de0586e4bfdf685d671c30a6964e63421ea22078ba34b135566656571825" as const;
+export const OPENAPI_SHA256 = "8bed2318f02dd8cd4b181ffb8ae6dccd626d709af6cbe44bb74de95e6a45ca5d" as const;
 export const OPENAPI_VERSION = "3.1.0" as const;
 export const PROTOCOL_VERSION = "1.0.0" as const;
+
+export interface ActivatedCredentialRotationSchema {
+  readonly activated_at: string;
+  readonly credential_id: string;
+  readonly device_id: string;
+  readonly generation: number;
+  readonly rotation_id: string;
+}
 
 export interface ApiErrorResponse {
   readonly error: ApiErrorSchema;
@@ -55,6 +63,19 @@ export interface CompatibilityResponse {
   readonly issues: ReadonlyArray<CompatibilityIssue>;
   readonly missing_features: ReadonlyArray<string>;
   readonly protocol_version: string | null;
+}
+
+export interface CredentialRotationActivateRequestSchema {
+  readonly device_id: string;
+}
+
+export interface CredentialRotationPrepareRequestSchema {
+  readonly ttl_seconds?: number;
+}
+
+export interface DeviceRevocationResponse {
+  readonly device_id: string;
+  readonly revoked: boolean;
 }
 
 export type DiarizationStatus =
@@ -186,9 +207,45 @@ export type ModelProfile =
   | "accuracy"
   | "speed";
 
+export interface PairedDeviceListResponse {
+  readonly devices: ReadonlyArray<PairedDeviceSchema>;
+}
+
+export interface PairedDeviceSchema {
+  readonly allowed_vault_ids: ReadonlyArray<string>;
+  readonly created_at: string;
+  readonly credential_id: string;
+  readonly device_id: string;
+  readonly generation: number;
+  readonly last_used_at: string | null;
+  readonly revoked_at: string | null;
+}
+
 export interface PairingConfirmRequestSchema {
   readonly pairing_code: string;
   readonly session_id: string;
+}
+
+export interface PairingSessionCreateSchema {
+  readonly allowed_vault_ids: ReadonlyArray<string>;
+  readonly device_id: string;
+  readonly ttl_seconds?: number;
+}
+
+export interface PairingSessionSecretSchema {
+  readonly allowed_vault_ids: ReadonlyArray<string>;
+  readonly device_id: string;
+  readonly expires_at: string;
+  readonly pairing_code: string;
+  readonly session_id: string;
+}
+
+export interface PreparedCredentialRotationSchema {
+  readonly bearer_token: string;
+  readonly device_id: string;
+  readonly expires_at: string;
+  readonly generation: number;
+  readonly rotation_id: string;
 }
 
 export type ProtocolCapability =

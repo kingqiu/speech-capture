@@ -105,6 +105,10 @@ def test_openapi_is_versioned_strict_and_has_stable_operation_ids() -> None:
     assert set(schema["paths"]) == {
         "/v1/capabilities",
         "/v1/capabilities/negotiate",
+        "/v1/device-credential-rotations/activate",
+        "/v1/devices",
+        "/v1/devices/{device_id}",
+        "/v1/devices/{device_id}/credential-rotations",
         "/v1/health",
         "/v1/jobs",
         "/v1/jobs/{job_id}",
@@ -117,6 +121,7 @@ def test_openapi_is_versioned_strict_and_has_stable_operation_ids() -> None:
         "/v1/jobs/{job_id}/retry",
         "/v1/jobs/{job_id}/snapshot",
         "/v1/pairing/confirm",
+        "/v1/pairing/sessions",
         "/v1/uploads",
         "/v1/uploads/{upload_id}",
         "/v1/uploads/{upload_id}/complete",
@@ -146,8 +151,10 @@ def test_openapi_is_versioned_strict_and_has_stable_operation_ids() -> None:
     }
     assert private_operations == {
         "completeUpload",
+        "activateDeviceCredentialRotation",
         "cancelJob",
         "createJob",
+        "createPairingSession",
         "createUpload",
         "downloadJobArtifact",
         "getJob",
@@ -156,9 +163,12 @@ def test_openapi_is_versioned_strict_and_has_stable_operation_ids() -> None:
         "getUpload",
         "listJobArtifacts",
         "listJobs",
+        "listDevices",
         "pauseJob",
+        "prepareDeviceCredentialRotation",
         "putUploadPart",
         "resumeJob",
+        "revokeDevice",
         "retryJob",
     }
     for path, methods in schema["paths"].items():

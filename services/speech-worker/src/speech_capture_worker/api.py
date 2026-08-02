@@ -12,6 +12,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from speech_capture_worker import __version__
 from speech_capture_worker.api_auth import ApiPrincipal, CredentialAuthenticator
 from speech_capture_worker.api_schemas import (
+    ActivatedCredentialRotationSchema,
     ApiErrorResponse,
     ApiErrorSchema,
     ArtifactListResponse,
@@ -20,6 +21,9 @@ from speech_capture_worker.api_schemas import (
     CapabilitiesResponse,
     CompatibilityRequestSchema,
     CompatibilityResponse,
+    CredentialRotationActivateRequestSchema,
+    CredentialRotationPrepareRequestSchema,
+    DeviceRevocationResponse,
     HealthResponse,
     IssuedDeviceCredentialSchema,
     JobActionEnvelope,
@@ -32,7 +36,12 @@ from speech_capture_worker.api_schemas import (
     JobSnapshotResponse,
     JobUpdateSchema,
     JobUpdatesResponse,
+    PairedDeviceListResponse,
+    PairedDeviceSchema,
     PairingConfirmRequestSchema,
+    PairingSessionCreateSchema,
+    PairingSessionSecretSchema,
+    PreparedCredentialRotationSchema,
     ProvisionalTranscriptSchema,
     SafeIdentifier,
     Sha256String,
@@ -164,18 +173,12 @@ def create_app(
             message=exc.message,
         )
 
-    def require_principal(
+    def require_bearer_token(
         credentials: Annotated[
             HTTPAuthorizationCredentials | None,
             Depends(bearer),
         ],
-    ) -> ApiPrincipal:
-        if credential_verifier is None:
-            raise ApiProblem(
-                503,
-                "AUTHENTICATION_NOT_CONFIGURED",
-                "Private Worker API access is not configured.",
-            )
+    ) -> str:
         if credentials is None or credentials.scheme.lower() != "bearer":
             raise ApiProblem(
                 401,
@@ -183,7 +186,18 @@ def create_app(
                 "A valid bearer credential is required.",
                 headers={"WWW-Authenticate": "Bearer"},
             )
-        principal = credential_verifier.authenticate(credentials.credentials)
+        return credentials.credentials
+
+    def require_principal(
+        token: Annotated[str, Depends(require_bearer_token)],
+    ) -> ApiPrincipal:
+        if credential_verifier is None:
+            raise ApiProblem(
+                503,
+                "AUTHENTICATION_NOT_CONFIGURED",
+                "Private Worker API access is not configured.",
+            )
+        principal = credential_verifier.authenticate(token)
         if principal is None:
             raise ApiProblem(
                 401,
@@ -203,6 +217,7 @@ def create_app(
         return store
 
     Principal = Annotated[ApiPrincipal, Depends(require_principal)]
+    BearerToken = Annotated[str, Depends(require_bearer_token)]
     Store = Annotated[JobStore, Depends(require_store)]
 
     @app.get(
@@ -278,6 +293,102 @@ def create_app(
             pairing_code=request.pairing_code,
         )
         return IssuedDeviceCredentialSchema.model_validate(asdict(issued))
+
+    @app.post(
+        "/v1/pairing/sessions",
+        response_model=PairingSessionSecretSchema,
+        operation_id="createPairingSession",
+        tags=["pairing"],
+        responses=PRIVATE_ERROR_RESPONSES,
+    )
+    def create_pairing_session(
+        request: PairingSessionCreateSchema,
+        principal: Principal,
+    ) -> PairingSessionSecretSchema:
+        security_store = _require_device_security_store(device_security_store)
+        requested_vaults = set(request.allowed_vault_ids)
+        if not requested_vaults <= principal.allowed_vault_ids:
+            raise ApiProblem(
+                403,
+                "VAULT_ACCESS_DENIED",
+                "A device can grant only its own authorized Vault scope.",
+            )
+        session = security_store.create_pairing_session(
+            device_id=request.device_id,
+            allowed_vault_ids=request.allowed_vault_ids,
+            ttl_seconds=request.ttl_seconds,
+        )
+        return PairingSessionSecretSchema.model_validate(asdict(session))
+
+    @app.get(
+        "/v1/devices",
+        response_model=PairedDeviceListResponse,
+        operation_id="listDevices",
+        tags=["devices"],
+        responses=PRIVATE_ERROR_RESPONSES,
+    )
+    def list_devices(principal: Principal) -> PairedDeviceListResponse:
+        security_store = _require_device_security_store(device_security_store)
+        visible = tuple(
+            PairedDeviceSchema.model_validate(asdict(device))
+            for device in security_store.list_devices()
+            if set(device.allowed_vault_ids) <= principal.allowed_vault_ids
+        )
+        return PairedDeviceListResponse(devices=visible)
+
+    @app.delete(
+        "/v1/devices/{device_id}",
+        response_model=DeviceRevocationResponse,
+        operation_id="revokeDevice",
+        tags=["devices"],
+        responses=PRIVATE_ERROR_RESPONSES,
+    )
+    def revoke_device(device_id: str, principal: Principal) -> DeviceRevocationResponse:
+        security_store = _require_device_security_store(device_security_store)
+        device = security_store.get_device(device_id)
+        if not set(device.allowed_vault_ids) <= principal.allowed_vault_ids:
+            raise ApiProblem(404, "RESOURCE_NOT_FOUND", "The requested resource was not found.")
+        revoked = security_store.revoke_device(device_id)
+        return DeviceRevocationResponse(device_id=device_id, revoked=revoked)
+
+    @app.post(
+        "/v1/devices/{device_id}/credential-rotations",
+        response_model=PreparedCredentialRotationSchema,
+        operation_id="prepareDeviceCredentialRotation",
+        tags=["devices"],
+        responses=PRIVATE_ERROR_RESPONSES,
+    )
+    def prepare_device_credential_rotation(
+        device_id: str,
+        request: CredentialRotationPrepareRequestSchema,
+        principal: Principal,
+    ) -> PreparedCredentialRotationSchema:
+        if device_id != principal.device_id:
+            raise ApiProblem(404, "RESOURCE_NOT_FOUND", "The requested resource was not found.")
+        security_store = _require_device_security_store(device_security_store)
+        prepared = security_store.prepare_credential_rotation(
+            device_id,
+            ttl_seconds=request.ttl_seconds,
+        )
+        return PreparedCredentialRotationSchema.model_validate(asdict(prepared))
+
+    @app.post(
+        "/v1/device-credential-rotations/activate",
+        response_model=ActivatedCredentialRotationSchema,
+        operation_id="activateDeviceCredentialRotation",
+        tags=["devices"],
+        responses=PRIVATE_ERROR_RESPONSES,
+    )
+    def activate_device_credential_rotation(
+        request: CredentialRotationActivateRequestSchema,
+        replacement_token: BearerToken,
+    ) -> ActivatedCredentialRotationSchema:
+        security_store = _require_device_security_store(device_security_store)
+        activated = security_store.activate_credential_rotation(
+            device_id=request.device_id,
+            replacement_token=replacement_token,
+        )
+        return ActivatedCredentialRotationSchema.model_validate(asdict(activated))
 
     @app.post(
         "/v1/uploads",
@@ -724,7 +835,17 @@ def _worker_error_status(exc: WorkerCoreError) -> int:
         return 401
     if exc.code == "PAIRING_SESSION_EXPIRED":
         return 410
-    if exc.code in {"PAIRING_SESSION_NOT_FOUND", "DEVICE_NOT_FOUND"}:
+    if exc.code == "CREDENTIAL_ROTATION_EXPIRED":
+        return 410
+    if exc.code == "CREDENTIAL_ROTATION_INVALID":
+        return 401
+    if exc.code == "CREDENTIAL_ROTATION_CONFLICT":
+        return 409
+    if exc.code in {
+        "PAIRING_SESSION_NOT_FOUND",
+        "DEVICE_NOT_FOUND",
+        "CREDENTIAL_ROTATION_NOT_FOUND",
+    }:
         return 404
     if exc.code == "DEVICE_ALREADY_PAIRED":
         return 409
@@ -749,6 +870,18 @@ def _authorized_job(store: JobStore, principal: ApiPrincipal, job_id: str) -> Jo
     job = store.get_job(job_id)
     _authorize_existing_vault(principal, job.vault_id)
     return job
+
+
+def _require_device_security_store(
+    security_store: DeviceSecurityStore | None,
+) -> DeviceSecurityStore:
+    if security_store is None:
+        raise ApiProblem(
+            503,
+            "DEVICE_SECURITY_NOT_CONFIGURED",
+            "Device security management is not configured.",
+        )
+    return security_store
 
 
 def _upload_schema(upload: UploadRecord) -> UploadSchema:

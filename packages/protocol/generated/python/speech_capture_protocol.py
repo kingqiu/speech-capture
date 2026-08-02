@@ -2,7 +2,7 @@
 
 from typing import Final, Literal, NotRequired, TypeAlias, TypedDict
 
-OPENAPI_SHA256: Final = "f693de0586e4bfdf685d671c30a6964e63421ea22078ba34b135566656571825"
+OPENAPI_SHA256: Final = "8bed2318f02dd8cd4b181ffb8ae6dccd626d709af6cbe44bb74de95e6a45ca5d"
 OPENAPI_VERSION: Final = "3.1.0"
 PROTOCOL_VERSION: Final = "1.0.0"
 
@@ -85,6 +85,13 @@ UploadState: TypeAlias = Literal[
     'failed',
 ]
 
+class ActivatedCredentialRotationSchema(TypedDict):
+    activated_at: str
+    credential_id: str
+    device_id: str
+    generation: int
+    rotation_id: str
+
 class ApiErrorSchema(TypedDict):
     code: str
     message: str
@@ -103,6 +110,16 @@ class CompatibilityResponse(TypedDict):
     issues: list[CompatibilityIssue]
     missing_features: list[str]
     protocol_version: str | None
+
+class CredentialRotationActivateRequestSchema(TypedDict):
+    device_id: str
+
+class CredentialRotationPrepareRequestSchema(TypedDict):
+    ttl_seconds: NotRequired[int]
+
+class DeviceRevocationResponse(TypedDict):
+    device_id: str
+    revoked: bool
 
 class HealthResponse(TypedDict):
     protocol_version: str
@@ -165,9 +182,37 @@ class JobUpdateSchema(TypedDict):
     payload: dict[str, object]
     sequence: int
 
+class PairedDeviceSchema(TypedDict):
+    allowed_vault_ids: list[str]
+    created_at: str
+    credential_id: str
+    device_id: str
+    generation: int
+    last_used_at: str | None
+    revoked_at: str | None
+
 class PairingConfirmRequestSchema(TypedDict):
     pairing_code: str
     session_id: str
+
+class PairingSessionCreateSchema(TypedDict):
+    allowed_vault_ids: list[str]
+    device_id: str
+    ttl_seconds: NotRequired[int]
+
+class PairingSessionSecretSchema(TypedDict):
+    allowed_vault_ids: list[str]
+    device_id: str
+    expires_at: str
+    pairing_code: str
+    session_id: str
+
+class PreparedCredentialRotationSchema(TypedDict):
+    bearer_token: str
+    device_id: str
+    expires_at: str
+    generation: int
+    rotation_id: str
 
 class ProtocolLimitsSchema(TypedDict):
     default_upload_chunk_size_bytes: int
@@ -293,6 +338,9 @@ class JobUpdatesResponse(TypedDict):
     next_after_sequence: int
     updates: list[JobUpdateSchema]
 
+class PairedDeviceListResponse(TypedDict):
+    devices: list[PairedDeviceSchema]
+
 class UploadEnvelope(TypedDict):
     created: NotRequired[bool | None]
     missing_part_numbers: list[int]
@@ -306,6 +354,7 @@ __all__ = [
     "OPENAPI_SHA256",
     "OPENAPI_VERSION",
     "PROTOCOL_VERSION",
+    "ActivatedCredentialRotationSchema",
     "ApiErrorResponse",
     "ApiErrorSchema",
     "ArtifactListResponse",
@@ -314,6 +363,9 @@ __all__ = [
     "CompatibilityIssue",
     "CompatibilityRequestSchema",
     "CompatibilityResponse",
+    "CredentialRotationActivateRequestSchema",
+    "CredentialRotationPrepareRequestSchema",
+    "DeviceRevocationResponse",
     "DiarizationStatus",
     "HealthResponse",
     "IssuedDeviceCredentialSchema",
@@ -329,7 +381,12 @@ __all__ = [
     "JobUpdateSchema",
     "JobUpdatesResponse",
     "ModelProfile",
+    "PairedDeviceListResponse",
+    "PairedDeviceSchema",
     "PairingConfirmRequestSchema",
+    "PairingSessionCreateSchema",
+    "PairingSessionSecretSchema",
+    "PreparedCredentialRotationSchema",
     "ProtocolCapability",
     "ProtocolLimitsSchema",
     "ProvisionalTranscriptSchema",

@@ -33,7 +33,9 @@ A reinstall, explicit reset of security state, or loss of the processing host re
 The implemented API foundation already enforces authentication and per-principal Vault allowlists for every private
 resource and redacts request-validation input. Durable pairing stores only token digests in a private `0600`
 security database; short-lived codes are attempt-limited and consumed once. Client-side OS-protected token storage
-and credential rotation remain separate work and must not be represented as complete yet.
+remains later Obsidian work. Worker-side credential rotation is implemented as a two-phase switch: preparing a
+replacement does not revoke the current token, and activation atomically promotes the replacement so a lost HTTP
+response cannot leave both credentials unusable.
 
 ## 4. Credential handling
 
