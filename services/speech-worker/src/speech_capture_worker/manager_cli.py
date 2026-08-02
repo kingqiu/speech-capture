@@ -17,6 +17,7 @@ from speech_capture_worker.launchd_service import (
     default_agent_path,
     default_data_dir,
 )
+from speech_capture_worker.manager_status import collect_manager_status
 from speech_capture_worker.redaction import public_cli_error_payload
 
 
@@ -25,9 +26,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         config = _config_from_args(args)
         manager = LaunchdServiceManager()
-        operation = getattr(manager, args.command)
-        status = operation(config)
-        print(json.dumps({"service": status.to_dict()}, sort_keys=True))
+        if args.command == "status":
+            service = manager.status(config)
+            status = collect_manager_status(config, service)
+            print(json.dumps({"status": status.to_dict()}, sort_keys=True))
+        else:
+            operation = getattr(manager, args.command)
+            service = operation(config)
+            print(json.dumps({"service": service.to_dict()}, sort_keys=True))
         return 0
     except WorkerCoreError as exc:
         print(

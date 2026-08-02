@@ -1282,7 +1282,7 @@ FastAPI，并加入设备身份和 Vault 授权。阶段 H 的 Obsidian 前端�
 - [x] 验证普通 Worker 崩溃后自动拉起。
 - [ ] 验证 Mac 重启后的真实启动条件。
 - [x] 明确 FileVault 解锁、用户登录和同步盘挂载状态。
-- [ ] 显示模型、磁盘、内存、端口和网络状态。
+- [x] 显示模型、磁盘、内存、端口和网络状态。
 - [ ] 下载模型前显示空间预算。
 - [ ] 校验模型文件。
 - [ ] 支持模型激活、切换和回滚。
@@ -2670,3 +2670,24 @@ Obsidian 客户端。下一步停在 Stage G 边界，等待项目所有者确�
 Stage G 下一步严格实现不含私人内容的 Manager 状态快照：模型、磁盘、内存、端口和网络；随后
 完成下载前空间预算、模型校验、激活/切换/回滚、诊断包和无需开发环境的打包运行时。不得进入
 Stage H 或 Obsidian 前端。
+
+---
+
+## 51. 2026-08-02 Stage G Manager 内容无关状态快照
+
+- `speech-capture-manager status` 现合并 launchd 服务、Worker 数据目录、磁盘总量/可用量、内存
+  总量/可用量/使用率、配置端口可达性、local-only/private-TLS 模式和 TLS 状态；
+- 模型状态覆盖 Qwen3-ASR 1.7B/0.6B、ForcedAligner、pyannote segmentation/diarization，以及
+  Ollama CLI、服务和 qwen3 14B/8B；当前只判断缓存是否存在，完整 hash 校验严格留在下一项；
+- 网络状态识别 Tailscale App、CLI、backend state 和 online 布尔值，但不返回 tailnet 名、设备名、
+  IP、用户账号或任何对端信息；Tailscale 不是必选依赖；
+- 状态快照只包含公开 model ID、布尔状态、字节计数、百分比、端口、进程状态和稳定 issue code；
+  不包含 home/data/cache 绝对路径、Vault 名、源文件名、正文、prompt、token 或命令 stderr；
+- issue code 可区分服务未安装/未运行、数据目录不可用、低磁盘、内存压力、端口不可达、ASR/
+  aligner 模型缺失、Ollama 未安装/未运行/模型缺失；
+- 真实本机只读检查已成功输出状态，确认三个 MLX 模型缓存存在；未安装正式 LaunchAgent 时正确
+  报告 `SERVICE_NOT_INSTALLED`；
+- 当前全套 `381` 项测试以及 Ruff、`compileall`、CLI help、依赖锁和差异检查通过。
+
+下一步严格实现“下载模型前显示空间预算”，并让预算与现有磁盘安全保留策略一致；随后才进入
+模型文件校验、激活/切换和回滚。不得开始 Stage H。

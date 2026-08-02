@@ -34,6 +34,10 @@ def test_manager_cli_returns_content_free_service_status(tmp_path, monkeypatch, 
         "speech_capture_worker.manager_cli.LaunchdServiceManager",
         FakeManager,
     )
+    monkeypatch.setattr(
+        "speech_capture_worker.manager_cli.collect_manager_status",
+        lambda _config, service: SimpleStatus(service),
+    )
     result = main([
         "status",
         "--data-dir",
@@ -45,7 +49,7 @@ def test_manager_cli_returns_content_free_service_status(tmp_path, monkeypatch, 
 
     assert result == 0
     assert output.err == ""
-    assert json.loads(output.out)["service"]["running"] is True
+    assert json.loads(output.out)["status"]["service"]["running"] is True
     assert str(tmp_path) not in output.out
 
 
@@ -75,3 +79,11 @@ def test_manager_cli_redacts_launchd_failure_details(tmp_path, monkeypatch, caps
         "code": "SERVICE_COMMAND_FAILED",
         "message": "launchd failed for [redacted-path]",
     }
+
+
+class SimpleStatus:
+    def __init__(self, service: LaunchdServiceStatus) -> None:
+        self.service = service
+
+    def to_dict(self):
+        return {"service": self.service.to_dict(), "issue_codes": ()}
