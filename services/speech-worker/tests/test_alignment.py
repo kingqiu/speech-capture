@@ -921,7 +921,7 @@ def test_cli_force_aligns_next_segment_without_exposing_text(
 
     monkeypatch.setattr(
         "speech_capture_worker.worker_cli.MlxQwenForcedAlignmentEngine",
-        lambda: engine,
+        lambda **_kwargs: engine,
     )
     real_executor = ForcedAlignmentExecutor
     monkeypatch.setattr(

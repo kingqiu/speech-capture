@@ -71,7 +71,8 @@ class MlxQwenForcedAlignmentEngine:
 
     model_id = FORCED_ALIGNER_MODEL_ID
 
-    def __init__(self) -> None:
+    def __init__(self, *, model_target: str | None = None) -> None:
+        self._model_target = model_target or self.model_id
         self._aligner: Any | None = None
 
     def align(
@@ -85,7 +86,7 @@ class MlxQwenForcedAlignmentEngine:
         if self._aligner is None:
             from mlx_qwen3_asr import ForcedAligner
 
-            self._aligner = ForcedAligner(model_path=self.model_id)
+            self._aligner = ForcedAligner(model_path=self._model_target)
         normalized_audio = _prepare_aligner_audio(audio, sample_rate=sample_rate)
         words = [
             asdict(word)

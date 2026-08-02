@@ -152,6 +152,12 @@ Atomic writes and artifact hashes prevent a half-written directory from being ma
 - The previous working model remains available until the new profile passes a local health check.
 - Rollback does not delete job evidence.
 
+The Stage G Manager now enforces this model boundary with full revision and content-hash validation before an
+atomic activation record changes. It retains one complete prior profile for revalidated rollback. The private state
+uses a process lock, restrictive permissions, no-follow reads, file and directory fsync, and rejects unknown model
+identity combinations. Activated MLX execution uses the pinned snapshot path while persisted job evidence keeps the
+canonical public model ID; model cache paths are not copied into job records or Manager output.
+
 ## 12. Security review gates
 
 Before any friend-ready release:

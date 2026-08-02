@@ -203,6 +203,14 @@ class ServiceCommandFailed(WorkerCoreError):
     code = "SERVICE_COMMAND_FAILED"
 
 
+class ModelActivationFailed(WorkerCoreError):
+    code = "MODEL_ACTIVATION_FAILED"
+
+
+class ModelRollbackUnavailable(WorkerCoreError):
+    code = "MODEL_ROLLBACK_UNAVAILABLE"
+
+
 class PublicationLeaseConflict(WorkerCoreError):
     code = "PUBLICATION_LEASE_CONFLICT"
 

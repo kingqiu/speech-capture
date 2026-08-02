@@ -55,6 +55,7 @@ from speech_capture_worker.gap_speech_activity import (
     PyannoteVoiceActivityDetector,
 )
 from speech_capture_worker.job_store import JobStore
+from speech_capture_worker.model_activation import resolve_active_model_target
 from speech_capture_worker.publication_domain import DEFAULT_PUBLICATION_LEASE_SECONDS
 from speech_capture_worker.recording_context import (
     MAX_RECORDING_CONTEXT_CHARACTERS,
@@ -496,12 +497,12 @@ def _build_parser() -> argparse.ArgumentParser:
     run_structuring.add_argument("job_id")
     run_structuring.add_argument(
         "--model",
-        default="qwen3:14b",
+        default=None,
         help="Ollama model name for classification and extraction.",
     )
     run_structuring.add_argument(
         "--editor-model",
-        default="qwen3:8b",
+        default=None,
         help="Ollama model name for faithful transcript punctuation and cleanup.",
     )
     run_structuring.add_argument(
@@ -1057,7 +1058,10 @@ def _dispatch(args: argparse.Namespace) -> int:
             job = store.get_job(args.job_id)
             result = AsrChunkExecutor(
                 store,
-                MlxQwenAsrEngine(model_profile=job.model_profile),
+                MlxQwenAsrEngine(
+                    model_profile=job.model_profile,
+                    model_target=_active_asr_target(args.data_dir, job.model_profile),
+                ),
                 max_attempts=args.max_attempts,
             ).run_next(args.job_id)
             _write_json(result.to_dict())
@@ -1068,7 +1072,10 @@ def _dispatch(args: argparse.Namespace) -> int:
             job = store.get_job(args.job_id)
             result = AsrChunkExecutor(
                 store,
-                MlxQwenAsrEngine(model_profile=job.model_profile),
+                MlxQwenAsrEngine(
+                    model_profile=job.model_profile,
+                    model_target=_active_asr_target(args.data_dir, job.model_profile),
+                ),
                 max_attempts=args.max_attempts,
             ).run_all(args.job_id, max_chunks=args.max_chunks)
             _write_json(result.to_dict())
@@ -1091,9 +1098,17 @@ def _dispatch(args: argparse.Namespace) -> int:
                 else 2
             )
         if args.command == "force-align-next":
+            job = store.get_job(args.job_id)
             result = ForcedAlignmentExecutor(
                 store,
-                MlxQwenForcedAlignmentEngine(),
+                MlxQwenForcedAlignmentEngine(
+                    model_target=resolve_active_model_target(
+                        args.data_dir,
+                        profile=job.model_profile.value,
+                        key="aligner",
+                        fallback="Qwen/Qwen3-ForcedAligner-0.6B",
+                    )
+                ),
             ).run_next(args.job_id)
             _write_json(result.to_dict())
             return 2 if result.outcome is ForcedAlignmentOutcome.SAFE_PAUSED else 0
@@ -1137,11 +1152,26 @@ def _dispatch(args: argparse.Namespace) -> int:
             _write_json(result.to_dict())
             return 2 if result.outcome is DiarizationOutcome.SAFE_PAUSED else 0
         if args.command == "run-structuring":
+            job = store.get_job(args.job_id)
+            profile = job.model_profile.value
+            main_key = "ollama_accuracy" if profile == "accuracy" else "ollama_editor"
             executor = StructuringExecutor(
                 store,
                 OllamaStructuringEngine(
-                    model=args.model,
-                    editor_model=args.editor_model,
+                    model=args.model
+                    or resolve_active_model_target(
+                        args.data_dir,
+                        profile=profile,
+                        key=main_key,
+                        fallback="qwen3:14b" if profile == "accuracy" else "qwen3:8b",
+                    ),
+                    editor_model=args.editor_model
+                    or resolve_active_model_target(
+                        args.data_dir,
+                        profile=profile,
+                        key="ollama_editor",
+                        fallback="qwen3:8b",
+                    ),
                 ),
             )
             selected_modes = sum(
@@ -1260,7 +1290,10 @@ def _dispatch(args: argparse.Namespace) -> int:
             job = store.get_job(args.job_id)
             result = GapRetranscriptionExecutor(
                 store,
-                MlxQwenAsrEngine(model_profile=job.model_profile),
+                MlxQwenAsrEngine(
+                    model_profile=job.model_profile,
+                    model_target=_active_asr_target(args.data_dir, job.model_profile),
+                ),
                 max_attempts=args.max_attempts,
             ).run(args.job_id)
             _write_json(result.to_dict())
@@ -1275,6 +1308,18 @@ def _dispatch(args: argparse.Namespace) -> int:
     parser_error = {"error": {"code": "UNKNOWN_COMMAND", "message": args.command}}
     _write_json(parser_error, stream=sys.stderr)
     return 2
+
+
+def _active_asr_target(data_dir: Path, profile: ModelProfile) -> str:
+    accuracy = profile is ModelProfile.ACCURACY
+    return resolve_active_model_target(
+        data_dir,
+        profile=profile.value,
+        key="asr_accuracy" if accuracy else "asr_speed",
+        fallback=(
+            "Qwen/Qwen3-ASR-1.7B" if accuracy else "Qwen/Qwen3-ASR-0.6B"
+        ),
+    )
 
 
 def _read_recording_context_file(path: Path | None) -> str | None:

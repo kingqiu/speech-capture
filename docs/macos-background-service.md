@@ -35,6 +35,17 @@ uv run speech-capture-manager model-verify \
   --profile accuracy \
   --executable "$PWD/.venv/bin/speech-capture-worker"
 
+uv run speech-capture-manager model-activate \
+  --profile accuracy \
+  --executable "$PWD/.venv/bin/speech-capture-worker"
+
+uv run speech-capture-manager model-switch \
+  --profile speed \
+  --executable "$PWD/.venv/bin/speech-capture-worker"
+
+uv run speech-capture-manager model-rollback \
+  --executable "$PWD/.venv/bin/speech-capture-worker"
+
 uv run speech-capture-manager restart \
   --executable "$PWD/.venv/bin/speech-capture-worker"
 
@@ -60,6 +71,12 @@ It reports an estimate and shortfall before a future download action; it does no
 repository metadata, required configuration and weight shards, Git/LFS hashes, and Safetensors headers. For Ollama
 models it verifies the manifest and every referenced blob SHA-256. A failed validation returns exit code 3 and safe
 issue codes; no local path or user content is emitted. Validation can take time because it reads every model byte.
+
+Activation is separate from download. An activation or switch performs full validation before atomically replacing
+the private active-profile record, while retaining the prior record for rollback. Rollback revalidates that exact
+prior revision before restoring it. MLX execution resolves an activated model to its pinned local snapshot, while
+durable job evidence continues to record only the canonical public model ID. A failed operation leaves the active
+record unchanged and never deletes model files or job data.
 
 ## 3. Restart and login conditions
 

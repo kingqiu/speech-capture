@@ -18,6 +18,7 @@ from speech_capture_worker.launchd_service import (
     default_data_dir,
 )
 from speech_capture_worker.manager_status import collect_manager_status
+from speech_capture_worker.model_activation import ModelActivationManager
 from speech_capture_worker.model_budget import (
     calculate_model_download_budget,
     presence_from_status,
@@ -30,11 +31,29 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     try:
         config = _config_from_args(args)
-        manager = LaunchdServiceManager()
+        if args.command in {
+            "model-activate",
+            "model-switch",
+            "model-rollback",
+            "model-activation-status",
+        }:
+            activation = ModelActivationManager(config.data_dir)
+            if args.command == "model-activation-status":
+                payload = {"activation": activation.status().to_dict()}
+            else:
+                operation = getattr(
+                    activation,
+                    args.command.removeprefix("model-").replace("-", "_"),
+                )
+                result = operation(args.profile) if hasattr(args, "profile") else operation()
+                payload = {"activation": result.to_dict()}
+            print(json.dumps(payload, sort_keys=True))
+            return 0
         if args.command == "model-verify":
             report = validate_model_profile(args.profile)
             print(json.dumps({"validation": report.to_dict()}, sort_keys=True))
             return 0 if report.valid else 3
+        manager = LaunchdServiceManager()
         if args.command in {"status", "model-budget"}:
             service = manager.status(config)
             status = collect_manager_status(config, service)
@@ -78,6 +97,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "uninstall",
         "model-budget",
         "model-verify",
+        "model-activate",
+        "model-switch",
+        "model-rollback",
+        "model-activation-status",
     ):
         subparser = subparsers.add_parser(command)
         subparser.add_argument("--data-dir", type=Path, default=default_data_dir())
@@ -86,7 +109,12 @@ def _build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--port", type=int, default=8765)
         subparser.add_argument("--ssl-certfile", type=Path)
         subparser.add_argument("--ssl-keyfile", type=Path)
-        if command in {"model-budget", "model-verify"}:
+        if command in {
+            "model-budget",
+            "model-verify",
+            "model-activate",
+            "model-switch",
+        }:
             subparser.add_argument(
                 "--profile",
                 choices=("accuracy", "speed", "all"),

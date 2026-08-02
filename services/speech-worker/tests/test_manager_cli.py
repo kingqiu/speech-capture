@@ -192,6 +192,49 @@ def test_manager_cli_returns_distinct_code_for_failed_model_validation(
     assert str(tmp_path) not in output.out
 
 
+def test_manager_cli_routes_model_activation_without_launchd(
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    class ActivationResult:
+        def to_dict(self):
+            return {
+                "action": "activated",
+                "changed": True,
+                "state": {"generation": 1, "active": {"profile": "accuracy"}},
+            }
+
+    class FakeActivationManager:
+        def __init__(self, data_dir):
+            assert data_dir == (tmp_path / "runtime").resolve()
+
+        def activate(self, profile):
+            assert profile == "accuracy"
+            return ActivationResult()
+
+    monkeypatch.setattr(
+        "speech_capture_worker.manager_cli.ModelActivationManager",
+        FakeActivationManager,
+    )
+
+    result = main([
+        "model-activate",
+        "--profile",
+        "accuracy",
+        "--data-dir",
+        str(tmp_path / "runtime"),
+        "--executable",
+        str(_executable(tmp_path)),
+    ])
+    output = capsys.readouterr()
+
+    assert result == 0
+    assert output.err == ""
+    assert json.loads(output.out)["activation"]["action"] == "activated"
+    assert str(tmp_path) not in output.out
+
+
 class SimpleStatus:
     def __init__(self, service: LaunchdServiceStatus) -> None:
         self.service = service

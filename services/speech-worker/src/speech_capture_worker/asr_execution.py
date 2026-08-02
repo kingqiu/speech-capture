@@ -111,7 +111,12 @@ class AsrBatchResult:
 class MlxQwenAsrEngine:
     """Lazy real-model adapter; construction does not load model weights."""
 
-    def __init__(self, *, model_profile: ModelProfile) -> None:
+    def __init__(
+        self,
+        *,
+        model_profile: ModelProfile,
+        model_target: str | None = None,
+    ) -> None:
         if not isinstance(model_profile, ModelProfile):
             raise InvalidJobRequest("model_profile is not supported.")
         self.model_id = (
@@ -119,6 +124,7 @@ class MlxQwenAsrEngine:
             if model_profile is ModelProfile.ACCURACY
             else SPEED_MODEL_ID
         )
+        self._model_target = model_target or self.model_id
         self._session: Any | None = None
 
     def transcribe(
@@ -134,7 +140,7 @@ class MlxQwenAsrEngine:
         if self._session is None:
             from mlx_qwen3_asr import Session
 
-            self._session = Session(model=self.model_id)
+            self._session = Session(model=self._model_target)
         result = self._session.transcribe(
             (audio, sample_rate),
             context=context,

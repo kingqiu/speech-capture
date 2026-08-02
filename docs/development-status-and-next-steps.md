@@ -1285,7 +1285,7 @@ FastAPI，并加入设备身份和 Vault 授权。阶段 H 的 Obsidian 前端�
 - [x] 显示模型、磁盘、内存、端口和网络状态。
 - [x] 下载模型前显示空间预算。
 - [x] 校验模型文件。
-- [ ] 支持模型激活、切换和回滚。
+- [x] 支持模型激活、切换和回滚。
 - [ ] 提供不含私人内容的诊断包。
 - [ ] 最终提供无需开发环境的打包运行时。
 
@@ -2737,3 +2737,26 @@ Stage H 或 Obsidian 前端。
 
 下一步严格实现模型激活、切换和回滚。任何新版本必须先完整校验，在一次原子切换前保持当前
 可用版本；激活失败或 Worker 启动验证失败时回到旧版本。不得开始 Stage H。
+
+---
+
+## 54. 2026-08-02 Stage G 模型激活、切换和回滚
+
+- 新增 `model-activate`、`model-switch`、`model-rollback` 和 `model-activation-status` Manager 命令；
+  激活状态只记录 profile、公开 model ID、provider、批准 revision、release ID 和 generation；
+- 每次激活、切换或回滚都先对目标 profile 重新执行完整文件哈希；验证失败、revision 不一致、
+  状态损坏、锁失败或原子写失败时，当前激活记录逐字节保持不变；
+- 状态写入使用进程锁、`0600` 文件、`0700` 目录、临时文件 fsync、原子 rename 和目录 fsync；
+  读取使用 `O_NOFOLLOW`，拒绝链接、过宽权限、超限文件、未知 model ID/provider 组合和非法 revision；
+- 切换保留上一份完整 profile 快照；回滚前按记录的精确 revision 重新校验，成功后把当前与上一
+  版本交换，因此回滚不删除模型、任务证据、数据库或生成产物；
+- Worker 的 ASR、ForcedAligner 和 Ollama 结构化入口已接入激活解析。MLX 使用固定 revision 的
+  本地 snapshot 路径加载，避免 `main` 漂移；持久 checkpoint 仍记录公开 canonical model ID，
+  不把本机缓存路径写入任务证据；没有激活记录的既有开发流程保持原兼容行为；
+- 已在隔离临时数据目录真实完成 `accuracy generation 1 → speed generation 2 → rollback accuracy
+  generation 3`；三步均重新做全量哈希，正式 Worker 数据未改动，临时目录已删除；
+- 自动化覆盖首次激活、幂等、切换、回滚、无可回滚版本、验证失败、写入失败、回滚 revision
+  改变、固定 snapshot 解析、状态 model ID 篡改、状态链接和 Manager 路由；全套 `406` 项测试通过。
+
+下一步严格提供不含私人内容的诊断包；随后完成无需开发环境的打包运行时。冷重启真实验收仍只
+能在项目所有者安排的维护窗口执行。不得开始 Stage H。
