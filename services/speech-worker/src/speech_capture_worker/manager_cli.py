@@ -18,6 +18,10 @@ from speech_capture_worker.launchd_service import (
     default_data_dir,
 )
 from speech_capture_worker.manager_status import collect_manager_status
+from speech_capture_worker.model_budget import (
+    calculate_model_download_budget,
+    presence_from_status,
+)
 from speech_capture_worker.redaction import public_cli_error_payload
 
 
@@ -26,10 +30,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         config = _config_from_args(args)
         manager = LaunchdServiceManager()
-        if args.command == "status":
+        if args.command in {"status", "model-budget"}:
             service = manager.status(config)
             status = collect_manager_status(config, service)
-            print(json.dumps({"status": status.to_dict()}, sort_keys=True))
+            if args.command == "status":
+                payload = {"status": status.to_dict()}
+            else:
+                payload = {
+                    "budget": calculate_model_download_budget(
+                        args.profile,
+                        disk_total_bytes=status.resources.disk_total_bytes,
+                        disk_free_bytes=status.resources.disk_free_bytes,
+                        present=presence_from_status(status),
+                    ).to_dict()
+                }
+            print(json.dumps(payload, sort_keys=True))
         else:
             operation = getattr(manager, args.command)
             service = operation(config)
@@ -49,7 +64,15 @@ def _build_parser() -> argparse.ArgumentParser:
         description="Install and control the per-user Speech Capture Worker service.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
-    for command in ("install", "start", "stop", "restart", "status", "uninstall"):
+    for command in (
+        "install",
+        "start",
+        "stop",
+        "restart",
+        "status",
+        "uninstall",
+        "model-budget",
+    ):
         subparser = subparsers.add_parser(command)
         subparser.add_argument("--data-dir", type=Path, default=default_data_dir())
         subparser.add_argument("--executable", type=Path)
@@ -57,6 +80,12 @@ def _build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--port", type=int, default=8765)
         subparser.add_argument("--ssl-certfile", type=Path)
         subparser.add_argument("--ssl-keyfile", type=Path)
+        if command == "model-budget":
+            subparser.add_argument(
+                "--profile",
+                choices=("accuracy", "speed", "all"),
+                default="accuracy",
+            )
     return parser
 
 

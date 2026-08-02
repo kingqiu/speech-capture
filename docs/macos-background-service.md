@@ -27,6 +27,10 @@ uv run speech-capture-manager install \
 uv run speech-capture-manager status \
   --executable "$PWD/.venv/bin/speech-capture-worker"
 
+uv run speech-capture-manager model-budget \
+  --profile accuracy \
+  --executable "$PWD/.venv/bin/speech-capture-worker"
+
 uv run speech-capture-manager restart \
   --executable "$PWD/.venv/bin/speech-capture-worker"
 
@@ -43,6 +47,10 @@ uv run speech-capture-manager uninstall \
 The default application-data directory is
 `~/Library/Application Support/Speech Capture Worker`. Uninstalling the service removes only its LaunchAgent; it
 does not delete databases, models, uploaded sources, generated artifacts, or user files.
+
+`model-budget` is a read-only preflight. It subtracts models already reported as present, adds 15% download
+headroom, and requires the filesystem to retain at least 20 GiB or 10% of total capacity, whichever is larger.
+It reports an estimate and shortfall before a future download action; it does not download or activate a model.
 
 ## 3. Restart and login conditions
 
