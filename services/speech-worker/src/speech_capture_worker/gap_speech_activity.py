@@ -43,6 +43,7 @@ PYANNOTE_PARAMETERS = {
     "min_duration_on": 0.136,
     "min_duration_off": 0.067,
 }
+MAX_DETECTOR_BOUNDARY_OVERRUN_SECONDS = 0.05
 _COMMIT_SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
 
 
@@ -480,7 +481,8 @@ def validate_detected_speech_regions(
             or not math.isfinite(region.end_seconds)
             or region.start_seconds < 0
             or region.end_seconds <= region.start_seconds
-            or region.end_seconds > duration_seconds + (1 / sample_rate)
+            or region.end_seconds
+            > duration_seconds + MAX_DETECTOR_BOUNDARY_OVERRUN_SECONDS
         ):
             raise SpeechActivityDetectionFailed("The detector returned an invalid speech region.")
         start_frame = min(total_frames, max(0, round(region.start_seconds * sample_rate)))

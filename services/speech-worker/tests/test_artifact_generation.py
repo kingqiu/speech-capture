@@ -7,6 +7,7 @@ import io
 import json
 import shutil
 import wave
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -18,6 +19,7 @@ from speech_capture_worker.alignment import (
 from speech_capture_worker.artifact_generation import (
     ArtifactGenerator,
     ArtifactOutcome,
+    _filter_scene_actions,
 )
 from speech_capture_worker.asr_execution import AsrChunkExecutor, AsrRunOutcome
 from speech_capture_worker.domain import JobState, ResourceStatus, UploadCreateRequest
@@ -48,6 +50,33 @@ def wav_bytes(*, duration_seconds: float) -> bytes:
         audio.setframerate(sample_rate)
         audio.writeframes(samples.tobytes())
     return output.getvalue()
+
+
+def test_speech_actions_require_independent_action_evidence() -> None:
+    document = {
+        "actions": [
+            {"task": "泛化启发", "evidence": ["seg_idea"]},
+            {"task": "明确安排", "evidence": ["seg_action"]},
+        ]
+    }
+    findings = (
+        SimpleNamespace(
+            unsupported=False,
+            kind=SimpleNamespace(value="action_item"),
+            evidence=("seg_action",),
+        ),
+    )
+
+    filtered = _filter_scene_actions(
+        document,
+        findings=findings,
+        content_type="speech",
+    )
+
+    assert filtered["actions"] == [
+        {"task": "明确安排", "evidence": ["seg_action"]}
+    ]
+    assert len(document["actions"]) == 2
 
 
 def source_probe_for(duration_seconds: float):
@@ -120,12 +149,26 @@ class FakeAsrEngine:
 class FakeStructuringEngine:
     model_id = "fake/structuring"
 
-    def __init__(self, findings=None):
+    def __init__(
+        self,
+        findings=None,
+        *,
+        content_type="meeting",
+        scene_kind=None,
+        scene_title=None,
+    ):
         self.findings = findings or []
+        self.content_type = content_type
+        self.scene_kind = scene_kind
+        self.scene_title = scene_title
+        self.recording_context = None
+
+    def set_recording_context(self, context):
+        self.recording_context = context
 
     def classify(self, segments, *, speaker_count):
         return {
-            "type": "meeting",
+            "type": self.content_type,
             "traits": ["multi_speaker"],
             "confidence": 0.9,
         }
@@ -142,7 +185,7 @@ class FakeStructuringEngine:
             actions.append({"task": text, "owner": "", "deadline": "", "evidence": evidence})
         if findings[0]["kind"] == "decision":
             decisions.append({"text": text, "evidence": evidence})
-        return {
+        document = {
             "title": "平台规划会议",
             "summary": {"text": text, "evidence": evidence},
             "context": [
@@ -177,6 +220,19 @@ class FakeStructuringEngine:
             "risks": [],
             "open_questions": [],
         }
+        if self.content_type != "meeting":
+            document["title"] = self.scene_title or "场景化内容笔记"
+            document["context"] = []
+            document["scene_sections"] = [
+                {
+                    "kind": self.scene_kind,
+                    "title": self.scene_title or "场景化正文",
+                    "summary": text,
+                    "details": [{"text": text, "evidence": evidence}],
+                    "evidence": evidence,
+                }
+            ]
+        return document
 
     def synthesize_discussion_threads(self, segments, *, content_type):
         if segments[0]["segment_id"] == segments[-1]["segment_id"]:
@@ -217,6 +273,9 @@ def create_quality_check_job(
     duration_seconds: float,
     suffix: str,
     with_structuring: bool = True,
+    content_type: str = "meeting",
+    scene_kind: str | None = None,
+    scene_title: str | None = None,
 ):
     content = wav_bytes(duration_seconds=duration_seconds)
     checksum = hashlib.sha256(content).hexdigest()
@@ -275,7 +334,10 @@ def create_quality_check_job(
                 "evidence": [segment_id],
                 "confidence": 0.9,
             }
-        ]
+        ],
+        content_type=content_type,
+        scene_kind=scene_kind,
+        scene_title=scene_title,
     )
     result = StructuringExecutor(
         store,
@@ -326,6 +388,8 @@ def test_artifact_generation_writes_four_files_and_advances_to_processed(
         assert transcript.startswith("## ")
         assert "^sp-" in transcript
         assert speech_record["content"]["type"] == "meeting"
+        assert speech_record["content"]["source"] == "automatic"
+        assert speech_record["content"]["automatic_type"] == "meeting"
         assert speech_record["document"]["title"] == "平台规划会议"
         assert speech_record["segments"]
         assert speech_record["segments"][0]["raw_text"]
@@ -338,6 +402,58 @@ def test_artifact_generation_writes_four_files_and_advances_to_processed(
         assert "当前方向转向计划排程" in note
         assert "[[transcript#^sp-" in note
         assert result.speech_id == speech_record["speech_id"]
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")
+@pytest.mark.parametrize(
+    ("content_type", "scene_kind", "scene_title", "body_heading", "kind_label"),
+    [
+        (
+            "interview",
+            "question_answer",
+            "如何判断产品方向",
+            "访谈内容",
+            "关键问答",
+        ),
+        ("course", "concept", "反馈回路", "知识结构", "核心概念"),
+        ("speech", "argument", "技术服务真实问题", "演讲脉络", "核心论点"),
+        ("voice_memo", "hypothesis", "先验证付费意愿", "想法整理", "待验证假设"),
+        ("generic", "insight", "材料的主要发现", "内容结构", "核心信息"),
+    ],
+)
+def test_each_nonmeeting_profile_renders_its_own_evidence_linked_note_structure(
+    tmp_path,
+    content_type: str,
+    scene_kind: str,
+    scene_title: str,
+    body_heading: str,
+    kind_label: str,
+) -> None:
+    with JobStore(
+        tmp_path / "worker.sqlite3",
+        source_probe=source_probe_for(95),
+    ) as store:
+        job = create_quality_check_job(
+            store,
+            duration_seconds=95,
+            suffix=f"profile-{content_type}",
+            content_type=content_type,
+            scene_kind=scene_kind,
+            scene_title=scene_title,
+        )
+        ArtifactGenerator(store).generate(job.job_id)
+        package = store.get_job_stage_directory(job.job_id, stage="artifacts")
+        note = (package / "note.md").read_text("utf-8")
+        speech_record = json.loads((package / "speech-record.json").read_text("utf-8"))
+
+    assert speech_record["content"]["type"] == content_type
+    assert speech_record["document"]["scene_sections"][0]["kind"] == scene_kind
+    assert f"## {body_heading}" in note
+    assert f"{kind_label}｜{scene_title}" in note
+    assert "[[transcript#^sp-" in note
+    assert "## 议题与讨论" not in note
+    assert "## 参与者与各方观点" not in note
+    assert "暂无明确待办" not in note
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")

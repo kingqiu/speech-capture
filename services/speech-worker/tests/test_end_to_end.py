@@ -101,6 +101,9 @@ class FakeDiarizationEngine:
 class FakeStructuringEngine:
     model_id = "fake/structuring"
 
+    def set_recording_context(self, context):
+        self.recording_context = context
+
     def classify(self, segments, *, speaker_count):
         return {
             "type": "meeting",

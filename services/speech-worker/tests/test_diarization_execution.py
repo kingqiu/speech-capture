@@ -19,6 +19,7 @@ from speech_capture_worker.diarization_execution import (
     DiarizationOutcome,
     PyannoteSpeakerDiarizationEngine,
     SpeakerDiarizationExecutor,
+    _validate_turns,
 )
 from speech_capture_worker.domain import JobState, ResourceStatus, UploadCreateRequest
 from speech_capture_worker.errors import DiarizationFailed, InvalidJobRequest
@@ -388,6 +389,24 @@ def test_diarization_rejects_out_of_bounds_or_malformed_turns(tmp_path) -> None:
                 malformed,
                 boundary_preflight=preflight(),
             ).run(job.job_id)
+
+
+def test_diarization_clips_small_model_window_overrun_at_audio_tail() -> None:
+    turns = _validate_turns(
+        [{"start_ms": 94_000, "end_ms": 95_025, "speaker": "SPEAKER_00"}],
+        source_duration_ms=95_000,
+    )
+
+    assert turns[0].start_ms == 94_000
+    assert turns[0].end_ms == 95_000
+
+
+def test_diarization_rejects_large_model_window_overrun_at_audio_tail() -> None:
+    with pytest.raises(DiarizationFailed):
+        _validate_turns(
+            [{"start_ms": 94_000, "end_ms": 95_051, "speaker": "SPEAKER_00"}],
+            source_duration_ms=95_000,
+        )
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")

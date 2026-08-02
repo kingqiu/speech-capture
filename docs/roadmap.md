@@ -17,7 +17,10 @@ Exit condition: the accepted product decisions are internally consistent and ver
 
 ## Phase 1 — Local model spike
 
-Status: in progress. The MLX Qwen3-ASR profiles and timestamp path are validated; diarization, local summarization, and representative real-audio acceptance remain.
+Status: in progress. The MLX Qwen3-ASR profiles and timestamp path are validated, and one
+real meeting note (generation 19) has passed human quality review. Diarization and equivalent
+representative acceptance for interview, course or speech, voice memo or personal note, and
+generic content remain.
 
 Goal: prove the two most uncertain foundations before building a polished plugin.
 
@@ -26,11 +29,18 @@ Goal: prove the two most uncertain foundations before building a polished plugin
 - validate timestamps and long-audio chunk boundaries;
 - integrate a minimal pyannote diarization path;
 - evaluate Ollama Qwen3 14B and 8B hierarchical extraction;
+- use the approved generation 19 meeting note as the shared quality baseline for clarity,
+  coverage, accuracy, and evidence traceability;
+- validate scene-specific structures and representative samples for interview, course or
+  speech, voice memo or personal note, and generic content without reusing the meeting layout;
 - measure memory, temporary disk, and real-time factor;
 - test restart-safe checkpoint files;
 - create the first private gold-standard samples.
 
-Exit condition: at least one representative long recording is completely accounted for, speaker labeling is measurable, and important summary claims link to evidence.
+Exit condition: representative recordings for every supported V1 content type are completely
+accounted for, meet the approved note-quality baseline through their own scene-appropriate
+structure, speaker labeling is measurable where applicable, and important summary claims link
+to evidence.
 
 ## Phase 2 — Backend personal alpha
 
@@ -45,6 +55,8 @@ Status: in progress. Durable storage, resumable verified intake, one-active-job 
 - job queue and resource preflight;
 - progressive transcript snapshot and event contract;
 - content detection and structured output;
+- per-content-type note profiles and regression quality gates benchmarked against the approved
+  generation 19 meeting-note quality level;
 - optional per-recording free-form context for post-ASR cleanup and synthesis, with
   transcript evidence remaining authoritative;
 - publication protocol and atomic-package fixtures;

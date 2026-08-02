@@ -60,6 +60,7 @@ from speech_capture_worker.gap_speech_activity import (
     PyannoteVoiceActivityDetector,
     SpeechActivityDetectorIdentity,
     SpeechActivityObservation,
+    validate_detected_speech_regions,
 )
 from speech_capture_worker.job_store import JobStore
 from speech_capture_worker.media_probe import MediaProbeResult
@@ -1159,6 +1160,27 @@ def test_vad_evidence_rejects_invalid_or_overlapping_detector_regions(tmp_path) 
     assert all(
         value.checkpoint_key != SPEECH_ACTIVITY_CHECKPOINT_KEY for value in checkpoints
     )
+
+
+def test_vad_clips_small_model_window_overrun_at_audio_tail() -> None:
+    regions = validate_detected_speech_regions(
+        (DetectedSpeechRegion(start_seconds=0.8, end_seconds=1.015),),
+        sample_rate=16_000,
+        total_frames=16_000,
+    )
+
+    assert regions == ((12_800, 16_000),)
+
+
+def test_vad_rejects_large_region_overrun_at_audio_tail() -> None:
+    with pytest.raises(WorkerCoreError) as raised:
+        validate_detected_speech_regions(
+            (DetectedSpeechRegion(start_seconds=0.8, end_seconds=1.051),),
+            sample_rate=16_000,
+            total_frames=16_000,
+        )
+
+    assert raised.value.code == "SPEECH_ACTIVITY_DETECTION_FAILED"
 
 
 def test_vad_evidence_safe_pauses_before_model_when_resources_are_blocked(tmp_path) -> None:

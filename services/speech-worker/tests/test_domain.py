@@ -81,6 +81,7 @@ def test_recovery_targets_only_active_processing_states() -> None:
         ("options", []),
         ("language_hint", "Chinese\nEnglish"),
         ("content_type_override", "meeting/../../other"),
+        ("content_type_override", "podcast"),
         ("source_upload_id", "../../upload"),
     ],
 )

@@ -32,6 +32,7 @@ from speech_capture_worker.domain import (
     UploadRecord,
     UploadState,
     ensure_transition_allowed,
+    validate_content_type_override,
     validate_idempotency_key,
     validate_reason_code,
     validate_safe_message,
@@ -56,6 +57,12 @@ from speech_capture_worker.errors import (
     WorkerCoreError,
 )
 from speech_capture_worker.media_probe import MediaProbeResult, probe_audio_source
+from speech_capture_worker.recording_context import (
+    RECORDING_CONTEXT_OPTION,
+    normalize_recording_context,
+    recording_context_from_options,
+    recording_context_sha256,
+)
 from speech_capture_worker.transcript import (
     DiarizationStatus,
     JobProgress,
@@ -314,6 +321,141 @@ class JobStore:
     def get_job(self, job_id: str) -> JobRecord:
         with self._lock:
             return self._row_to_job(self._fetch_job_row(job_id))
+
+    def update_job_recording_context(
+        self,
+        job_id: str,
+        *,
+        context: str | None,
+        expected_revision: int,
+    ) -> tuple[JobRecord, bool]:
+        """Revision-guard one job's optional post-ASR processing context."""
+
+        normalized = normalize_recording_context(context)
+        if (
+            not isinstance(expected_revision, int)
+            or isinstance(expected_revision, bool)
+            or expected_revision < 0
+        ):
+            raise InvalidJobRequest("expected_revision must be zero or greater.")
+        with self._transaction():
+            current = self._row_to_job(self._fetch_job_row(job_id))
+            if current.revision != expected_revision:
+                raise RevisionConflict(
+                    "The job changed after the recording-context snapshot.",
+                    details={
+                        "job_id": job_id,
+                        "expected_revision": expected_revision,
+                        "current_revision": current.revision,
+                    },
+                )
+            existing = recording_context_from_options(current.options)
+            if existing == normalized:
+                return current, False
+            options = dict(current.options)
+            if normalized is None:
+                options.pop(RECORDING_CONTEXT_OPTION, None)
+            else:
+                options[RECORDING_CONTEXT_OPTION] = normalized
+            revision = current.revision + 1
+            now = _utc_now()
+            cursor = self._connection.execute(
+                """
+                UPDATE jobs
+                SET options_json = ?, revision = ?, updated_at = ?
+                WHERE job_id = ? AND revision = ?
+                """,
+                (
+                    _canonical_json(options),
+                    revision,
+                    now,
+                    job_id,
+                    current.revision,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise RevisionConflict(
+                    "The job changed while recording context was being saved.",
+                    details={"job_id": job_id},
+                )
+            self._insert_event(
+                job_id=job_id,
+                revision=revision,
+                event_type="job.recording_context_updated",
+                from_state=current.state,
+                to_state=current.state,
+                reason_code=(
+                    "recording_context_cleared"
+                    if normalized is None
+                    else "recording_context_saved"
+                ),
+                payload={
+                    "context_supplied": normalized is not None,
+                    "context_sha256": recording_context_sha256(normalized),
+                },
+                created_at=now,
+            )
+            return self._row_to_job(self._fetch_job_row(job_id)), True
+
+    def update_job_content_type_override(
+        self,
+        job_id: str,
+        *,
+        content_type: str | None,
+        expected_revision: int,
+    ) -> tuple[JobRecord, bool]:
+        """Revision-guard one job's user-selected content type."""
+
+        normalized = validate_content_type_override(content_type)
+        if (
+            not isinstance(expected_revision, int)
+            or isinstance(expected_revision, bool)
+            or expected_revision < 0
+        ):
+            raise InvalidJobRequest("expected_revision must be zero or greater.")
+        with self._transaction():
+            current = self._row_to_job(self._fetch_job_row(job_id))
+            if current.revision != expected_revision:
+                raise RevisionConflict(
+                    "The job changed after the content-type snapshot.",
+                    details={
+                        "job_id": job_id,
+                        "expected_revision": expected_revision,
+                        "current_revision": current.revision,
+                    },
+                )
+            if current.content_type_override == normalized:
+                return current, False
+            revision = current.revision + 1
+            now = _utc_now()
+            cursor = self._connection.execute(
+                """
+                UPDATE jobs
+                SET content_type_override = ?, revision = ?, updated_at = ?
+                WHERE job_id = ? AND revision = ?
+                """,
+                (normalized, revision, now, job_id, current.revision),
+            )
+            if cursor.rowcount != 1:
+                raise RevisionConflict(
+                    "The job changed while the content type was being saved.",
+                    details={"job_id": job_id},
+                )
+            self._insert_event(
+                job_id=job_id,
+                revision=revision,
+                event_type="job.content_type_override_updated",
+                from_state=current.state,
+                to_state=current.state,
+                reason_code=(
+                    "content_type_override_cleared"
+                    if normalized is None
+                    else "content_type_override_saved"
+                ),
+                payload={"content_type_override": normalized},
+                created_at=now,
+            )
+            return self._row_to_job(self._fetch_job_row(job_id)), True
 
     def list_jobs(
         self,

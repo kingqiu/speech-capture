@@ -100,6 +100,15 @@ The private test set should span:
 
 Synthetic and openly licensed fixtures cover repository tests. Real personal recordings remain local and ignored by Git.
 
+For structured-note quality, each supported content type also has a scene-contract regression:
+
+- synthesis receives the complete corrected transcript;
+- every generated section carries valid transcript evidence;
+- section kinds are restricted to the selected content type;
+- rendered headings and semantics match that type instead of reusing meeting sections;
+- empty, irrelevant meeting-style sections are omitted;
+- synthetic contract tests do not count as human acceptance of real content quality.
+
 ## 4. Transcript completeness gates
 
 For each validated source:

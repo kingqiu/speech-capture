@@ -24,6 +24,7 @@ from speech_capture_worker.diarization_execution import (
     SpeakerDiarizationExecutor,
 )
 from speech_capture_worker.domain import (
+    SUPPORTED_CONTENT_TYPES,
     JobCreateRequest,
     JobState,
     ModelProfile,
@@ -52,6 +53,12 @@ from speech_capture_worker.gap_speech_activity import (
     PyannoteVoiceActivityDetector,
 )
 from speech_capture_worker.job_store import JobStore
+from speech_capture_worker.recording_context import (
+    MAX_RECORDING_CONTEXT_CHARACTERS,
+    RECORDING_CONTEXT_OPTION,
+    normalize_recording_context,
+    recording_context_sha256,
+)
 from speech_capture_worker.resources import (
     check_resource_preflight,
     estimate_job_disk_bytes,
@@ -103,7 +110,12 @@ def _build_parser() -> argparse.ArgumentParser:
         default=ModelProfile.ACCURACY.value,
     )
     create.add_argument("--language-hint")
-    create.add_argument("--content-type")
+    create.add_argument("--content-type", choices=sorted(SUPPORTED_CONTENT_TYPES))
+    create.add_argument(
+        "--recording-context-file",
+        type=Path,
+        help="Optional UTF-8 free-form context used only after raw ASR.",
+    )
 
     create_from_upload = subparsers.add_parser(
         "create-job-from-upload",
@@ -118,7 +130,38 @@ def _build_parser() -> argparse.ArgumentParser:
         default=ModelProfile.ACCURACY.value,
     )
     create_from_upload.add_argument("--language-hint")
-    create_from_upload.add_argument("--content-type")
+    create_from_upload.add_argument(
+        "--content-type", choices=sorted(SUPPORTED_CONTENT_TYPES)
+    )
+    create_from_upload.add_argument(
+        "--recording-context-file",
+        type=Path,
+        help="Optional UTF-8 free-form context used only after raw ASR.",
+    )
+
+    set_recording_context = subparsers.add_parser(
+        "set-recording-context",
+        help="Save, replace, or clear one job's optional post-ASR context.",
+    )
+    _add_data_dir(set_recording_context)
+    set_recording_context.add_argument("job_id")
+    set_recording_context.add_argument("--expected-revision", type=int, required=True)
+    context_source = set_recording_context.add_mutually_exclusive_group(required=True)
+    context_source.add_argument("--context-file", type=Path)
+    context_source.add_argument("--clear", action="store_true")
+
+    set_content_type = subparsers.add_parser(
+        "set-content-type",
+        help="Save or clear one job's user-selected content type.",
+    )
+    _add_data_dir(set_content_type)
+    set_content_type.add_argument("job_id")
+    set_content_type.add_argument("--expected-revision", type=int, required=True)
+    content_type_source = set_content_type.add_mutually_exclusive_group(required=True)
+    content_type_source.add_argument(
+        "--content-type", choices=sorted(SUPPORTED_CONTENT_TYPES)
+    )
+    content_type_source.add_argument("--clear", action="store_true")
 
     create_upload = subparsers.add_parser(
         "create-upload",
@@ -441,6 +484,14 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Retry only failed transcript-edit batches with smaller contexts.",
     )
+    run_structuring.add_argument(
+        "--context-corrections-only",
+        action="store_true",
+        help=(
+            "Apply explicit user-confirmed term corrections to accepted derived text "
+            "without rerunning ASR or the full note models."
+        ),
+    )
 
     generate_artifacts = subparsers.add_parser(
         "generate-artifacts",
@@ -513,6 +564,7 @@ def _dispatch(args: argparse.Namespace) -> int:
             _write_json({"database_ready": store.quick_check(), "schema_ready": True})
             return 0
         if args.command == "create-job":
+            context = _read_recording_context_file(args.recording_context_file)
             request = JobCreateRequest(
                 vault_id=args.vault_id,
                 source_display_name=args.source_name,
@@ -521,19 +573,62 @@ def _dispatch(args: argparse.Namespace) -> int:
                 model_profile=ModelProfile(args.profile),
                 language_hint=args.language_hint,
                 content_type_override=args.content_type,
+                options=(
+                    {RECORDING_CONTEXT_OPTION: context} if context is not None else {}
+                ),
             )
             job, created = store.create_job(request, idempotency_key=args.idempotency_key)
             _write_json({"created": created, "job": job.to_dict()})
             return 0
         if args.command == "create-job-from-upload":
+            context = _read_recording_context_file(args.recording_context_file)
             job, created = store.create_job_from_upload(
                 args.upload_id,
                 idempotency_key=args.idempotency_key,
                 model_profile=ModelProfile(args.profile),
                 language_hint=args.language_hint,
                 content_type_override=args.content_type,
+                options=(
+                    {RECORDING_CONTEXT_OPTION: context} if context is not None else {}
+                ),
             )
             _write_json({"created": created, "job": job.to_dict()})
+            return 0
+        if args.command == "set-recording-context":
+            context = None if args.clear else _read_recording_context_file(args.context_file)
+            job, changed = store.update_job_recording_context(
+                args.job_id,
+                context=context,
+                expected_revision=args.expected_revision,
+            )
+            saved_context = job.options.get(RECORDING_CONTEXT_OPTION)
+            _write_json(
+                {
+                    "changed": changed,
+                    "job_id": job.job_id,
+                    "job_revision": job.revision,
+                    "context_supplied": isinstance(saved_context, str) and bool(saved_context),
+                    "context_sha256": recording_context_sha256(
+                        saved_context if isinstance(saved_context, str) else None
+                    ),
+                }
+            )
+            return 0
+        if args.command == "set-content-type":
+            content_type = None if args.clear else args.content_type
+            job, changed = store.update_job_content_type_override(
+                args.job_id,
+                content_type=content_type,
+                expected_revision=args.expected_revision,
+            )
+            _write_json(
+                {
+                    "changed": changed,
+                    "job_id": job.job_id,
+                    "job_revision": job.revision,
+                    "content_type_override": job.content_type_override,
+                }
+            )
             return 0
         if args.command == "create-upload":
             request = UploadCreateRequest(
@@ -826,14 +921,24 @@ def _dispatch(args: argparse.Namespace) -> int:
                     editor_model=args.editor_model,
                 ),
             )
-            if args.document_only and args.transcript_edits_only:
+            selected_modes = sum(
+                int(value)
+                for value in (
+                    args.document_only,
+                    args.transcript_edits_only,
+                    args.context_corrections_only,
+                )
+            )
+            if selected_modes > 1:
                 raise InvalidJobRequest(
-                    "Choose either --document-only or --transcript-edits-only."
+                    "Choose only one incremental structuring mode."
                 )
             if args.document_only:
                 result = executor.resynthesize_document(args.job_id)
             elif args.transcript_edits_only:
                 result = executor.repair_transcript_edits(args.job_id)
+            elif args.context_corrections_only:
+                result = executor.apply_recording_context_corrections(args.job_id)
             else:
                 result = executor.run(args.job_id, force=args.force)
             _write_json(result.to_dict())
@@ -861,6 +966,25 @@ def _dispatch(args: argparse.Namespace) -> int:
     parser_error = {"error": {"code": "UNKNOWN_COMMAND", "message": args.command}}
     _write_json(parser_error, stream=sys.stderr)
     return 2
+
+
+def _read_recording_context_file(path: Path | None) -> str | None:
+    if path is None:
+        return None
+    if path.is_symlink() or not path.is_file():
+        raise InvalidJobRequest("The recording-context file must be a regular file.")
+    try:
+        if path.stat().st_size > MAX_RECORDING_CONTEXT_CHARACTERS * 4:
+            raise InvalidJobRequest("The recording-context file is too large.")
+        value = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        raise InvalidJobRequest("The recording-context file must be UTF-8.") from exc
+    except OSError as exc:
+        raise InvalidJobRequest("The recording-context file could not be read.") from exc
+    normalized = normalize_recording_context(value)
+    if normalized is None:
+        raise InvalidJobRequest("The recording-context file must not be empty.")
+    return normalized
 
 
 def _resolve_estimated_bytes(args: argparse.Namespace) -> int:

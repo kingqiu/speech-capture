@@ -26,6 +26,11 @@ from speech_capture_worker.errors import (
     UploadStorageError,
 )
 from speech_capture_worker.job_store import JobStore
+from speech_capture_worker.note_prompt_profiles import (
+    render_headings,
+    scene_section_labels,
+)
+from speech_capture_worker.recording_context import recording_context_from_options
 from speech_capture_worker.structuring_execution import (
     STRUCTURING_CHECKPOINT_KEY,
     STRUCTURING_STAGE,
@@ -36,7 +41,7 @@ from speech_capture_worker.transcript import (
     TranscriptSegment,
 )
 
-ARTIFACT_SCHEMA_VERSION = "1.1.0"
+ARTIFACT_SCHEMA_VERSION = "1.3.0"
 RAW_TRANSCRIPT_SCHEMA_VERSION = "1.0.0"
 ARTIFACT_STAGE = "artifacts"
 ARTIFACT_CHECKPOINT_KEY = "artifacts_generation"
@@ -147,10 +152,19 @@ class ArtifactGenerator:
         )
         findings = _merge_findings(structuring_raw["batch_results"])
         classification = structuring_raw["classification"]
-        document = structuring_raw.get("document")
+        document = _filter_scene_actions(
+            structuring_raw.get("document"),
+            findings=findings,
+            content_type=classification.get("type"),
+        )
         transcript_edits = _transcript_edits(
             structuring_raw.get("transcript_edit_results", structuring_raw["batch_results"])
         )
+        context_corrections = structuring_raw.get("context_corrections", [])
+        if not isinstance(context_corrections, list):
+            raise ArtifactGenerationFailed(
+                "The structuring evidence has invalid context corrections."
+            )
         upload = self.store.get_upload(job.source_upload_id)
         block_ids = {
             segment.segment_id: _block_id(speech_id, segment.segment_sequence)
@@ -185,6 +199,7 @@ class ArtifactGenerator:
             alignment_report=alignment_checkpoint.payload,
             alignment_report_generation=alignment_checkpoint.generation,
             structuring_checkpoint=structuring_checkpoint.payload,
+            context_corrections=context_corrections,
         )
         note_markdown = _build_note_markdown(
             job=job,
@@ -298,6 +313,39 @@ class ArtifactGenerator:
         if not isinstance(raw, dict) or not isinstance(raw.get("classification"), dict):
             raise ArtifactGenerationFailed("The structuring evidence is incomplete.")
         return raw
+
+
+def _filter_scene_actions(
+    document: Any,
+    *,
+    findings: tuple[Any, ...],
+    content_type: Any,
+) -> Any:
+    """Keep speech tasks only when extraction independently found an action."""
+
+    if not isinstance(document, dict) or content_type != "speech":
+        return document
+    action_evidence = {
+        segment_id
+        for finding in findings
+        if not finding.unsupported
+        and finding.kind.value in {"action_item", "next_step"}
+        for segment_id in finding.evidence
+    }
+    filtered = dict(document)
+    raw_actions = document.get("actions")
+    filtered["actions"] = (
+        [
+            action
+            for action in raw_actions
+            if isinstance(action, dict)
+            and isinstance(action.get("evidence"), list)
+            and bool(set(action["evidence"]) & action_evidence)
+        ]
+        if isinstance(raw_actions, list)
+        else []
+    )
+    return filtered
 
 
 def _build_raw_transcript(
@@ -417,6 +465,7 @@ def _build_speech_record(
     alignment_report: dict[str, Any],
     alignment_report_generation: int,
     structuring_checkpoint: dict[str, Any],
+    context_corrections: list[Any],
 ) -> dict[str, Any]:
     status = (
         "complete"
@@ -432,6 +481,10 @@ def _build_speech_record(
         "status": status,
         "content": {
             "type": classification.get("type"),
+            "source": structuring_checkpoint.get("content_type_source", "automatic"),
+            "automatic_type": structuring_checkpoint.get(
+                "automatic_content_type", classification.get("type")
+            ),
             "traits": classification.get("traits", []),
             "confidence": classification.get("confidence"),
         },
@@ -478,12 +531,24 @@ def _build_speech_record(
             for finding in findings
         ],
         "document": document if isinstance(document, dict) else None,
-        "corrections": [],
+        "corrections": context_corrections,
         "provenance": {
             "artifact_schema_version": ARTIFACT_SCHEMA_VERSION,
             "worker_package_version": _package_version(),
             "structuring_model_id": structuring_checkpoint.get("model_id"),
             "alignment_report_generation": alignment_report_generation,
+            "recording_context_supplied": (
+                recording_context_from_options(job.options) is not None
+            ),
+            "recording_context_sha256": structuring_checkpoint.get(
+                "recording_context_sha256"
+            ),
+            "recording_context_applied": structuring_checkpoint.get(
+                "recording_context_applied", False
+            ),
+            "recording_context_processing_version": structuring_checkpoint.get(
+                "recording_context_processing_version"
+            ),
         },
         "quality": {
             "transcript_complete": alignment_report.get("transcript_complete"),
@@ -522,7 +587,9 @@ def _build_note_markdown(
     structured = _usable_document(document) or _fallback_document(
         source_title=job.source_display_name,
         findings=supported,
+        content_type=content_type,
     )
+    headings = render_headings(content_type)
     title = structured["title"]
     lines = [
         "---",
@@ -551,7 +618,7 @@ def _build_note_markdown(
         ]
     )
     if structured["context"]:
-        lines.extend(["## 背景与参与方", ""])
+        lines.extend([f"## {headings['context']}", ""])
         for item in structured["context"]:
             lines.append(
                 f"- **{item['title']}**：{item['text']} "
@@ -559,7 +626,7 @@ def _build_note_markdown(
             )
         lines.append("")
 
-    lines.extend(["## 核心结论", ""])
+    lines.extend([f"## {headings['highlights']}", ""])
     if structured["highlights"]:
         for item in _unique_evidence_items(structured["highlights"]):
             lines.append(
@@ -568,12 +635,22 @@ def _build_note_markdown(
     else:
         lines.append("暂无可靠的核心结论。")
 
-    lines.extend(["", "## 议题与讨论", ""])
-    if structured["topics"]:
-        for index, topic in enumerate(structured["topics"], start=1):
+    lines.extend(["", f"## {headings['body']}", ""])
+    body_items = (
+        structured["topics"]
+        if content_type == "meeting"
+        else structured["scene_sections"]
+    )
+    if body_items:
+        kind_labels = scene_section_labels(content_type)
+        for index, topic in enumerate(body_items, start=1):
+            section_title = topic["title"]
+            if content_type != "meeting":
+                label = kind_labels.get(topic.get("kind", ""), "内容")
+                section_title = f"{label}｜{section_title}"
             lines.extend(
                 [
-                    f"### {index}. {topic['title']}",
+                    f"### {index}. {section_title}",
                     "",
                     topic["summary"]
                     + " "
@@ -588,7 +665,7 @@ def _build_note_markdown(
                 )
             lines.append("")
     else:
-        lines.extend(["暂无可靠的主题归纳。", ""])
+        lines.extend(["暂无可靠的正文归纳。", ""])
 
     if structured["discussion_threads"]:
         status_labels = {
@@ -633,7 +710,7 @@ def _build_note_markdown(
             )
 
     if structured["speaker_summaries"]:
-        lines.extend(["## 参与者与各方观点", ""])
+        lines.extend([f"## {headings['speakers']}", ""])
         for speaker in structured["speaker_summaries"]:
             identity = speaker["display_name"] or speaker["speaker_id"]
             descriptors = [
@@ -654,15 +731,15 @@ def _build_note_markdown(
             lines.append("")
 
     if structured["decisions"]:
-        lines.extend(["## 已确认的决定", ""])
+        lines.extend([f"## {headings['decisions']}", ""])
         for item in _unique_evidence_items(structured["decisions"]):
             lines.append(
                 f"- {item['text']} （{_evidence_links(item['evidence'], block_ids, segment_map)}）"
             )
         lines.append("")
 
-    lines.extend(["## 待办事项", ""])
     if structured["actions"]:
+        lines.extend([f"## {headings['actions']}", ""])
         for action in _unique_action_items(structured["actions"]):
             attributes = []
             if action["owner"]:
@@ -674,12 +751,14 @@ def _build_note_markdown(
                 f"- [ ] {action['task']}{suffix} "
                 f"（{_evidence_links(action['evidence'], block_ids, segment_map)}）"
             )
-    else:
+        lines.append("")
+    elif content_type == "meeting":
+        lines.extend([f"## {headings['actions']}", ""])
         lines.append("暂无明确待办。")
-    lines.append("")
+        lines.append("")
 
     if structured["risks"]:
-        lines.extend(["## 风险与注意事项", ""])
+        lines.extend([f"## {headings['risks']}", ""])
         for item in _unique_evidence_items(structured["risks"]):
             lines.append(
                 f"- {item['text']} （{_evidence_links(item['evidence'], block_ids, segment_map)}）"
@@ -696,7 +775,7 @@ def _build_note_markdown(
     else:
         open_questions = []
     if open_questions:
-        lines.extend(["## 未决问题", ""])
+        lines.extend([f"## {headings['questions']}", ""])
         for item in _unique_evidence_items(open_questions):
             lines.append(
                 f"- {item['text']} （{_evidence_links(item['evidence'], block_ids, segment_map)}）"
@@ -786,10 +865,14 @@ def _usable_document(value: Any) -> dict[str, Any] | None:
     }
     if not isinstance(value, dict) or not required.issubset(value):
         return None
-    return value
+    normalized = dict(value)
+    normalized.setdefault("scene_sections", [])
+    return normalized
 
 
-def _fallback_document(*, source_title: str, findings: list[Any]) -> dict[str, Any]:
+def _fallback_document(
+    *, source_title: str, findings: list[Any], content_type: str
+) -> dict[str, Any]:
     overview = _overview_findings(findings)
     evidence = list(
         dict.fromkeys(segment_id for finding in overview for segment_id in finding.evidence)
@@ -819,6 +902,28 @@ def _fallback_document(*, source_title: str, findings: list[Any]) -> dict[str, A
                 ),
             }
         )
+    fallback_scene_kind = {
+        "interview": "viewpoint",
+        "course": "concept",
+        "speech": "argument",
+        "voice_memo": "idea",
+        "generic": "theme",
+    }.get(content_type)
+    scene_sections = (
+        [
+            {
+                "kind": fallback_scene_kind,
+                "title": topic["title"],
+                "summary": topic["summary"],
+                "details": topic["details"],
+                "evidence": topic["evidence"],
+            }
+            for topic in topics
+        ]
+        if fallback_scene_kind
+        else []
+    )
+    chapters = topics if content_type == "meeting" else scene_sections
     return {
         "title": source_title,
         "summary": {"text": summary_text, "evidence": evidence},
@@ -827,6 +932,7 @@ def _fallback_document(*, source_title: str, findings: list[Any]) -> dict[str, A
             {"text": finding.text, "evidence": list(finding.evidence)} for finding in overview
         ],
         "topics": topics,
+        "scene_sections": scene_sections,
         "discussion_threads": [],
         "speaker_summaries": [],
         "decisions": [
@@ -850,7 +956,14 @@ def _fallback_document(*, source_title: str, findings: list[Any]) -> dict[str, A
             {"text": item.text, "evidence": list(item.evidence)}
             for item in by_kind.get("question", [])
         ],
-        "chapters": [],
+        "chapters": [
+            {
+                "title": item["title"],
+                "summary": item["summary"],
+                "evidence": item["evidence"],
+            }
+            for item in chapters
+        ],
     }
 
 

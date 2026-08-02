@@ -43,6 +43,10 @@ The package now contains:
   attribution, safe degradation, and restart-safe evidence;
 - content-type classification and bounded-batch evidence-linked extraction
   through local Ollama, with unsupported findings kept out of the summary;
+- scene-specific synthesis contracts and Note rendering for interviews,
+  courses, speeches, voice memos or personal notes, and generic content;
+- synthetic cross-type quality gates that require complete-transcript input,
+  evidence-linked sections, and content-appropriate headings without meeting-template filler;
 - deterministic backend artifacts: raw transcript, evidence transcript,
   structured record, content-aware note, and a checksummed manifest;
 - a private alignment report that separately proves raw evidence, aligned timing,
@@ -126,6 +130,34 @@ uv run speech-capture-worker run-structuring \
 
 uv run speech-capture-worker generate-artifacts \
   --data-dir runtime/dev-worker \
+  job_example
+
+# Save optional free-form context after raw ASR. The file may contain any number
+# of lines or paragraphs; the expected revision prevents concurrent overwrites.
+uv run speech-capture-worker set-recording-context \
+  --data-dir runtime/dev-worker \
+  --expected-revision 10 \
+  --context-file runtime/dev-worker/recording-context.txt \
+  job_example
+
+# Save or clear a user-selected content type. Changing the type reuses the
+# corrected transcript, but re-extracts type-dependent findings before the Note.
+uv run speech-capture-worker set-content-type \
+  --data-dir runtime/dev-worker \
+  --expected-revision 11 \
+  --content-type speech \
+  job_example
+
+# Apply only an explicit confirmed term correction without rerunning ASR or the
+# long note models, then regenerate the deterministic artifact package.
+uv run speech-capture-worker run-structuring \
+  --data-dir runtime/dev-worker \
+  --context-corrections-only \
+  job_example
+
+uv run speech-capture-worker generate-artifacts \
+  --data-dir runtime/dev-worker \
+  --force \
   job_example
 
 # Recompute useful structure and replace artifacts after reviewing a processed job.

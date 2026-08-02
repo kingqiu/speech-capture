@@ -57,6 +57,92 @@ def test_identical_idempotent_request_reuses_job(tmp_path) -> None:
     assert second.job_id == first.job_id
 
 
+def test_recording_context_is_revision_guarded_and_event_payload_is_safe(tmp_path) -> None:
+    with JobStore(tmp_path / "worker.sqlite3") as store:
+        job, _ = store.create_job(request(), idempotency_key="submit-context")
+        updated, changed = store.update_job_recording_context(
+            job.job_id,
+            context="客户公司是聚衣堂。\n这是多人会议。",
+            expected_revision=job.revision,
+        )
+        repeated, repeated_changed = store.update_job_recording_context(
+            job.job_id,
+            context="客户公司是聚衣堂。\n这是多人会议。",
+            expected_revision=updated.revision,
+        )
+        events = store.list_events(job.job_id)
+
+        assert changed is True
+        assert updated.revision == 1
+        assert updated.options["recording_context"] == "客户公司是聚衣堂。\n这是多人会议。"
+        assert repeated_changed is False
+        assert repeated.revision == updated.revision
+        assert events[-1].event_type == "job.recording_context_updated"
+        assert events[-1].payload["context_supplied"] is True
+        assert len(events[-1].payload["context_sha256"]) == 64
+        assert "聚衣堂" not in str(events[-1].payload)
+
+        with pytest.raises(RevisionConflict):
+            store.update_job_recording_context(
+                job.job_id,
+                context=None,
+                expected_revision=job.revision,
+            )
+
+        cleared, cleared_changed = store.update_job_recording_context(
+            job.job_id,
+            context=None,
+            expected_revision=updated.revision,
+        )
+        assert cleared_changed is True
+        assert "recording_context" not in cleared.options
+
+
+def test_content_type_override_is_revision_guarded_and_evented(tmp_path) -> None:
+    with JobStore(tmp_path / "worker.sqlite3") as store:
+        job, _ = store.create_job(request(), idempotency_key="submit-content-type")
+        updated, changed = store.update_job_content_type_override(
+            job.job_id,
+            content_type="speech",
+            expected_revision=job.revision,
+        )
+        repeated, repeated_changed = store.update_job_content_type_override(
+            job.job_id,
+            content_type="speech",
+            expected_revision=updated.revision,
+        )
+        events = store.list_events(job.job_id)
+
+        assert changed is True
+        assert updated.revision == 1
+        assert updated.content_type_override == "speech"
+        assert repeated_changed is False
+        assert repeated.revision == updated.revision
+        assert events[-1].event_type == "job.content_type_override_updated"
+        assert events[-1].payload == {"content_type_override": "speech"}
+
+        with pytest.raises(RevisionConflict):
+            store.update_job_content_type_override(
+                job.job_id,
+                content_type=None,
+                expected_revision=job.revision,
+            )
+        with pytest.raises(InvalidJobRequest):
+            store.update_job_content_type_override(
+                job.job_id,
+                content_type="podcast",
+                expected_revision=updated.revision,
+            )
+
+        cleared, cleared_changed = store.update_job_content_type_override(
+            job.job_id,
+            content_type=None,
+            expected_revision=updated.revision,
+        )
+        assert cleared_changed is True
+        assert cleared.content_type_override is None
+
+
 def test_idempotency_key_cannot_change_request(tmp_path) -> None:
     with JobStore(tmp_path / "worker.sqlite3") as store:
         store.create_job(request(), idempotency_key="submit-001")

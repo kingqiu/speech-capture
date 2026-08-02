@@ -50,6 +50,7 @@ DIARIZATION_MODEL_REVISION = "84fd25912480287da0247647c3d2b4853cb3ee5d"
 DIARIZATION_HEADROOM_BYTES = 3 * GIB
 DIARIZATION_STAGE = "diarizing"
 DIARIZATION_CHECKPOINT_KEY = "speaker_attribution_evidence"
+MAX_DIARIZATION_BOUNDARY_OVERRUN_MS = 50
 _COMMIT_SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
 
 
@@ -595,8 +596,9 @@ def _validate_turns(
             or not isinstance(end_ms, int)
             or isinstance(end_ms, bool)
             or start_ms < 0
+            or start_ms >= source_duration_ms
             or end_ms <= start_ms
-            or end_ms > source_duration_ms + 1
+            or end_ms > source_duration_ms + MAX_DIARIZATION_BOUNDARY_OVERRUN_MS
             or not isinstance(speaker, str)
             or not speaker
             or any(not character.isprintable() for character in speaker)

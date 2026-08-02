@@ -9,12 +9,19 @@ from pathlib import PurePath
 from typing import Any
 
 from speech_capture_worker.errors import InvalidJobRequest, InvalidTransition
+from speech_capture_worker.recording_context import (
+    RECORDING_CONTEXT_OPTION,
+    normalize_recording_context,
+)
 
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 SAFE_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 MEDIA_TYPE_PATTERN = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,63}/"
     r"[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,63}$"
+)
+SUPPORTED_CONTENT_TYPES = frozenset(
+    {"meeting", "interview", "course", "speech", "voice_memo", "generic"}
 )
 
 
@@ -181,6 +188,8 @@ class JobCreateRequest:
             raise InvalidJobRequest("model_profile is not supported.")
         if not isinstance(self.options, dict):
             raise InvalidJobRequest("options must be a JSON object.")
+        if RECORDING_CONTEXT_OPTION in self.options:
+            normalize_recording_context(self.options[RECORDING_CONTEXT_OPTION])
         if self.language_hint is not None and (
             not self.language_hint
             or len(self.language_hint) > 64
@@ -190,7 +199,7 @@ class JobCreateRequest:
                 "language_hint must be a printable value of 1 to 64 characters."
             )
         if self.content_type_override is not None:
-            _validate_identifier("content_type_override", self.content_type_override)
+            validate_content_type_override(self.content_type_override)
         if self.source_upload_id is not None:
             _validate_upload_id(self.source_upload_id)
 
@@ -323,6 +332,12 @@ def validate_idempotency_key(value: str) -> None:
 def validate_reason_code(value: str | None) -> None:
     if value is not None:
         _validate_identifier("reason_code", value)
+
+
+def validate_content_type_override(value: str | None) -> str | None:
+    if value is not None and value not in SUPPORTED_CONTENT_TYPES:
+        raise InvalidJobRequest("content_type_override is not supported.")
+    return value
 
 
 def validate_safe_message(value: str | None) -> None:

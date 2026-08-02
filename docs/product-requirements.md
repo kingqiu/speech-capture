@@ -101,7 +101,32 @@ The original source file is never modified or deleted by Speech Capture.
 - V1 does not require users to build or maintain a Vault-wide terminology dictionary.
   A terminology-learning workflow remains a later quality extension.
 
-### 4.6 Progressive experience
+### 4.6 Structured-note quality baseline
+
+- Generation 19 of the validated real meeting sample is the V1 human-approved quality
+  reference for clarity, information coverage, factual accuracy, and evidence traceability.
+- Every supported content type—meeting, interview, course or speech, voice memo or
+  personal note, and generic content—must reach the same quality level. This is a shared
+  quality bar, not a requirement to reuse the meeting-note headings or layout.
+- Meetings prioritize context, participants, viewpoints, discussion evolution, decisions,
+  actions, risks, and open questions.
+- Interviews distinguish interviewer prompts from interviewee statements and preserve the
+  interviewee's background, central views, reasoning, examples, tensions, and unanswered
+  questions.
+- Courses and speeches preserve the topic hierarchy, concepts, arguments, examples,
+  constraints, and reviewable takeaways.
+- Voice memos and personal notes preserve the speaker's intent, ideas, judgments, tasks,
+  hypotheses, constraints, and follow-ups without inventing a meeting structure.
+- Generic content uses the structure best supported by the transcript and does not fill
+  irrelevant sections merely to satisfy a template.
+- Final synthesis always reads the complete corrected transcript. It does not depend only
+  on chunk summaries, fixed item counts, or metadata-oriented filler.
+- Important names, numbers, viewpoints, decisions, and tasks remain faithful to the
+  evidence; uncertainty and conflicts remain explicit rather than being silently resolved.
+- Each content-type profile requires representative human-reviewed samples and regression
+  checks before it is considered to have met this baseline.
+
+### 4.7 Progressive experience
 
 After upload verification, the plugin displays:
 
@@ -115,7 +140,7 @@ After upload verification, the plugin displays:
 
 The Worker persists each completed segment. Reconnecting clients reconstruct the latest preview from a snapshot and event cursor.
 
-### 4.7 Output
+### 4.8 Output
 
 The permanent output is a knowledge package rather than a single note. It contains:
 
@@ -127,7 +152,7 @@ The permanent output is a knowledge package rather than a single note. It contai
 
 Important generated statements link to stable transcript evidence.
 
-### 4.8 Review and correction
+### 4.9 Review and correction
 
 - Raw ASR output is never overwritten.
 - Users may correct text, terminology, speaker names, speaker attribution, and paragraph boundaries.
@@ -138,7 +163,7 @@ Important generated statements link to stable transcript evidence.
 - User-owned sections such as `我的补充` are protected from regeneration.
 - A changed generated section creates a new revision rather than silently replacing user edits.
 
-### 4.9 Job control
+### 4.10 Job control
 
 - Multiple queued jobs.
 - One full local processing job active by default.

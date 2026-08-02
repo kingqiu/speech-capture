@@ -51,6 +51,68 @@ def test_cli_create_is_idempotent_and_listable(tmp_path, capsys) -> None:
     assert len(listed["jobs"]) == 1
 
 
+def test_cli_can_set_and_clear_job_content_type(tmp_path, capsys) -> None:
+    data_dir = str(tmp_path / "runtime")
+    assert (
+        main(
+            [
+                "create-job",
+                "--data-dir",
+                data_dir,
+                "--vault-id",
+                "vault_primary",
+                "--source-name",
+                "presentation.m4a",
+                "--source-sha256",
+                "a" * 64,
+                "--source-size-bytes",
+                "1024",
+                "--idempotency-key",
+                "submit-content-type",
+            ]
+        )
+        == 0
+    )
+    created = json.loads(capsys.readouterr().out)["job"]
+
+    assert (
+        main(
+            [
+                "set-content-type",
+                "--data-dir",
+                data_dir,
+                created["job_id"],
+                "--expected-revision",
+                str(created["revision"]),
+                "--content-type",
+                "speech",
+            ]
+        )
+        == 0
+    )
+    saved = json.loads(capsys.readouterr().out)
+    assert saved["changed"] is True
+    assert saved["content_type_override"] == "speech"
+
+    assert (
+        main(
+            [
+                "set-content-type",
+                "--data-dir",
+                data_dir,
+                created["job_id"],
+                "--expected-revision",
+                str(saved["job_revision"]),
+                "--clear",
+            ]
+        )
+        == 0
+    )
+    cleared = json.loads(capsys.readouterr().out)
+    assert cleared["changed"] is True
+    assert cleared["content_type_override"] is None
+
+
 def test_cli_returns_stable_error_for_invalid_transition(tmp_path, capsys) -> None:
     data_dir = str(tmp_path / "runtime")
     main(

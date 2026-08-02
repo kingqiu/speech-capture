@@ -140,13 +140,20 @@ Content-specific sections are then added:
 | Content type | Specialized sections |
 | --- | --- |
 | Meeting | decisions, action items, owners, deadlines, disagreements, unresolved questions |
-| Interview | themes, questions and answers, notable claims, tensions, follow-ups |
-| Course | concepts, definitions, examples, methods, study questions |
-| Speech | thesis, supporting arguments, examples, rhetorical structure |
-| Voice memo | ideas, assumptions, next steps, related-note suggestions |
-| Generic | chronology, topics, claims, open questions |
+| Interview | interviewee background, question-answer links, viewpoints, reasoning, experiences, tensions, unanswered questions |
+| Course | learning goals, concepts, principles, methods, examples, limitations, review takeaways |
+| Speech | theme, arguments, evidence, examples, implications, takeaways |
+| Voice memo | intent, ideas, judgments, tasks, hypotheses, constraints, follow-ups |
+| Generic | context, themes, insights, details, outcomes, actions, open questions |
 
 Empty specialized sections are omitted rather than filled with generic prose.
+These scene sections use a stable `kind`, title, summary, details, and transcript evidence.
+They share a quality bar but not a meeting-note layout.
+
+The structured record also distinguishes an automatically detected content type from an optional
+user override. If the selected type changes after processing, the Worker keeps raw ASR and the
+corrected transcript unchanged, re-extracts type-dependent findings, and then re-synthesizes the
+Note. `speech-record.json.content.source` and `automatic_type` preserve this provenance.
 
 ## 6. Obsidian properties
 
