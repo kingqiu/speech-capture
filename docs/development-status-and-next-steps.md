@@ -1252,9 +1252,9 @@ FastAPI，并加入设备身份和 Vault 授权。阶段 H 的 Obsidian 前端�
 - [x] 定义协议版本和能力协商。
 - [x] 建立 OpenAPI。
 - [x] 生成 Python 和 TypeScript 类型。
-- [ ] 实现 FastAPI 健康、能力、上传、作业、快照、更新和产物接口。
-- [ ] 实现大文件断点续传。
-- [ ] 实现有限制的轮询或 SSE 更新。
+- [x] 实现 FastAPI 健康、能力、上传、作业、快照、更新和产物接口。
+- [x] 实现大文件断点续传。
+- [x] 实现有限制的轮询或 SSE 更新。
 - [ ] 实现设备配对。
 - [ ] 实现长期凭据的安全保存。
 - [ ] 实现 Vault 级授权。
@@ -2577,3 +2577,21 @@ Stage E 已在 `9872f20 Implement atomic Vault publication` 提交并推送到
 下一步严格实现正式 FastAPI 接口。已有三个发现接口可保持公开；上传、作业、快照、更新和产物
 涉及私人内容，必须先建立统一认证依赖及其拒绝测试，再逐组接入现有持久化核心。不得提前进入
 阶段 G 或阶段 H 前端。
+
+---
+
+## 47. 2026-08-02 Stage F 正式认证 API
+
+阶段 F 第四至第六个工作项已连续完成：
+
+- FastAPI 已接入上传、作业、生命周期动作、快照、有界更新和完整 artifact 包接口；
+- 私人接口统一使用 Bearer 认证与 Vault allowlist，未配置时 fail closed；跨 Vault 资源不可枚举；
+- 输入校验错误统一脱敏，不回显正文、背景或凭据；响应含稳定错误码与 request ID；
+- 分块上传公开缺块列表，支持 checksum 绑定的幂等重传、流式限额读取和完成重放；
+- SQLite schema `8` 持久记录作业动作幂等结果，重启后不会重复暂停、恢复、取消或重试；
+- artifact 下载前复核 checkpoint、manifest、七个文件、全部 hash 和路径/符号链接安全；
+- OpenAPI 与 Python/TypeScript 类型已经同步；`353` 项测试以及 Ruff、`compileall`、漂移检查和
+  `git diff --check` 全部通过。
+
+当前注入式验证器只完成 API 安全边界，不等同于持久设备身份。下一步严格实现设备配对，再完成
+长期凭据、Vault 授权管理、撤销/轮换、HTTPS 和安全网络接入；不得提前进入阶段 G 或前端。

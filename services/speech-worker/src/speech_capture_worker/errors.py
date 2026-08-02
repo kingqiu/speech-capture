@@ -143,6 +143,14 @@ class ArtifactGenerationFailed(WorkerCoreError):
     code = "ARTIFACT_GENERATION_FAILED"
 
 
+class ArtifactNotFound(WorkerCoreError):
+    code = "ARTIFACT_NOT_FOUND"
+
+
+class ArtifactVerificationFailed(WorkerCoreError):
+    code = "ARTIFACT_VERIFICATION_FAILED"
+
+
 class PublicationLeaseConflict(WorkerCoreError):
     code = "PUBLICATION_LEASE_CONFLICT"
 

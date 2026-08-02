@@ -30,6 +30,10 @@ V1 assumes a private network such as Tailscale.
 
 A reinstall, explicit reset of security state, or loss of the processing host requires new pairing.
 
+The implemented API foundation already enforces authentication and per-principal Vault allowlists for every private
+resource, redacts request-validation input, and stores no plaintext token in its injected verifier. Persistent
+pairing and credential lifecycle remain separate Stage F work and must not be represented as complete yet.
+
 ## 4. Credential handling
 
 - Pairing credentials stay in operating-system-protected storage.

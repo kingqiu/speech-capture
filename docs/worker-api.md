@@ -64,6 +64,13 @@ GET    /v1/diagnostics/summary
 POST   /v1/diagnostics/export
 ```
 
+### 3.1 Implemented Stage F surface
+
+The checked-in OpenAPI now implements uploads, jobs, lifecycle actions, bounded snapshots and updates, artifact
+listing, and integrity-checked artifact download. Upload status includes exact missing part numbers; the update feed
+is bounded and deliberately excludes transcript text. Pairing, device management, model management, diagnostics,
+and publication lease HTTP routes remain reserved.
+
 ## 4. Authentication
 
 ### Local
@@ -85,6 +92,10 @@ Remote access requires:
 Pairing creates a per-device revocable credential. Restarting or upgrading the Worker does not require pairing again. Reinstalling or deleting Worker security state does.
 
 Credentials are not stored in the synchronized Vault.
+
+The current API boundary accepts an injected digest-only credential verifier and an explicit Vault allowlist. This
+is a fail-closed foundation, not the final pairing store: persistent pairing, revocation, and rotation are the next
+Stage F work items.
 
 ## 5. Idempotency
 

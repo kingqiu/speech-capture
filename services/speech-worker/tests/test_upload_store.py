@@ -98,6 +98,7 @@ def test_schema_one_database_migrates_through_current_worker_schema(tmp_path) ->
     connection = sqlite3.connect(database)
     connection.executescript(
         """
+        DROP TABLE job_action_requests;
         DROP TABLE publication_receipts;
         DROP TABLE publication_leases;
         DROP TABLE corrections;

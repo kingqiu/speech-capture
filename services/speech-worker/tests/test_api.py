@@ -103,9 +103,23 @@ def test_openapi_is_versioned_strict_and_has_stable_operation_ids() -> None:
     assert schema["openapi"].startswith("3.1.")
     assert schema["info"]["version"] == PROTOCOL_VERSION
     assert set(schema["paths"]) == {
-        "/v1/health",
         "/v1/capabilities",
         "/v1/capabilities/negotiate",
+        "/v1/health",
+        "/v1/jobs",
+        "/v1/jobs/{job_id}",
+        "/v1/jobs/{job_id}/artifacts",
+        "/v1/jobs/{job_id}/artifacts/{artifact_name}",
+        "/v1/jobs/{job_id}/cancel",
+        "/v1/jobs/{job_id}/events",
+        "/v1/jobs/{job_id}/pause",
+        "/v1/jobs/{job_id}/resume",
+        "/v1/jobs/{job_id}/retry",
+        "/v1/jobs/{job_id}/snapshot",
+        "/v1/uploads",
+        "/v1/uploads/{upload_id}",
+        "/v1/uploads/{upload_id}/complete",
+        "/v1/uploads/{upload_id}/parts/{part_number}",
     }
     assert schema["paths"]["/v1/health"]["get"]["operationId"] == "getHealth"
     assert (
@@ -116,6 +130,34 @@ def test_openapi_is_versioned_strict_and_has_stable_operation_ids() -> None:
         schema["paths"]["/v1/capabilities/negotiate"]["post"]["operationId"]
         == "negotiateCapabilities"
     )
+    private_operations = {
+        operation["operationId"]
+        for path, methods in schema["paths"].items()
+        if path not in {"/v1/health", "/v1/capabilities", "/v1/capabilities/negotiate"}
+        for operation in methods.values()
+    }
+    assert private_operations == {
+        "completeUpload",
+        "cancelJob",
+        "createJob",
+        "createUpload",
+        "downloadJobArtifact",
+        "getJob",
+        "getJobSnapshot",
+        "getJobUpdates",
+        "getUpload",
+        "listJobArtifacts",
+        "listJobs",
+        "pauseJob",
+        "putUploadPart",
+        "resumeJob",
+        "retryJob",
+    }
+    for path, methods in schema["paths"].items():
+        if path in {"/v1/health", "/v1/capabilities", "/v1/capabilities/negotiate"}:
+            continue
+        for operation in methods.values():
+            assert operation["security"] == [{"BearerAuth": []}]
     for name, component in schema["components"]["schemas"].items():
-        if name.endswith(("RequestSchema", "VersionRangeSchema")):
+        if name.endswith(("RequestSchema", "VersionRangeSchema", "Response", "Envelope")):
             assert component["additionalProperties"] is False

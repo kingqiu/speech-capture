@@ -1,7 +1,32 @@
 // Generated Worker protocol wire types. Do not edit manually.
-export const OPENAPI_SHA256 = "686cc2f1e8ad8052fff0c946cda3dbb96e2ef00263261dfc1138aba7797ba58e" as const;
+export const OPENAPI_SHA256 = "7545d5bd8d7e20c8aa01cf62daa3490e6a4d016b6014d9c00d899d70f8b9a0a1" as const;
 export const OPENAPI_VERSION = "3.1.0" as const;
 export const PROTOCOL_VERSION = "1.0.0" as const;
+
+export interface ApiErrorResponse {
+  readonly error: ApiErrorSchema;
+}
+
+export interface ApiErrorSchema {
+  readonly code: string;
+  readonly message: string;
+  readonly request_id: string;
+}
+
+export interface ArtifactListResponse {
+  readonly artifacts: ReadonlyArray<ArtifactSchema>;
+  readonly job_id: string;
+  readonly manifest_sha256: string;
+  readonly speech_id: string;
+}
+
+export interface ArtifactSchema {
+  readonly download_path: string;
+  readonly media_type: "text/markdown" | "application/json";
+  readonly name: "transcript.raw.json" | "transcript.md" | "speech-record.json" | "note.md" | "note.evidence.md" | "timeline.md" | "artifact-manifest.json";
+  readonly sha256: string;
+  readonly size_bytes: number;
+}
 
 export interface CapabilitiesResponse {
   readonly artifact_schema: VersionRangeSchema;
@@ -32,15 +57,125 @@ export interface CompatibilityResponse {
   readonly protocol_version: string | null;
 }
 
-export interface HTTPValidationError {
-  readonly detail?: ReadonlyArray<ValidationError>;
-}
+export type DiarizationStatus =
+  | "not_started"
+  | "processing"
+  | "ready"
+  | "unavailable";
 
 export interface HealthResponse {
   readonly protocol_version: string;
   readonly status: "ok";
   readonly worker_version: string;
 }
+
+export interface JobActionEnvelope {
+  readonly applied: boolean;
+  readonly job: JobSchema;
+}
+
+export interface JobActionRequestSchema {
+  readonly expected_revision: number;
+}
+
+export interface JobCreateSchema {
+  readonly content_type_override?: string | null;
+  readonly language_hint?: string | null;
+  readonly model_profile?: ModelProfile;
+  readonly recording_context?: string | null;
+  readonly upload_id: string;
+}
+
+export interface JobEnvelope {
+  readonly created?: boolean | null;
+  readonly job: JobSchema;
+}
+
+export interface JobListResponse {
+  readonly jobs: ReadonlyArray<JobSchema>;
+}
+
+export interface JobProgressSchema {
+  readonly diarization_status: DiarizationStatus;
+  readonly duration_ms: number;
+  readonly elapsed_seconds: number;
+  readonly estimated_remaining_seconds: number | null;
+  readonly generation: number;
+  readonly job_id: string;
+  readonly processed_ms: number;
+  readonly stage: JobState;
+  readonly stage_progress: number;
+  readonly updated_at: string;
+}
+
+export interface JobSchema {
+  readonly content_type_override: string | null;
+  readonly created_at: string;
+  readonly job_id: string;
+  readonly language_hint: string | null;
+  readonly last_error_code: string | null;
+  readonly last_error_message: string | null;
+  readonly model_profile: ModelProfile;
+  readonly recording_context: string | null;
+  readonly revision: number;
+  readonly source_display_name: string;
+  readonly source_sha256: string;
+  readonly source_size_bytes: number;
+  readonly source_upload_id: string | null;
+  readonly state: JobState;
+  readonly updated_at: string;
+  readonly vault_id: string;
+}
+
+export interface JobSnapshotResponse {
+  readonly has_more_segments: boolean;
+  readonly job: JobSchema;
+  readonly latest_event_sequence: number;
+  readonly next_after_segment_sequence: number;
+  readonly progress: JobProgressSchema | null;
+  readonly provisional: ProvisionalTranscriptSchema | null;
+  readonly resource_report: Readonly<Record<string, unknown>> | null;
+  readonly stable_segments: ReadonlyArray<TranscriptSegmentSchema>;
+}
+
+export type JobState =
+  | "created"
+  | "uploading"
+  | "verifying"
+  | "queued"
+  | "preprocessing"
+  | "transcribing"
+  | "aligning"
+  | "diarizing"
+  | "structuring"
+  | "quality_check"
+  | "processed"
+  | "publishing"
+  | "published"
+  | "paused"
+  | "waiting_user"
+  | "partial"
+  | "failed"
+  | "cancelled";
+
+export interface JobUpdateSchema {
+  readonly created_at: string;
+  readonly event_type: string;
+  readonly job_id: string;
+  readonly job_revision: number;
+  readonly payload: Readonly<Record<string, unknown>>;
+  readonly sequence: number;
+}
+
+export interface JobUpdatesResponse {
+  readonly has_more: boolean;
+  readonly next_after_sequence: number;
+  readonly updates: ReadonlyArray<JobUpdateSchema>;
+}
+
+export type ModelProfile =
+  | "accuracy"
+  | "speed";
 
 export type ProtocolCapability =
   | "resumable_uploads"
@@ -64,13 +199,106 @@ export interface ProtocolLimitsSchema {
   readonly max_upload_parts: number;
 }
 
-export interface ValidationError {
-  readonly ctx?: Readonly<Record<string, unknown>>;
-  readonly input?: unknown;
-  readonly loc: ReadonlyArray<string | number>;
-  readonly msg: string;
-  readonly type: string;
+export interface ProvisionalTranscriptSchema {
+  readonly end_ms: number;
+  readonly generation: number;
+  readonly job_id: string;
+  readonly language: string | null;
+  readonly start_ms: number;
+  readonly text: string;
+  readonly updated_at: string;
 }
+
+export type SpeakerLabelStatus =
+  | "pending"
+  | "anonymous"
+  | "confirmed"
+  | "unavailable";
+
+export type TranscriptOutcome =
+  | "transcribed"
+  | "inaudible"
+  | "non_speech"
+  | "failed";
+
+export interface TranscriptSegmentSchema {
+  readonly confidence: number | null;
+  readonly created_at: string;
+  readonly end_ms: number;
+  readonly error_code: string | null;
+  readonly job_id: string;
+  readonly language: string | null;
+  readonly outcome: TranscriptOutcome;
+  readonly revision: number;
+  readonly segment_id: string;
+  readonly segment_sequence: number;
+  readonly speaker_id: string | null;
+  readonly speaker_label_status: SpeakerLabelStatus;
+  readonly start_ms: number;
+  readonly text: string | null;
+  readonly timing_status: TranscriptTimingStatus;
+  readonly updated_at: string;
+}
+
+export type TranscriptTimingStatus =
+  | "estimated"
+  | "aligned";
+
+export interface UploadCreateSchema {
+  readonly media_type: string;
+  readonly source_display_name: string;
+  readonly source_sha256: string;
+  readonly source_size_bytes: number;
+  readonly vault_id: string;
+}
+
+export interface UploadEnvelope {
+  readonly created?: boolean | null;
+  readonly missing_part_numbers: ReadonlyArray<number>;
+  readonly upload: UploadSchema;
+}
+
+export interface UploadPartEnvelope {
+  readonly created: boolean;
+  readonly part: UploadPartSchema;
+}
+
+export interface UploadPartSchema {
+  readonly created_at: string;
+  readonly part_number: number;
+  readonly sha256: string;
+  readonly size_bytes: number;
+  readonly updated_at: string;
+  readonly upload_id: string;
+}
+
+export interface UploadSchema {
+  readonly audio_stream_count: number | null;
+  readonly chunk_size_bytes: number;
+  readonly completed_at: string | null;
+  readonly created_at: string;
+  readonly detected_format_name: string | null;
+  readonly duration_seconds: number | null;
+  readonly last_error_code: string | null;
+  readonly last_error_message: string | null;
+  readonly media_type: string;
+  readonly part_count: number;
+  readonly received_bytes: number;
+  readonly received_part_count: number;
+  readonly source_display_name: string;
+  readonly source_sha256: string;
+  readonly source_size_bytes: number;
+  readonly state: UploadState;
+  readonly updated_at: string;
+  readonly upload_id: string;
+  readonly vault_id: string;
+}
+
+export type UploadState =
+  | "uploading"
+  | "verifying"
+  | "complete"
+  | "failed";
 
 export interface VersionRangeSchema {
   readonly maximum: string;

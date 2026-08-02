@@ -97,7 +97,7 @@ from speech_capture_worker.transcript import (
     validate_transcript_text,
 )
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 DEFAULT_UPLOAD_CHUNK_SIZE_BYTES = 8 * 1024 * 1024
 MAX_UPLOAD_CHUNK_SIZE_BYTES = 64 * 1024 * 1024
 MAX_UPLOAD_PARTS = 10_000
@@ -937,13 +937,28 @@ class JobStore:
     def list_jobs(
         self,
         *,
+        vault_id: str | None = None,
         states: Sequence[JobState] | None = None,
         limit: int = 100,
     ) -> list[JobRecord]:
         if limit < 1 or limit > 1000:
             raise InvalidJobRequest("limit must be between 1 and 1000.")
+        if vault_id is not None and not SAFE_IDENTIFIER_PATTERN.fullmatch(vault_id):
+            raise InvalidJobRequest("vault_id contains unsupported characters.")
         with self._lock:
-            if states:
+            if states and vault_id is not None:
+                placeholders = ", ".join("?" for _ in states)
+                rows = self._connection.execute(
+                    f"""
+                    SELECT *
+                    FROM jobs
+                    WHERE vault_id = ? AND state IN ({placeholders})
+                    ORDER BY created_at ASC, job_id ASC
+                    LIMIT ?
+                    """,
+                    (vault_id, *[state.value for state in states], limit),
+                ).fetchall()
+            elif states:
                 placeholders = ", ".join("?" for _ in states)
                 rows = self._connection.execute(
                     f"""
@@ -954,6 +969,17 @@ class JobStore:
                     LIMIT ?
                     """,
                     (*[state.value for state in states], limit),
+                ).fetchall()
+            elif vault_id is not None:
+                rows = self._connection.execute(
+                    """
+                    SELECT *
+                    FROM jobs
+                    WHERE vault_id = ?
+                    ORDER BY created_at ASC, job_id ASC
+                    LIMIT ?
+                    """,
+                    (vault_id, limit),
                 ).fetchall()
             else:
                 rows = self._connection.execute(
@@ -1146,6 +1172,106 @@ class JobStore:
                 error_message=error_message,
                 event_type=event_type,
             )
+
+    def apply_job_action(
+        self,
+        job_id: str,
+        *,
+        action: str,
+        expected_revision: int,
+        idempotency_key: str,
+    ) -> tuple[JobRecord, bool]:
+        """Apply one user lifecycle action exactly once across network retries."""
+
+        action_contract = {
+            "pause": (JobState.PAUSED, "user_paused", "job.paused"),
+            "resume": (JobState.QUEUED, "user_resumed", "job.resumed"),
+            "cancel": (JobState.CANCELLED, "user_cancelled", "job.cancelled"),
+            "retry": (JobState.QUEUED, "user_retry_requested", "job.retry_requested"),
+        }
+        if action not in action_contract:
+            raise InvalidJobRequest("The requested job action is not supported.")
+        if (
+            not isinstance(expected_revision, int)
+            or isinstance(expected_revision, bool)
+            or expected_revision < 0
+        ):
+            raise InvalidJobRequest("expected_revision must be zero or greater.")
+        validate_idempotency_key(idempotency_key)
+        target_state, reason_code, event_type = action_contract[action]
+        request_fingerprint = hashlib.sha256(
+            _canonical_json(
+                {
+                    "action": action,
+                    "expected_revision": expected_revision,
+                    "target_state": target_state.value,
+                }
+            ).encode("utf-8")
+        ).hexdigest()
+        with self._transaction():
+            prior = self._connection.execute(
+                """
+                SELECT request_fingerprint, response_json
+                FROM job_action_requests
+                WHERE job_id = ? AND idempotency_key = ?
+                """,
+                (job_id, idempotency_key),
+            ).fetchone()
+            if prior is not None:
+                if str(prior["request_fingerprint"]) != request_fingerprint:
+                    raise IdempotencyConflict(
+                        "The idempotency key is already bound to a different job action.",
+                        details={"job_id": job_id},
+                    )
+                return _job_record_from_dict(_json_object(str(prior["response_json"]))), False
+
+            current = self._row_to_job(self._fetch_job_row(job_id))
+            if current.revision != expected_revision:
+                raise RevisionConflict(
+                    "The job changed after the action snapshot.",
+                    details={
+                        "job_id": job_id,
+                        "expected_revision": expected_revision,
+                        "current_revision": current.revision,
+                    },
+                )
+            if action == "resume" and current.state is not JobState.PAUSED:
+                raise InvalidJobRequest("Only a paused job can be resumed.")
+            if action == "retry" and current.state not in {
+                JobState.FAILED,
+                JobState.PARTIAL,
+                JobState.WAITING_USER,
+            }:
+                raise InvalidJobRequest(
+                    "Only a failed, partial, or waiting job can be retried."
+                )
+            ensure_transition_allowed(current.state, target_state)
+            result = self._transition_in_transaction(
+                current=current,
+                target_state=target_state,
+                reason_code=reason_code,
+                error_code=None,
+                error_message=None,
+                event_type=event_type,
+            )
+            self._connection.execute(
+                """
+                INSERT INTO job_action_requests (
+                    job_id, idempotency_key, action, request_fingerprint,
+                    response_json, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    job_id,
+                    idempotency_key,
+                    action,
+                    request_fingerprint,
+                    _canonical_json(result.to_dict()),
+                    _utc_now(),
+                ),
+            )
+            return result, True
 
     def recover_interrupted_jobs(self) -> list[JobRecord]:
         """Move interrupted active work to its safe restart boundary."""
@@ -3668,6 +3794,34 @@ class JobStore:
                     if self._connection.in_transaction:
                         self._connection.execute("ROLLBACK")
                     raise
+                current = 7
+            if current == 7:
+                try:
+                    self._connection.executescript(
+                        """
+                    BEGIN IMMEDIATE;
+
+                    CREATE TABLE job_action_requests (
+                        job_id TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+                        idempotency_key TEXT NOT NULL,
+                        action TEXT NOT NULL,
+                        request_fingerprint TEXT NOT NULL,
+                        response_json TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        PRIMARY KEY (job_id, idempotency_key)
+                    );
+
+                    CREATE INDEX job_action_requests_job_created_idx
+                    ON job_action_requests (job_id, created_at);
+
+                    PRAGMA user_version = 8;
+                    COMMIT;
+                    """
+                    )
+                except BaseException:
+                    if self._connection.in_transaction:
+                        self._connection.execute("ROLLBACK")
+                    raise
 
     @contextmanager
     def _transaction(self) -> Iterator[None]:
@@ -4728,6 +4882,45 @@ def _canonical_json(value: Any) -> str:
         )
     except (TypeError, ValueError) as exc:
         raise InvalidJobRequest("Job data must be valid finite JSON.") from exc
+
+
+def _job_record_from_dict(value: dict[str, Any]) -> JobRecord:
+    return JobRecord(
+        job_id=str(value["job_id"]),
+        vault_id=str(value["vault_id"]),
+        source_upload_id=(
+            str(value["source_upload_id"])
+            if value.get("source_upload_id") is not None
+            else None
+        ),
+        source_display_name=str(value["source_display_name"]),
+        source_sha256=str(value["source_sha256"]),
+        source_size_bytes=int(value["source_size_bytes"]),
+        state=JobState(str(value["state"])),
+        model_profile=ModelProfile(str(value["model_profile"])),
+        language_hint=(
+            str(value["language_hint"]) if value.get("language_hint") is not None else None
+        ),
+        content_type_override=(
+            str(value["content_type_override"])
+            if value.get("content_type_override") is not None
+            else None
+        ),
+        options=dict(value.get("options", {})),
+        revision=int(value["revision"]),
+        last_error_code=(
+            str(value["last_error_code"])
+            if value.get("last_error_code") is not None
+            else None
+        ),
+        last_error_message=(
+            str(value["last_error_message"])
+            if value.get("last_error_message") is not None
+            else None
+        ),
+        created_at=str(value["created_at"]),
+        updated_at=str(value["updated_at"]),
+    )
 
 
 def _json_object(value: str) -> dict[str, Any]:

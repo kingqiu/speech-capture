@@ -46,6 +46,100 @@ def test_create_job_records_initial_event(tmp_path) -> None:
     assert events[0].to_state is JobState.CREATED
 
 
+def test_job_actions_are_revision_guarded_and_idempotent_across_restart(tmp_path) -> None:
+    database = tmp_path / "worker.sqlite3"
+    with JobStore(database) as store:
+        job, _ = store.create_job(request(), idempotency_key="submit-action")
+        advance(
+            store,
+            job.job_id,
+            [JobState.UPLOADING, JobState.VERIFYING, JobState.QUEUED],
+        )
+        queued = store.get_job(job.job_id)
+        paused, applied = store.apply_job_action(
+            job.job_id,
+            action="pause",
+            expected_revision=queued.revision,
+            idempotency_key="action-pause",
+        )
+        replayed, replay_applied = store.apply_job_action(
+            job.job_id,
+            action="pause",
+            expected_revision=queued.revision,
+            idempotency_key="action-pause",
+        )
+
+        assert applied is True
+        assert replay_applied is False
+        assert replayed == paused
+        assert paused.state is JobState.PAUSED
+        assert [event.event_type for event in store.list_events(job.job_id)].count(
+            "job.paused"
+        ) == 1
+
+        resumed, resumed_applied = store.apply_job_action(
+            job.job_id,
+            action="resume",
+            expected_revision=paused.revision,
+            idempotency_key="action-resume",
+        )
+        assert resumed_applied is True
+        assert resumed.state is JobState.QUEUED
+
+        with pytest.raises(IdempotencyConflict):
+            store.apply_job_action(
+                job.job_id,
+                action="cancel",
+                expected_revision=resumed.revision,
+                idempotency_key="action-pause",
+            )
+
+    with JobStore(database) as restarted:
+        replayed_after_restart, applied_after_restart = restarted.apply_job_action(
+            job.job_id,
+            action="pause",
+            expected_revision=queued.revision,
+            idempotency_key="action-pause",
+        )
+
+    assert applied_after_restart is False
+    assert replayed_after_restart == paused
+
+
+def test_retry_action_requires_a_retryable_terminal_state(tmp_path) -> None:
+    with JobStore(tmp_path / "worker.sqlite3") as store:
+        job, _ = store.create_job(request(), idempotency_key="submit-retry")
+        advance(
+            store,
+            job.job_id,
+            [JobState.UPLOADING, JobState.VERIFYING, JobState.QUEUED],
+        )
+        queued = store.get_job(job.job_id)
+        with pytest.raises(InvalidJobRequest, match="failed, partial, or waiting"):
+            store.apply_job_action(
+                job.job_id,
+                action="retry",
+                expected_revision=queued.revision,
+                idempotency_key="retry-too-early",
+            )
+        failed = store.transition_job(
+            job.job_id,
+            JobState.FAILED,
+            expected_revision=queued.revision,
+            error_code="TEST_FAILURE",
+            error_message="A safe test failure.",
+        )
+        retried, applied = store.apply_job_action(
+            job.job_id,
+            action="retry",
+            expected_revision=failed.revision,
+            idempotency_key="retry-after-failure",
+        )
+
+    assert applied is True
+    assert retried.state is JobState.QUEUED
+
+
 def test_identical_idempotent_request_reuses_job(tmp_path) -> None:
     with JobStore(tmp_path / "worker.sqlite3") as store:
         first, first_created = store.create_job(request(), idempotency_key="submit-001")
