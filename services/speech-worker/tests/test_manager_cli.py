@@ -235,6 +235,75 @@ def test_manager_cli_routes_model_activation_without_launchd(
     assert str(tmp_path) not in output.out
 
 
+def test_manager_cli_builds_diagnostic_bundle_without_returning_output_path(
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    class FakeManager:
+        def status(self, _config):
+            return SimpleNamespace()
+
+    class FakeActivationManager:
+        def __init__(self, _data_dir):
+            pass
+
+        def status(self):
+            return SimpleNamespace(to_dict=lambda: {"generation": 0})
+
+    class Result:
+        def to_dict(self):
+            return {
+                "created": True,
+                "entry_count": 5,
+                "bundle_bytes": 900,
+                "bundle_sha256": "a" * 64,
+            }
+
+    output_path = tmp_path / "private-support-name.zip"
+    monkeypatch.setattr(
+        "speech_capture_worker.manager_cli.LaunchdServiceManager",
+        FakeManager,
+    )
+    monkeypatch.setattr(
+        "speech_capture_worker.manager_cli.ModelActivationManager",
+        FakeActivationManager,
+    )
+    monkeypatch.setattr(
+        "speech_capture_worker.manager_cli.collect_manager_status",
+        lambda _config, _service: SimpleNamespace(to_dict=lambda: {}),
+    )
+    monkeypatch.setattr(
+        "speech_capture_worker.manager_cli.validate_model_profile",
+        lambda _profile: SimpleNamespace(to_dict=lambda: {}, valid=True),
+    )
+
+    def build(output, **_kwargs):
+        assert output == output_path
+        return Result()
+
+    monkeypatch.setattr(
+        "speech_capture_worker.manager_cli.build_diagnostic_bundle",
+        build,
+    )
+
+    result = main([
+        "diagnostic-bundle",
+        "--output",
+        str(output_path),
+        "--data-dir",
+        str(tmp_path / "runtime"),
+        "--executable",
+        str(_executable(tmp_path)),
+    ])
+    output = capsys.readouterr()
+
+    assert result == 0
+    assert output.err == ""
+    assert json.loads(output.out)["diagnostic_bundle"]["created"] is True
+    assert str(output_path) not in output.out
+
+
 class SimpleStatus:
     def __init__(self, service: LaunchdServiceStatus) -> None:
         self.service = service

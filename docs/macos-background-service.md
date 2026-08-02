@@ -46,6 +46,10 @@ uv run speech-capture-manager model-switch \
 uv run speech-capture-manager model-rollback \
   --executable "$PWD/.venv/bin/speech-capture-worker"
 
+uv run speech-capture-manager diagnostic-bundle \
+  --output "/private/tmp/worker-diagnostics.zip" \
+  --executable "$PWD/.venv/bin/speech-capture-worker"
+
 uv run speech-capture-manager restart \
   --executable "$PWD/.venv/bin/speech-capture-worker"
 
@@ -77,6 +81,11 @@ the private active-profile record, while retaining the prior record for rollback
 prior revision before restoring it. MLX execution resolves an activated model to its pinned local snapshot, while
 durable job evidence continues to record only the canonical public model ID. A failed operation leaves the active
 record unchanged and never deletes model files or job data.
+
+The diagnostic bundle contains only fixed JSON entries for public environment versions, the content-free Manager
+status, activation identity, full model validation, and per-entry hashes. Raw logs are intentionally excluded. The
+command refuses existing outputs and does not print the requested path or filename in its result. The example path
+above is for development only; a future native Manager will present a normal save dialog.
 
 ## 3. Restart and login conditions
 

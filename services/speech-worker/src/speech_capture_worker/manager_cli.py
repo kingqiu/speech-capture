@@ -9,6 +9,7 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
+from speech_capture_worker.diagnostic_bundle import build_diagnostic_bundle
 from speech_capture_worker.errors import InvalidJobRequest, WorkerCoreError
 from speech_capture_worker.launchd_service import (
     DEFAULT_LAUNCHD_LABEL,
@@ -54,6 +55,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(json.dumps({"validation": report.to_dict()}, sort_keys=True))
             return 0 if report.valid else 3
         manager = LaunchdServiceManager()
+        if args.command == "diagnostic-bundle":
+            service = manager.status(config)
+            status = collect_manager_status(config, service)
+            activation = ModelActivationManager(config.data_dir).status()
+            validation = validate_model_profile("all")
+            result = build_diagnostic_bundle(
+                args.output,
+                status=status,
+                activation=activation,
+                validation=validation,
+                private_markers=(str(config.data_dir), str(Path.home())),
+            )
+            print(json.dumps({"diagnostic_bundle": result.to_dict()}, sort_keys=True))
+            return 0
         if args.command in {"status", "model-budget"}:
             service = manager.status(config)
             status = collect_manager_status(config, service)
@@ -101,6 +116,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "model-switch",
         "model-rollback",
         "model-activation-status",
+        "diagnostic-bundle",
     ):
         subparser = subparsers.add_parser(command)
         subparser.add_argument("--data-dir", type=Path, default=default_data_dir())
@@ -120,6 +136,8 @@ def _build_parser() -> argparse.ArgumentParser:
                 choices=("accuracy", "speed", "all"),
                 default="accuracy",
             )
+        if command == "diagnostic-bundle":
+            subparser.add_argument("--output", type=Path, required=True)
     return parser
 
 

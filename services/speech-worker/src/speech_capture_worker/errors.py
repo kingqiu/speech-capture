@@ -211,6 +211,10 @@ class ModelRollbackUnavailable(WorkerCoreError):
     code = "MODEL_ROLLBACK_UNAVAILABLE"
 
 
+class DiagnosticBundleFailed(WorkerCoreError):
+    code = "DIAGNOSTIC_BUNDLE_FAILED"
+
+
 class PublicationLeaseConflict(WorkerCoreError):
     code = "PUBLICATION_LEASE_CONFLICT"
 
