@@ -1,6 +1,7 @@
 # Speech Capture Worker Manager
 
-Status: design only; no installable build exists yet.
+Status: the tested macOS LaunchAgent lifecycle core and development Manager CLI exist; the native SwiftUI Manager
+and installable packaged runtime remain to be built.
 
 The Worker Manager is a native macOS companion for setup and maintenance. It will:
 

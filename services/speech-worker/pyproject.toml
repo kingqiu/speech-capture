@@ -33,6 +33,7 @@ diarization = [
 speech-capture-asr-probe = "speech_capture_worker.asr_probe:main"
 speech-capture-vad-probe = "speech_capture_worker.vad_probe:main"
 speech-capture-worker = "speech_capture_worker.worker_cli:main"
+speech-capture-manager = "speech_capture_worker.manager_cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/speech_capture_worker"]

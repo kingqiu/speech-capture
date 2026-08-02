@@ -32,6 +32,10 @@ PUBLIC_ERROR_MESSAGES = {
     "CREDENTIAL_ROTATION_EXPIRED": "The credential rotation has expired.",
     "CREDENTIAL_ROTATION_INVALID": "The replacement credential was not accepted.",
     "CREDENTIAL_ROTATION_CONFLICT": "The credential rotation could not be completed safely.",
+    "SERVICE_PLATFORM_UNSUPPORTED": "Background-service management requires macOS.",
+    "SERVICE_NOT_INSTALLED": "The Worker background service is not installed.",
+    "SERVICE_INSTALL_CONFLICT": "A different Worker service configuration already exists.",
+    "SERVICE_COMMAND_FAILED": "macOS could not complete the Worker service operation.",
 }
 
 

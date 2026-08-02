@@ -331,3 +331,6 @@ The probe checks source duration, chunk timeline continuity, generation truncati
 See the [architecture](../../docs/architecture.md), [Worker API direction](../../docs/worker-api.md),
 [HTTPS and private-network setup](../../docs/private-network-setup.md), and
 [testing strategy](../../docs/testing-strategy.md).
+
+Stage G background-service development and restart boundaries are documented in
+[macOS Worker background service](../../docs/macos-background-service.md).

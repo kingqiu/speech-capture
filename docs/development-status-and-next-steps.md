@@ -1278,10 +1278,10 @@ FastAPI，并加入设备身份和 Vault 授权。阶段 H 的 Obsidian 前端�
 
 #### 工作项
 
-- [ ] 实现 macOS launchd 服务安装、启动、停止和重启。
-- [ ] 验证普通 Worker 崩溃后自动拉起。
+- [x] 实现 macOS launchd 服务安装、启动、停止和重启。
+- [x] 验证普通 Worker 崩溃后自动拉起。
 - [ ] 验证 Mac 重启后的真实启动条件。
-- [ ] 明确 FileVault 解锁、用户登录和同步盘挂载状态。
+- [x] 明确 FileVault 解锁、用户登录和同步盘挂载状态。
 - [ ] 显示模型、磁盘、内存、端口和网络状态。
 - [ ] 下载模型前显示空间预算。
 - [ ] 校验模型文件。
@@ -2643,3 +2643,30 @@ Stage F 的 Worker 端实现已经收口，没有进入 Stage G 或 Obsidian 前
 Stage F 的 Worker 端范围完成。唯一未实现的长期明文 token 系统保护存储明确属于 Stage H 的
 Obsidian 客户端。下一步停在 Stage G 边界，等待项目所有者确认后才进入 Worker Manager 和系统
 后台服务；不得自行开始阶段 G 或阶段 H。
+
+---
+
+## 50. 2026-08-02 Stage G macOS LaunchAgent 生命周期与崩溃恢复
+
+项目所有者已明确确认进入 Stage G。第一个后台服务里程碑已经完成，没有进入 Obsidian 前端：
+
+- 新增 macOS per-user LaunchAgent 核心，使用 `bootstrap`、`bootout`、`kickstart`、`print` 实现
+  install/start/stop/restart/status/uninstall；相同配置可幂等安装，不同既有配置拒绝覆盖；
+- plist 使用绝对 executable 和参数数组，不经过 shell；`KeepAlive`、10 秒 throttle、30 秒退出
+  窗口、`077` umask、私有日志目录；不写入 token、pairing code、源文件名、正文或 prompt；
+- 新增 `speech-capture-manager` 开发者命令入口；状态输出不含本地路径，launchd 失败输出会移除
+  路径/凭据和内部 details；卸载服务不删除数据库、模型、上传和生成产物；
+- 单元测试覆盖 plist、权限、生命周期、幂等、冲突保护、状态解析、非 macOS fail closed 和 Manager
+  输出脱敏；
+- 已在当前 Mac 做隔离真实验证：临时 Worker 健康后以 `SIGKILL` 终止，launchd 随后产生不同 PID，
+  runs 递增并恢复 `/v1/health`；测试服务已自动卸载，无残留 label；
+- `docs/macos-background-service.md` 明确 FileVault、用户登录、logout、同步盘未挂载和 Tailscale
+  提前启动时的边界。per-user LaunchAgent 只能在解锁且用户登录后运行；本地处理可继续，但同步
+  Vault 不可用时必须保持待发布；
+- 冷重启和真实 logout/login 会中断当前用户会话，因此没有自动执行，保留为明确维护窗口内的
+  人工验收项；
+- 当前全套 `379` 项测试以及 Ruff、`compileall`、CLI help、依赖锁和差异检查通过。
+
+Stage G 下一步严格实现不含私人内容的 Manager 状态快照：模型、磁盘、内存、端口和网络；随后
+完成下载前空间预算、模型校验、激活/切换/回滚、诊断包和无需开发环境的打包运行时。不得进入
+Stage H 或 Obsidian 前端。

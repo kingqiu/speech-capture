@@ -187,6 +187,22 @@ class CredentialRotationConflict(WorkerCoreError):
     code = "CREDENTIAL_ROTATION_CONFLICT"
 
 
+class ServiceUnsupported(WorkerCoreError):
+    code = "SERVICE_PLATFORM_UNSUPPORTED"
+
+
+class ServiceNotInstalled(WorkerCoreError):
+    code = "SERVICE_NOT_INSTALLED"
+
+
+class ServiceInstallConflict(WorkerCoreError):
+    code = "SERVICE_INSTALL_CONFLICT"
+
+
+class ServiceCommandFailed(WorkerCoreError):
+    code = "SERVICE_COMMAND_FAILED"
+
+
 class PublicationLeaseConflict(WorkerCoreError):
     code = "PUBLICATION_LEASE_CONFLICT"
 
