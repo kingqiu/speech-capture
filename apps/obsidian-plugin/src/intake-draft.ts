@@ -54,11 +54,85 @@ export function recordingDateHint(
   }
 }
 
+export async function readAudioDurationSeconds(file: File): Promise<number | null> {
+  const sourceUrl = URL.createObjectURL(file);
+  const audio = document.createElement("audio");
+  audio.preload = "metadata";
+  return await new Promise((resolve) => {
+    let settled = false;
+    const finish = (value: number | null): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      window.clearTimeout(timeout);
+      audio.removeAttribute("src");
+      audio.load();
+      URL.revokeObjectURL(sourceUrl);
+      resolve(value);
+    };
+    const timeout = window.setTimeout(() => finish(null), 10_000);
+    audio.addEventListener(
+      "loadedmetadata",
+      () =>
+        finish(
+          Number.isFinite(audio.duration) && audio.duration > 0
+            ? audio.duration
+            : null
+        ),
+      { once: true }
+    );
+    audio.addEventListener("error", () => finish(null), { once: true });
+    audio.src = sourceUrl;
+  });
+}
+
+export function formatDurationSeconds(value: number | null): string {
+  if (value === null || !Number.isFinite(value) || value < 0) {
+    return "读取中";
+  }
+  const totalSeconds = Math.round(value);
+  const hours = Math.floor(totalSeconds / 3_600);
+  const minutes = Math.floor((totalSeconds % 3_600) / 60);
+  const seconds = totalSeconds % 60;
+  return [
+    ...(hours > 0 ? [`${hours.toString()}小时`] : []),
+    ...(minutes > 0 || hours > 0 ? [`${minutes.toString()}分`] : []),
+    `${seconds.toString()}秒`
+  ].join("");
+}
+
 export function formatBytes(bytes: number): string {
+  if (bytes >= 1024 * 1024 * 1024) {
+    return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+  }
   if (bytes < 1024 * 1024) {
     return `${Math.max(1, Math.round(bytes / 1024))} KB`;
   }
   return `${(bytes / (1024 * 1024)).toFixed(bytes < 10 * 1024 * 1024 ? 1 : 0)} MB`;
+}
+
+export function estimateJobDiskBytes(
+  sourceSizeBytes: number,
+  durationSeconds: number | null
+): { readonly workingBytes: number; readonly totalBytes: number } | null {
+  if (
+    durationSeconds === null ||
+    !Number.isFinite(durationSeconds) ||
+    durationSeconds <= 0 ||
+    !Number.isSafeInteger(sourceSizeBytes) ||
+    sourceSizeBytes <= 0
+  ) {
+    return null;
+  }
+  const pcmBytes = Math.ceil(durationSeconds * 16_000 * 2);
+  const workingAudioBytes = pcmBytes * 3;
+  const artifactHeadroomBytes = Math.max(
+    256 * 1024 * 1024,
+    Math.ceil(sourceSizeBytes * 0.1)
+  );
+  const workingBytes = workingAudioBytes + artifactHeadroomBytes;
+  return { workingBytes, totalBytes: sourceSizeBytes + workingBytes };
 }
 
 export function mediaTypeLabel(file: Pick<File, "name" | "type">): string {

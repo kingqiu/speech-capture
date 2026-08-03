@@ -6,9 +6,18 @@ import type {
 } from "../../../packages/protocol/generated/typescript/speech-capture-protocol";
 
 import {
+  nextConnectionAttempt,
+  recoveryAfterFailure,
+  type ConnectionAttemptMode,
+  type ConnectionRecovery
+} from "./connection-recovery";
+import {
+  estimateJobDiskBytes,
   formatBytes,
+  formatDurationSeconds,
   isSupportedAudioFile,
   mediaTypeLabel,
+  readAudioDurationSeconds,
   recordingDateHint,
   suggestRecordingDate,
   type RecordingDateSuggestion
@@ -69,14 +78,6 @@ type SubmissionState =
   | { readonly state: "complete"; readonly jobId: string }
   | { readonly state: "error"; readonly message: string };
 
-type ConnectionRecovery =
-  | {
-      readonly state: "retrying";
-      readonly attemptsCompleted: number;
-      readonly nextAttemptAt: number;
-    }
-  | { readonly state: "exhausted" };
-
 export class SpeechWorkbenchView extends ItemView {
   private viewMode: "intake" | "pairing" | "task" = "intake";
   private workerProbe: WorkerProbeResult | null = null;
@@ -89,6 +90,7 @@ export class SpeechWorkbenchView extends ItemView {
   private fileError: string | null = null;
   private recordingDateSource: RecordingDateSuggestion["source"] = "today";
   private recordingDateEdited = false;
+  private sourceDurationSeconds: number | null = null;
   private submissionState: SubmissionState = { state: "idle" };
   private jobs: readonly JobSchema[] = [];
   private selectedJobId: string | null = null;
@@ -295,10 +297,10 @@ export class SpeechWorkbenchView extends ItemView {
       attr: { "aria-label": "当前任务" }
     });
     const title = aside.createDiv({ cls: "speech-capture-panel__title" });
+    title.createEl("h2", { text: "当前任务" });
     title.appendChild(
       this.collapseButton("right", "收起当前任务栏", "panel-right-close")
     );
-    title.createEl("h2", { text: "当前任务" });
     const job = this.selectedSnapshot?.job ?? this.selectedJob();
     const facts = aside.createDiv({ cls: "speech-capture-task-facts" });
     this.assurance(
@@ -410,7 +412,7 @@ export class SpeechWorkbenchView extends ItemView {
     });
     details.createEl("span", {
       text: this.draft.file
-        ? `${mediaTypeLabel(this.draft.file)} · ${formatBytes(this.draft.file.size)}`
+        ? `${mediaTypeLabel(this.draft.file)} · ${formatDurationSeconds(this.sourceDurationSeconds)} · ${formatBytes(this.draft.file.size)}`
         : "或从这台电脑选择音频文件"
     });
     const choose = dropZone.createEl("button", {
@@ -419,7 +421,7 @@ export class SpeechWorkbenchView extends ItemView {
     });
     choose.addEventListener("click", () => input.click());
     input.addEventListener("change", () => {
-      this.setFile(input.files?.[0] ?? null);
+      void this.setFile(input.files?.[0] ?? null);
     });
     dropZone.addEventListener("dragover", (event) => {
       event.preventDefault();
@@ -431,7 +433,7 @@ export class SpeechWorkbenchView extends ItemView {
     dropZone.addEventListener("drop", (event) => {
       event.preventDefault();
       dropZone.removeClass("is-dragging");
-      this.setFile(event.dataTransfer?.files[0] ?? null);
+      void this.setFile(event.dataTransfer?.files[0] ?? null);
     });
     if (this.fileError) {
       field.createEl("p", {
@@ -584,6 +586,26 @@ export class SpeechWorkbenchView extends ItemView {
       "文件大小",
       this.draft.file ? formatBytes(this.draft.file.size) : "-"
     );
+    this.fact(
+      facts,
+      "时长",
+      this.draft.file ? formatDurationSeconds(this.sourceDurationSeconds) : "-"
+    );
+    this.fact(facts, "录音日期", this.draft.file ? this.draft.recordingDate : "-");
+    const estimate = this.draft.file
+      ? estimateJobDiskBytes(this.draft.file.size, this.sourceDurationSeconds)
+      : null;
+    facts.createEl("h3", { text: "Worker 预计占用" });
+    this.fact(
+      facts,
+      "处理临时文件",
+      estimate ? `约 ${formatBytes(estimate.workingBytes)}` : "验证音频后确认"
+    );
+    this.fact(
+      facts,
+      "预计总占用",
+      estimate ? `约 ${formatBytes(estimate.totalBytes)}` : "验证音频后确认"
+    );
 
     if (this.submissionState.state !== "idle") {
       this.renderSubmissionStatus(aside);
@@ -632,6 +654,26 @@ export class SpeechWorkbenchView extends ItemView {
     const copy = card.createSpan();
     copy.createEl("strong", { text: worker?.displayName ?? "Worker" });
     copy.createEl("small", { text: "已发现 · 尚未配对" });
+    for (const candidate of this.plugin.settings.workers) {
+      if (candidate.id === worker?.id) {
+        continue;
+      }
+      const other = aside.createEl("button", {
+        cls: "speech-capture-device-card",
+        attr: { type: "button", disabled: "true" }
+      });
+      other.appendChild(
+        this.choiceMark(candidate.kind === "local" ? "laptop" : "monitor")
+      );
+      const otherCopy = other.createSpan();
+      otherCopy.createEl("strong", { text: candidate.displayName });
+      otherCopy.createEl("small", {
+        text:
+          candidate.kind === "local"
+            ? "未检测到可用 Worker"
+            : "当前未选择"
+      });
+    }
   }
 
   private renderPairing(layout: HTMLElement): void {
@@ -644,7 +686,7 @@ export class SpeechWorkbenchView extends ItemView {
     main.createEl("h2", { text: `连接${workerName}` });
     main.createEl("p", {
       cls: "speech-capture-pairing__intro",
-      text: "完成一次配对与授权，以建立安全连接。音频和转录仍只在你的设备与 Vault 中处理。"
+      text: `Worker 将在你的${workerName}上本地处理音频，数据只留在你的设备和 Vault 中。请完成一次配对与授权，以建立安全连接。`
     });
 
     const device = this.pairingSection(main, "monitor-check", "确认设备");
@@ -710,10 +752,24 @@ export class SpeechWorkbenchView extends ItemView {
       attr: { "aria-label": "连接前确认" }
     });
     aside.createEl("h2", { text: "连接前确认" });
-    const facts = aside.createDiv({ cls: "speech-capture-pairing-facts" });
-    this.assurance(facts, "cloud-off", "不会上传到公共云端");
-    this.assurance(facts, "vault", "只授权当前 Vault");
-    this.assurance(facts, "clock-3", "配对码仅在短时间内有效");
+    this.pairingConfirmationCard(
+      aside,
+      "cloud-off",
+      "不会上传到公共云端",
+      "音频与转录只在已连接的私有设备和 Vault 中处理。"
+    );
+    this.pairingConfirmationCard(
+      aside,
+      "vault",
+      "只授权当前 Vault",
+      "Worker 不能访问其他 Vault。"
+    );
+    this.pairingConfirmationCard(
+      aside,
+      "clock-3",
+      "配对码仅在短时间内有效",
+      "过期后需要在目标 Mac 上重新生成。"
+    );
     aside.createEl("p", {
       cls: "speech-capture-inline-warning",
       text: `配对码需要在${this.plugin.preferredWorker()?.displayName ?? "Worker"}的 Worker Manager 中生成`
@@ -736,6 +792,20 @@ export class SpeechWorkbenchView extends ItemView {
     const body = section.createDiv({ cls: "speech-capture-pairing-section__body" });
     body.createEl("h3", { text: title });
     return body;
+  }
+
+  private pairingConfirmationCard(
+    parent: HTMLElement,
+    iconName: string,
+    title: string,
+    detail: string
+  ): void {
+    const card = parent.createDiv({ cls: "speech-capture-pairing-confirmation-card" });
+    const icon = card.createSpan();
+    setIcon(icon, iconName);
+    const copy = card.createDiv();
+    copy.createEl("strong", { text: title });
+    copy.createEl("p", { text: detail });
   }
 
   private renderRestoreHandles(layout: HTMLElement): void {
@@ -920,7 +990,7 @@ export class SpeechWorkbenchView extends ItemView {
     row.createSpan({ text: value, attr: { title: value } });
   }
 
-  private setFile(file: File | null): void {
+  private async setFile(file: File | null): Promise<void> {
     if (this.submissionState.state === "running") {
       return;
     }
@@ -932,12 +1002,20 @@ export class SpeechWorkbenchView extends ItemView {
     this.fileError = null;
     this.submissionState = { state: "idle" };
     this.draft.file = file;
+    this.sourceDurationSeconds = null;
     if (file && !this.recordingDateEdited) {
       const suggestion = suggestRecordingDate(file.name, file.lastModified);
       this.draft.recordingDate = suggestion.value;
       this.recordingDateSource = suggestion.source;
     }
     this.render();
+    if (file) {
+      const duration = await readAudioDurationSeconds(file);
+      if (this.draft.file === file) {
+        this.sourceDurationSeconds = duration;
+        this.render();
+      }
+    }
   }
 
   private setProfile(profile: "accuracy" | "speed"): void {
@@ -990,21 +1068,14 @@ export class SpeechWorkbenchView extends ItemView {
   }
 
   private async pollJobs(): Promise<void> {
-    if (this.connectionRecovery?.state === "exhausted") {
-      return;
+    const mode = nextConnectionAttempt(this.connectionRecovery, Date.now());
+    if (mode !== null) {
+      await this.refreshJobs(mode);
     }
-    if (this.connectionRecovery?.state === "retrying") {
-      if (Date.now() < this.connectionRecovery.nextAttemptAt) {
-        return;
-      }
-      await this.refreshJobs("automatic");
-      return;
-    }
-    await this.refreshJobs();
   }
 
   private async refreshJobs(
-    mode: "normal" | "automatic" | "manual" = "normal"
+    mode: ConnectionAttemptMode = "normal"
   ): Promise<void> {
     if (this.refreshingTasks) {
       return;
@@ -1041,22 +1112,11 @@ export class SpeechWorkbenchView extends ItemView {
       this.render();
     } catch (error) {
       if (error instanceof JobClientError && error.code === "unavailable") {
-        if (mode === "manual") {
-          this.connectionRecovery = { state: "exhausted" };
-        } else {
-          const attemptsCompleted =
-            mode === "automatic" && this.connectionRecovery?.state === "retrying"
-              ? this.connectionRecovery.attemptsCompleted + 1
-              : 0;
-          this.connectionRecovery =
-            attemptsCompleted >= 3
-              ? { state: "exhausted" }
-              : {
-                  state: "retrying",
-                  attemptsCompleted,
-                  nextAttemptAt: Date.now() + 60_000
-                };
-        }
+        this.connectionRecovery = recoveryAfterFailure(
+          this.connectionRecovery,
+          mode,
+          Date.now()
+        );
         if (this.viewMode === "task") {
           this.render();
         }
@@ -1289,6 +1349,7 @@ export class SpeechWorkbenchView extends ItemView {
       return;
     }
     this.fileError = null;
+    this.sourceDurationSeconds = null;
     this.recordingDateEdited = false;
     this.recordingDateSource = "today";
     this.submissionState = { state: "idle" };
@@ -1311,6 +1372,12 @@ export class SpeechWorkbenchView extends ItemView {
     }
     if (this.probingWorker) {
       return { text: `${workerName} · 正在检测`, className: "is-neutral" };
+    }
+    if (this.viewMode === "task") {
+      const job = this.selectedSnapshot?.job ?? this.selectedJob();
+      if (job && isActiveJob(job.state)) {
+        return { text: `${workerName} · 正在处理`, className: "is-active" };
+      }
     }
     switch (this.workerProbe?.state) {
       case "ready":
@@ -1467,6 +1534,22 @@ function isPausable(state: JobSchema["state"]): boolean {
     "diarizing",
     "structuring",
     "quality_check"
+  ].includes(state);
+}
+
+function isActiveJob(state: JobSchema["state"]): boolean {
+  return [
+    "created",
+    "uploading",
+    "verifying",
+    "queued",
+    "preprocessing",
+    "transcribing",
+    "aligning",
+    "diarizing",
+    "structuring",
+    "quality_check",
+    "publishing"
   ].includes(state);
 }
 

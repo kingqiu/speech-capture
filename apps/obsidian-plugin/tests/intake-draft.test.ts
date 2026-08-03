@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  estimateJobDiskBytes,
   formatBytes,
+  formatDurationSeconds,
   isSupportedAudioFile,
   mediaTypeLabel,
   recordingDateHint,
@@ -61,5 +63,15 @@ describe("intake draft helpers", () => {
     expect(mediaTypeLabel({ name: "meeting.wav", type: "audio/wav" })).toBe(
       "WAV"
     );
+    expect(formatDurationSeconds(42 * 60 + 18)).toBe("42分18秒");
+    expect(formatDurationSeconds(3_661)).toBe("1小时1分1秒");
+    expect(formatDurationSeconds(null)).toBe("读取中");
+    expect(formatBytes(1.7 * 1024 * 1024 * 1024)).toBe("1.7 GB");
+    expect(
+      estimateJobDiskBytes(486 * 1024 * 1024, 42 * 60 + 18)
+    ).toEqual({
+      workingBytes: 512_083_456,
+      totalBytes: 1_021_691_392
+    });
   });
 });

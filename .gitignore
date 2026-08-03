@@ -6,6 +6,8 @@ node_modules/
 dist/
 build/
 coverage/
+output/playwright/
+.playwright-cli/
 *.tsbuildinfo
 .pnpm-store/
 apps/obsidian-plugin/main.js
