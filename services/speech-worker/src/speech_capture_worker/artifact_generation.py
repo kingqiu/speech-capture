@@ -37,6 +37,7 @@ from speech_capture_worker.note_prompt_profiles import (
     scene_section_labels,
 )
 from speech_capture_worker.recording_context import recording_context_from_options
+from speech_capture_worker.recording_metadata import recording_date_from_options
 from speech_capture_worker.structuring_execution import (
     STRUCTURING_CHECKPOINT_KEY,
     STRUCTURING_STAGE,
@@ -284,6 +285,7 @@ class ArtifactGenerator:
             transcript_edits=transcript_edits,
             document=document,
             corrections=corrections,
+            recording_date=recording_date_from_options(job.options),
         )
         transcript_edits = effective.transcript_edits
         document = effective.document
@@ -567,6 +569,7 @@ def _apply_corrections(
     transcript_edits: dict[str, str],
     document: Any,
     corrections: list[CorrectionRecord],
+    recording_date: str | None,
 ) -> EffectiveCorrections:
     """Overlay the append-only ledger on derived values, never source evidence."""
 
@@ -588,7 +591,6 @@ def _apply_corrections(
                 and display_name.strip()
             ):
                 speaker_names[speaker_id] = display_name.strip()
-    recording_date: str | None = None
     for correction in corrections:
         if correction.field is CorrectionField.TRANSCRIPT_TEXT:
             segment = segment_map.get(correction.target_id or "")

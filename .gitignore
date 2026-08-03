@@ -8,6 +8,8 @@ build/
 coverage/
 *.tsbuildinfo
 .pnpm-store/
+apps/obsidian-plugin/main.js
+apps/obsidian-plugin/main.js.map
 
 # Python
 .venv/

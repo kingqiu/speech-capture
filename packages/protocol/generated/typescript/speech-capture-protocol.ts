@@ -1,5 +1,5 @@
 // Generated Worker protocol wire types. Do not edit manually.
-export const OPENAPI_SHA256 = "447e392e161b0cbd8aabecca5dd811f9c4653b4cd93d4c03bacf47e9cb9bf56e" as const;
+export const OPENAPI_SHA256 = "6300b201c29125314cc362e3c8483285a1f38ebba50d0eb485d29f92a9badfa8" as const;
 export const OPENAPI_VERSION = "3.1.0" as const;
 export const PROTOCOL_VERSION = "1.0.0" as const;
 
@@ -124,6 +124,7 @@ export interface JobCreateSchema {
   readonly language_hint?: string | null;
   readonly model_profile?: ModelProfile;
   readonly recording_context?: string | null;
+  readonly recording_date?: string | null;
   readonly upload_id: string;
 }
 
@@ -158,6 +159,7 @@ export interface JobSchema {
   readonly last_error_message: string | null;
   readonly model_profile: ModelProfile;
   readonly recording_context: string | null;
+  readonly recording_date: string | null;
   readonly revision: number;
   readonly source_display_name: string;
   readonly source_sha256: string;
@@ -233,8 +235,9 @@ export interface PairedDeviceSchema {
 }
 
 export interface PairingConfirmRequestSchema {
-  readonly pairing_code: string;
-  readonly session_id: string;
+  readonly pairing_code?: string | null;
+  readonly pairing_ticket?: string | null;
+  readonly session_id?: string | null;
 }
 
 export interface PairingSessionCreateSchema {
@@ -248,6 +251,7 @@ export interface PairingSessionSecretSchema {
   readonly device_id: string;
   readonly expires_at: string;
   readonly pairing_code: string;
+  readonly pairing_ticket: string;
   readonly session_id: string;
 }
 
@@ -257,6 +261,13 @@ export interface PreparedCredentialRotationSchema {
   readonly expires_at: string;
   readonly generation: number;
   readonly rotation_id: string;
+}
+
+export interface ProfileReadinessSchema {
+  readonly can_start: boolean;
+  readonly issue_codes: ReadonlyArray<string>;
+  readonly model_profile: ModelProfile;
+  readonly state: "ready" | "warning" | "blocked";
 }
 
 export type ProtocolCapability =
@@ -270,7 +281,9 @@ export type ProtocolCapability =
   | "summary_revisions"
   | "evidence_linked_artifacts"
   | "publication_leases"
-  | "atomic_vault_publication";
+  | "atomic_vault_publication"
+  | "review_audio_ranges"
+  | "worker_readiness";
 
 export interface ProtocolLimitsSchema {
   readonly default_upload_chunk_size_bytes: number;
@@ -289,6 +302,21 @@ export interface ProvisionalTranscriptSchema {
   readonly start_ms: number;
   readonly text: string;
   readonly updated_at: string;
+}
+
+export interface ReviewAudioResponse {
+  readonly accept_ranges: "bytes";
+  readonly bits_per_sample: number;
+  readonly channels: number;
+  readonly content_path: string;
+  readonly duration_ms: number;
+  readonly job_id: string;
+  readonly media_type: "audio/wav";
+  readonly retention: "job_lifetime";
+  readonly sample_rate: number;
+  readonly sha256: string;
+  readonly size_bytes: number;
+  readonly status: "available";
 }
 
 export type SpeakerLabelStatus =
@@ -385,4 +413,30 @@ export type UploadState =
 export interface VersionRangeSchema {
   readonly maximum: string;
   readonly minimum: string;
+}
+
+export interface WorkerReadinessResponse {
+  readonly active_model_profile: "accuracy" | "speed" | "all" | null;
+  readonly checked_at: string;
+  readonly disk_free_bytes: number;
+  readonly disk_reserve_bytes: number;
+  readonly disk_total_bytes: number;
+  readonly endpoint_mode: "local_only" | "private_tls";
+  readonly ffmpeg_available: boolean;
+  readonly ffprobe_available: boolean;
+  readonly issue_codes: ReadonlyArray<string>;
+  readonly memory_available_bytes: number;
+  readonly memory_total_bytes: number;
+  readonly memory_used_percent: number;
+  readonly ollama_reachable: boolean;
+  readonly profiles: ReadonlyArray<ProfileReadinessSchema>;
+  readonly protocol_version: string;
+  readonly schema_version: string;
+  readonly security_database_ok: boolean;
+  readonly state: "ready" | "warning" | "blocked";
+  readonly storage_ready: boolean;
+  readonly swap_used_bytes: number;
+  readonly tls_enabled: boolean;
+  readonly worker_database_ok: boolean;
+  readonly worker_version: string;
 }

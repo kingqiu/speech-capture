@@ -1,5 +1,6 @@
 """Versioned FastAPI surface over the durable Worker core."""
 
+from collections.abc import Callable
 from dataclasses import asdict
 from typing import Annotated
 from uuid import uuid4
@@ -44,6 +45,7 @@ from speech_capture_worker.api_schemas import (
     PairingSessionSecretSchema,
     PreparedCredentialRotationSchema,
     ProvisionalTranscriptSchema,
+    ReviewAudioResponse,
     SafeIdentifier,
     Sha256String,
     TranscriptSegmentSchema,
@@ -52,8 +54,10 @@ from speech_capture_worker.api_schemas import (
     UploadPartEnvelope,
     UploadPartSchema,
     UploadSchema,
+    WorkerReadinessResponse,
 )
 from speech_capture_worker.artifact_access import load_artifact_package
+from speech_capture_worker.audio_preprocessing import AudioPreprocessor
 from speech_capture_worker.device_security import DeviceSecurityStore
 from speech_capture_worker.domain import (
     JobRecord,
@@ -68,6 +72,8 @@ from speech_capture_worker.errors import (
     InvalidJobRequest,
     InvalidTransition,
     JobNotFound,
+    ReviewAudioNotFound,
+    ReviewAudioVerificationFailed,
     RevisionConflict,
     SchedulerBusy,
     UploadIncomplete,
@@ -89,8 +95,17 @@ from speech_capture_worker.recording_context import (
     RECORDING_CONTEXT_OPTION,
     recording_context_from_options,
 )
+from speech_capture_worker.recording_metadata import (
+    RECORDING_DATE_OPTION,
+    recording_date_from_options,
+)
 from speech_capture_worker.redaction import public_error_message
+from speech_capture_worker.review_audio import REVIEW_AUDIO_FILENAME, ReviewAudioManager
 from speech_capture_worker.transcript import JobSnapshot, TranscriptSegment
+from speech_capture_worker.worker_readiness import (
+    WorkerReadinessSnapshot,
+    collect_worker_readiness,
+)
 
 PRIVATE_ERROR_RESPONSES = {
     400: {"model": ApiErrorResponse},
@@ -126,6 +141,9 @@ def create_app(
     store: JobStore | None = None,
     credential_verifier: CredentialAuthenticator | None = None,
     device_security_store: DeviceSecurityStore | None = None,
+    readiness_provider: Callable[[], WorkerReadinessSnapshot] | None = None,
+    endpoint_mode: str = "local_only",
+    tls_enabled: bool = False,
 ) -> FastAPI:
     app = FastAPI(
         title="Speech Capture Worker API",
@@ -299,10 +317,17 @@ def create_app(
                 "PAIRING_NOT_CONFIGURED",
                 "Device pairing is not configured.",
             )
-        issued = device_security_store.confirm_pairing(
-            session_id=request.session_id,
-            pairing_code=request.pairing_code,
-        )
+        if request.pairing_ticket is not None:
+            issued = device_security_store.confirm_pairing_ticket(
+                request.pairing_ticket
+            )
+        else:
+            assert request.session_id is not None
+            assert request.pairing_code is not None
+            issued = device_security_store.confirm_pairing(
+                session_id=request.session_id,
+                pairing_code=request.pairing_code,
+            )
         return IssuedDeviceCredentialSchema.model_validate(asdict(issued))
 
     @app.post(
@@ -400,6 +425,34 @@ def create_app(
             replacement_token=replacement_token,
         )
         return ActivatedCredentialRotationSchema.model_validate(asdict(activated))
+
+    @app.get(
+        "/v1/readiness",
+        response_model=WorkerReadinessResponse,
+        operation_id="getWorkerReadiness",
+        tags=["diagnostics"],
+        responses=PRIVATE_ERROR_RESPONSES,
+    )
+    def get_worker_readiness(
+        _principal: Principal,
+        worker_store: Store,
+    ) -> WorkerReadinessResponse:
+        snapshot = (
+            readiness_provider()
+            if readiness_provider is not None
+            else collect_worker_readiness(
+                worker_store.data_directory,
+                worker_database_ok=worker_store.quick_check(),
+                security_database_ok=(
+                    device_security_store.quick_check()
+                    if device_security_store is not None
+                    else False
+                ),
+                endpoint_mode=endpoint_mode,
+                tls_enabled=tls_enabled,
+            )
+        )
+        return WorkerReadinessResponse.model_validate(snapshot.to_dict())
 
     @app.get(
         "/v1/diagnostics/summary",
@@ -556,11 +609,11 @@ def create_app(
     ) -> JobEnvelope:
         upload = worker_store.get_upload(request.upload_id)
         _authorize_existing_vault(principal, upload.vault_id)
-        options = (
-            {RECORDING_CONTEXT_OPTION: request.recording_context}
-            if request.recording_context is not None
-            else {}
-        )
+        options = {}
+        if request.recording_context is not None:
+            options[RECORDING_CONTEXT_OPTION] = request.recording_context
+        if request.recording_date is not None:
+            options[RECORDING_DATE_OPTION] = request.recording_date
         job, created = worker_store.create_job_from_upload(
             request.upload_id,
             idempotency_key=idempotency_key,
@@ -761,6 +814,74 @@ def create_app(
         )
 
     @app.get(
+        "/v1/jobs/{job_id}/review-audio",
+        response_model=ReviewAudioResponse,
+        operation_id="getJobReviewAudio",
+        tags=["review-audio"],
+        responses=PRIVATE_ERROR_RESPONSES,
+    )
+    def get_job_review_audio(
+        job_id: str,
+        principal: Principal,
+        worker_store: Store,
+    ) -> ReviewAudioResponse:
+        _authorized_job(worker_store, principal, job_id)
+        plan = AudioPreprocessor(worker_store).get_plan(job_id)
+        descriptor = ReviewAudioManager(worker_store).get(
+            job_id,
+            normalized_sha256=plan.normalized_sha256,
+            duration_ms=plan.duration_ms,
+        )
+        return ReviewAudioResponse(
+            job_id=job_id,
+            status="available",
+            media_type="audio/wav",
+            size_bytes=descriptor.size_bytes,
+            sha256=descriptor.sha256,
+            duration_ms=descriptor.duration_ms,
+            sample_rate=descriptor.sample_rate,
+            channels=descriptor.channels,
+            bits_per_sample=descriptor.bits_per_sample,
+            accept_ranges="bytes",
+            content_path=f"/v1/jobs/{job_id}/review-audio/content",
+            retention="job_lifetime",
+        )
+
+    @app.get(
+        "/v1/jobs/{job_id}/review-audio/content",
+        operation_id="streamJobReviewAudio",
+        tags=["review-audio"],
+        responses={
+            **PRIVATE_ERROR_RESPONSES,
+            200: {"content": {"audio/wav": {}}},
+            206: {
+                "description": "Requested review-audio byte range.",
+                "content": {"audio/wav": {}},
+            },
+            416: {"description": "Requested byte range is not satisfiable."},
+        },
+    )
+    def stream_job_review_audio(
+        job_id: str,
+        principal: Principal,
+        worker_store: Store,
+    ) -> FileResponse:
+        _authorized_job(worker_store, principal, job_id)
+        plan = AudioPreprocessor(worker_store).get_plan(job_id)
+        manager = ReviewAudioManager(worker_store)
+        descriptor = manager.get(
+            job_id,
+            normalized_sha256=plan.normalized_sha256,
+            duration_ms=plan.duration_ms,
+        )
+        return FileResponse(
+            manager.path_for(job_id, descriptor),
+            media_type=descriptor.media_type,
+            filename=REVIEW_AUDIO_FILENAME,
+            content_disposition_type="inline",
+        )
+
+    @app.get(
         "/v1/jobs/{job_id}/artifacts",
         response_model=ArtifactListResponse,
         operation_id="listJobArtifacts",
@@ -835,7 +956,10 @@ def _error_response(
 
 
 def _worker_error_status(exc: WorkerCoreError) -> int:
-    if isinstance(exc, (JobNotFound, UploadNotFound, ArtifactNotFound)):
+    if isinstance(
+        exc,
+        (JobNotFound, UploadNotFound, ArtifactNotFound, ReviewAudioNotFound),
+    ):
         return 404
     if isinstance(
         exc,
@@ -844,6 +968,7 @@ def _worker_error_status(exc: WorkerCoreError) -> int:
             IdempotencyConflict,
             InvalidTransition,
             RevisionConflict,
+            ReviewAudioVerificationFailed,
             SchedulerBusy,
             UploadIncomplete,
             UploadPartChecksumMismatch,
@@ -957,6 +1082,7 @@ def _job_schema(job: JobRecord) -> JobSchema:
         language_hint=job.language_hint,
         content_type_override=job.content_type_override,
         recording_context=recording_context_from_options(job.options),
+        recording_date=recording_date_from_options(job.options),
         revision=job.revision,
         last_error_code=job.last_error_code,
         last_error_message=public_error_message(job.last_error_code),

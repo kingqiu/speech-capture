@@ -13,6 +13,10 @@ from speech_capture_worker.recording_context import (
     RECORDING_CONTEXT_OPTION,
     normalize_recording_context,
 )
+from speech_capture_worker.recording_metadata import (
+    RECORDING_DATE_OPTION,
+    normalize_recording_date,
+)
 
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 SAFE_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
@@ -190,6 +194,8 @@ class JobCreateRequest:
             raise InvalidJobRequest("options must be a JSON object.")
         if RECORDING_CONTEXT_OPTION in self.options:
             normalize_recording_context(self.options[RECORDING_CONTEXT_OPTION])
+        if RECORDING_DATE_OPTION in self.options:
+            normalize_recording_date(self.options[RECORDING_DATE_OPTION])
         if self.language_hint is not None and (
             not self.language_hint
             or len(self.language_hint) > 64

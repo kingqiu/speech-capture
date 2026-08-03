@@ -46,7 +46,7 @@ to evidence.
 
 Goal: complete the durable local processing contract before frontend implementation.
 
-Status: in progress. Durable storage, resumable verified intake, one-active-job scheduling, resource preflight, progressive snapshots, deterministic normalization, immutable raw attempts, restart-safe local ASR chunk execution, a durable whole-transcript alignment/completeness gate, controlled forced-alignment fallback, conservative PCM evidence for uncovered ranges, evidence-bound definite-silence timeline backfill, and exact-range human-reviewed gap outcomes are implemented.
+Status: in progress. Durable storage, resumable verified intake, one-active-job scheduling, resource preflight, progressive snapshots, deterministic normalization, immutable raw attempts, restart-safe local ASR chunk execution, a durable whole-transcript alignment/completeness gate, controlled forced-alignment fallback, conservative PCM evidence for uncovered ranges, evidence-bound definite-silence timeline backfill, exact-range human-reviewed gap outcomes, authenticated content-free readiness, and Vault-scoped range-capable review audio are implemented.
 
 - versioned protocol and generated types;
 - durable Worker database and artifact store;
@@ -61,7 +61,15 @@ Status: in progress. Durable storage, resumable verified intake, one-active-job 
   transcript evidence remaining authoritative;
 - publication protocol and atomic-package fixtures;
 - transcript corrections and protected human sections;
-- basic Worker Manager setup.
+- basic Worker Manager setup;
+- content-free Worker/Manager readiness exposed to the plugin without claiming an unreachable local service is
+  definitely uninstalled;
+- authenticated, Vault-scoped review-audio seek/range access for remote evidence review, with explicit retention
+  and offline behavior.
+
+The two Stage I blocking backend contracts are complete. Review audio currently follows job lifetime and is not a
+Vault artifact; explicit archival/expiry controls, waveform peaks, and multi-client bandwidth management remain
+later refinements rather than hidden V1 promises.
 
 Exit condition: representative local jobs can be submitted through backend test tools, processed, recovered, and published through stable protocol fixtures, with every plugin-visible state represented.
 
@@ -76,13 +84,24 @@ Goal: validate the complete plugin experience before writing its user-facing pag
 - Reading Capture-aligned visual system and component direction;
 - key interaction visuals generated through Codex GPT Image with synthetic data;
 - narrow-pane, keyboard, reduced-motion, light-theme, and dark-theme behavior;
+- V1 theme inheritance from Obsidian, with plugin-specific color and theme overrides deferred;
 - project-owner review, revision, and explicit approval.
+- approved workbench-home behavior, independently collapsible sidebars, multi-person segment correction, and
+  local-versus-home-Worker selection states.
+- first-time pairing and post-pairing Worker management with keychain-only long-lived credentials;
+- bounded one-minute reconnect retries and automatic no-conflict publication, with diff-first conflict resolution.
 
 Exit condition: the project owner approves the task workbench, progressive transcript, reader, speaker review, resource warning, reconnect, and publication designs. No Obsidian page implementation begins before this condition is met.
+
+Status: completed on 2026-08-03. Stage I must use the approved current-version visuals as fidelity targets, with
+synthetic-data screenshot comparison for each key page; material implementation departures return to design review.
 
 ## Phase 4 — Obsidian local personal alpha
 
 Goal: implement the approved same-Mac plugin workflow.
+
+Entry status: ready. The final backend test, protocol-generation, and private-data audit passed on 2026-08-03.
+Implementation must start from the approved shell and synthetic states, not from a newly invented page structure.
 
 - Obsidian source selection, optional free-form context, and submission;
 - Worker selection and local connection states;
@@ -93,6 +112,8 @@ Goal: implement the approved same-Mac plugin workflow.
 - transcript reader, speaker review, and corrections;
 - structured-note regeneration with protected human sections;
 - accessibility and theme conformance.
+- page-by-page visual comparison against the approved Stage H images, correcting material differences instead of
+  redesigning during implementation.
 
 Exit condition: a user can process, review, and publish real recordings locally without using development commands, and the implementation matches the approved design contract.
 

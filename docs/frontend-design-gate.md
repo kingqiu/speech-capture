@@ -88,3 +88,15 @@ Frontend implementation remains blocked until the project owner explicitly appro
 - the set of remaining design questions that may safely be resolved during implementation.
 
 Any later change that materially alters navigation, evidence semantics, destructive actions, privacy boundaries, or recovery behavior returns the affected flow to design review.
+
+## 7. Approval and implementation fidelity
+
+The project owner explicitly approved Stage H on 2026-08-03. The approved visuals are implementation targets,
+not loose inspiration. Stage I must reproduce their layout, hierarchy, density, typography, semantic colors,
+controls, responsive behavior, and state presentation as closely as the Obsidian host permits.
+
+The written interaction baseline remains authoritative for behavior and data ownership; the current images in the
+visual review index are authoritative for visual presentation; the message catalog is authoritative for interface
+copy. Each key implemented page requires a synthetic-data screenshot comparison against its approved visual before
+the page is considered complete. A material departure must be documented and returned to the project owner for
+review rather than introduced as an implementation-time redesign.

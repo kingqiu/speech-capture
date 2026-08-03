@@ -33,6 +33,7 @@ SECURITY_SCHEMA_VERSION = 2
 DEFAULT_PAIRING_TTL_SECONDS = 300
 MAX_PAIRING_TTL_SECONDS = 900
 MAX_PAIRING_ATTEMPTS = 5
+PAIRING_TICKET_PREFIX = "scpair1"
 DEFAULT_ROTATION_TTL_SECONDS = 600
 MAX_ROTATION_TTL_SECONDS = 3600
 
@@ -41,6 +42,7 @@ MAX_ROTATION_TTL_SECONDS = 3600
 class PairingSessionSecret:
     session_id: str
     pairing_code: str
+    pairing_ticket: str
     device_id: str
     allowed_vault_ids: tuple[str, ...]
     expires_at: str
@@ -158,6 +160,7 @@ class DeviceSecurityStore:
         return PairingSessionSecret(
             session_id=session_id,
             pairing_code=pairing_code,
+            pairing_ticket=create_pairing_ticket(session_id, pairing_code),
             device_id=device_id,
             allowed_vault_ids=vaults,
             expires_at=expires_at,
@@ -240,6 +243,13 @@ class DeviceSecurityStore:
             allowed_vault_ids=vaults,
             generation=generation,
             created_at=now,
+        )
+
+    def confirm_pairing_ticket(self, pairing_ticket: str) -> IssuedDeviceCredential:
+        session_id, pairing_code = parse_pairing_ticket(pairing_ticket)
+        return self.confirm_pairing(
+            session_id=session_id,
+            pairing_code=pairing_code,
         )
 
     def authenticate(self, token: str) -> ApiPrincipal | None:
@@ -564,6 +574,34 @@ def _validate_identity_scope(device_id: str, vault_ids: tuple[str, ...]) -> tupl
     ):
         raise InvalidJobRequest("Pairing Vault identities must be unique safe identifiers.")
     return tuple(sorted(normalized))
+
+
+def create_pairing_ticket(session_id: str, pairing_code: str) -> str:
+    if (
+        not session_id.startswith("pair_")
+        or len(session_id) != 37
+        or any(character not in "0123456789abcdef" for character in session_id[5:])
+        or not pairing_code
+        or len(pairing_code) > 128
+        or any(
+            not (character.isascii() and (character.isalnum() or character in "_-"))
+            for character in pairing_code
+        )
+    ):
+        raise PairingCodeInvalid("The pairing code was not accepted.")
+    return f"{PAIRING_TICKET_PREFIX}.{session_id[5:]}.{pairing_code}"
+
+
+def parse_pairing_ticket(pairing_ticket: str) -> tuple[str, str]:
+    if not isinstance(pairing_ticket, str) or len(pairing_ticket) > 192:
+        raise PairingCodeInvalid("The pairing code was not accepted.")
+    parts = pairing_ticket.strip().split(".")
+    if len(parts) != 3 or parts[0] != PAIRING_TICKET_PREFIX:
+        raise PairingCodeInvalid("The pairing code was not accepted.")
+    session_id = f"pair_{parts[1]}"
+    pairing_code = parts[2]
+    create_pairing_ticket(session_id, pairing_code)
+    return session_id, pairing_code
 
 
 def _validate_device_id(device_id: str) -> None:

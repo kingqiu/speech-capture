@@ -78,6 +78,10 @@ def serve(config: ServerConfig, *, runner: Any | None = None) -> None:
                 store=jobs,
                 credential_verifier=security,
                 device_security_store=security,
+                endpoint_mode=(
+                    "local_only" if _is_loopback(validated.host) else "private_tls"
+                ),
+                tls_enabled=validated.ssl_certfile is not None,
             ),
             host=validated.host,
             port=validated.port,

@@ -565,6 +565,18 @@
             ],
             "title": "Recording Context"
           },
+          "recording_date": {
+            "anyOf": [
+              {
+                "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Recording Date"
+          },
           "upload_id": {
             "pattern": "^upl_[0-9a-f]{32}$",
             "title": "Upload Id",
@@ -753,6 +765,17 @@
             ],
             "title": "Recording Context"
           },
+          "recording_date": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Recording Date"
+          },
           "revision": {
             "title": "Revision",
             "type": "integer"
@@ -807,6 +830,7 @@
           "language_hint",
           "content_type_override",
           "recording_context",
+          "recording_date",
           "revision",
           "last_error_code",
           "last_error_message",
@@ -1073,21 +1097,45 @@
         "additionalProperties": false,
         "properties": {
           "pairing_code": {
-            "maxLength": 128,
-            "minLength": 1,
-            "title": "Pairing Code",
-            "type": "string"
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pairing Code"
+          },
+          "pairing_ticket": {
+            "anyOf": [
+              {
+                "maxLength": 192,
+                "minLength": 1,
+                "pattern": "^scpair1\\.[0-9a-f]{32}\\.[A-Za-z0-9_-]+$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pairing Ticket"
           },
           "session_id": {
-            "pattern": "^pair_[0-9a-f]{32}$",
-            "title": "Session Id",
-            "type": "string"
+            "anyOf": [
+              {
+                "pattern": "^pair_[0-9a-f]{32}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Session Id"
           }
         },
-        "required": [
-          "session_id",
-          "pairing_code"
-        ],
         "title": "PairingConfirmRequestSchema",
         "type": "object"
       },
@@ -1148,6 +1196,13 @@
             "title": "Pairing Code",
             "type": "string"
           },
+          "pairing_ticket": {
+            "maxLength": 192,
+            "minLength": 1,
+            "pattern": "^scpair1\\.[0-9a-f]{32}\\.[A-Za-z0-9_-]+$",
+            "title": "Pairing Ticket",
+            "type": "string"
+          },
           "session_id": {
             "pattern": "^pair_[0-9a-f]{32}$",
             "title": "Session Id",
@@ -1157,6 +1212,7 @@
         "required": [
           "session_id",
           "pairing_code",
+          "pairing_ticket",
           "device_id",
           "allowed_vault_ids",
           "expires_at"
@@ -1201,6 +1257,42 @@
         "title": "PreparedCredentialRotationSchema",
         "type": "object"
       },
+      "ProfileReadinessSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "can_start": {
+            "title": "Can Start",
+            "type": "boolean"
+          },
+          "issue_codes": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Issue Codes",
+            "type": "array"
+          },
+          "model_profile": {
+            "$ref": "#/components/schemas/ModelProfile"
+          },
+          "state": {
+            "enum": [
+              "ready",
+              "warning",
+              "blocked"
+            ],
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "model_profile",
+          "state",
+          "can_start",
+          "issue_codes"
+        ],
+        "title": "ProfileReadinessSchema",
+        "type": "object"
+      },
       "ProtocolCapability": {
         "enum": [
           "resumable_uploads",
@@ -1213,7 +1305,9 @@
           "summary_revisions",
           "evidence_linked_artifacts",
           "publication_leases",
-          "atomic_vault_publication"
+          "atomic_vault_publication",
+          "review_audio_ranges",
+          "worker_readiness"
         ],
         "title": "ProtocolCapability",
         "type": "string"
@@ -1313,6 +1407,86 @@
           "updated_at"
         ],
         "title": "ProvisionalTranscriptSchema",
+        "type": "object"
+      },
+      "ReviewAudioResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "accept_ranges": {
+            "const": "bytes",
+            "title": "Accept Ranges",
+            "type": "string"
+          },
+          "bits_per_sample": {
+            "exclusiveMinimum": 0.0,
+            "title": "Bits Per Sample",
+            "type": "integer"
+          },
+          "channels": {
+            "exclusiveMinimum": 0.0,
+            "title": "Channels",
+            "type": "integer"
+          },
+          "content_path": {
+            "title": "Content Path",
+            "type": "string"
+          },
+          "duration_ms": {
+            "exclusiveMinimum": 0.0,
+            "title": "Duration Ms",
+            "type": "integer"
+          },
+          "job_id": {
+            "pattern": "^job_[0-9a-f]{32}$",
+            "title": "Job Id",
+            "type": "string"
+          },
+          "media_type": {
+            "const": "audio/wav",
+            "title": "Media Type",
+            "type": "string"
+          },
+          "retention": {
+            "const": "job_lifetime",
+            "title": "Retention",
+            "type": "string"
+          },
+          "sample_rate": {
+            "exclusiveMinimum": 0.0,
+            "title": "Sample Rate",
+            "type": "integer"
+          },
+          "sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Sha256",
+            "type": "string"
+          },
+          "size_bytes": {
+            "exclusiveMinimum": 0.0,
+            "title": "Size Bytes",
+            "type": "integer"
+          },
+          "status": {
+            "const": "available",
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "job_id",
+          "status",
+          "media_type",
+          "size_bytes",
+          "sha256",
+          "duration_ms",
+          "sample_rate",
+          "channels",
+          "bits_per_sample",
+          "accept_ranges",
+          "content_path",
+          "retention"
+        ],
+        "title": "ReviewAudioResponse",
         "type": "object"
       },
       "SpeakerLabelStatus": {
@@ -1775,6 +1949,167 @@
           "maximum"
         ],
         "title": "VersionRangeSchema",
+        "type": "object"
+      },
+      "WorkerReadinessResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "active_model_profile": {
+            "anyOf": [
+              {
+                "enum": [
+                  "accuracy",
+                  "speed",
+                  "all"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Active Model Profile"
+          },
+          "checked_at": {
+            "title": "Checked At",
+            "type": "string"
+          },
+          "disk_free_bytes": {
+            "minimum": 0.0,
+            "title": "Disk Free Bytes",
+            "type": "integer"
+          },
+          "disk_reserve_bytes": {
+            "minimum": 0.0,
+            "title": "Disk Reserve Bytes",
+            "type": "integer"
+          },
+          "disk_total_bytes": {
+            "minimum": 0.0,
+            "title": "Disk Total Bytes",
+            "type": "integer"
+          },
+          "endpoint_mode": {
+            "enum": [
+              "local_only",
+              "private_tls"
+            ],
+            "title": "Endpoint Mode",
+            "type": "string"
+          },
+          "ffmpeg_available": {
+            "title": "Ffmpeg Available",
+            "type": "boolean"
+          },
+          "ffprobe_available": {
+            "title": "Ffprobe Available",
+            "type": "boolean"
+          },
+          "issue_codes": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Issue Codes",
+            "type": "array"
+          },
+          "memory_available_bytes": {
+            "minimum": 0.0,
+            "title": "Memory Available Bytes",
+            "type": "integer"
+          },
+          "memory_total_bytes": {
+            "minimum": 0.0,
+            "title": "Memory Total Bytes",
+            "type": "integer"
+          },
+          "memory_used_percent": {
+            "maximum": 100.0,
+            "minimum": 0.0,
+            "title": "Memory Used Percent",
+            "type": "number"
+          },
+          "ollama_reachable": {
+            "title": "Ollama Reachable",
+            "type": "boolean"
+          },
+          "profiles": {
+            "items": {
+              "$ref": "#/components/schemas/ProfileReadinessSchema"
+            },
+            "title": "Profiles",
+            "type": "array"
+          },
+          "protocol_version": {
+            "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$",
+            "title": "Protocol Version",
+            "type": "string"
+          },
+          "schema_version": {
+            "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$",
+            "title": "Schema Version",
+            "type": "string"
+          },
+          "security_database_ok": {
+            "title": "Security Database Ok",
+            "type": "boolean"
+          },
+          "state": {
+            "enum": [
+              "ready",
+              "warning",
+              "blocked"
+            ],
+            "title": "State",
+            "type": "string"
+          },
+          "storage_ready": {
+            "title": "Storage Ready",
+            "type": "boolean"
+          },
+          "swap_used_bytes": {
+            "minimum": 0.0,
+            "title": "Swap Used Bytes",
+            "type": "integer"
+          },
+          "tls_enabled": {
+            "title": "Tls Enabled",
+            "type": "boolean"
+          },
+          "worker_database_ok": {
+            "title": "Worker Database Ok",
+            "type": "boolean"
+          },
+          "worker_version": {
+            "title": "Worker Version",
+            "type": "string"
+          }
+        },
+        "required": [
+          "schema_version",
+          "checked_at",
+          "worker_version",
+          "protocol_version",
+          "state",
+          "endpoint_mode",
+          "tls_enabled",
+          "storage_ready",
+          "worker_database_ok",
+          "security_database_ok",
+          "ffmpeg_available",
+          "ffprobe_available",
+          "ollama_reachable",
+          "active_model_profile",
+          "disk_total_bytes",
+          "disk_free_bytes",
+          "disk_reserve_bytes",
+          "memory_total_bytes",
+          "memory_available_bytes",
+          "memory_used_percent",
+          "swap_used_bytes",
+          "profiles",
+          "issue_codes"
+        ],
+        "title": "WorkerReadinessResponse",
         "type": "object"
       }
     },
@@ -3922,6 +4257,268 @@
         ]
       }
     },
+    "/v1/jobs/{job_id}/review-audio": {
+      "get": {
+        "operationId": "getJobReviewAudio",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "title": "Job Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReviewAudioResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Request Entity Too Large"
+          },
+          "415": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Unsupported Media Type"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Get Job Review Audio",
+        "tags": [
+          "review-audio"
+        ]
+      }
+    },
+    "/v1/jobs/{job_id}/review-audio/content": {
+      "get": {
+        "operationId": "streamJobReviewAudio",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "title": "Job Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              },
+              "audio/wav": {}
+            },
+            "description": "Successful Response"
+          },
+          "206": {
+            "content": {
+              "audio/wav": {}
+            },
+            "description": "Requested review-audio byte range."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Request Entity Too Large"
+          },
+          "415": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Unsupported Media Type"
+          },
+          "416": {
+            "description": "Requested byte range is not satisfiable."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Stream Job Review Audio",
+        "tags": [
+          "review-audio"
+        ]
+      }
+    },
     "/v1/jobs/{job_id}/snapshot": {
       "get": {
         "operationId": "getJobSnapshot",
@@ -4286,6 +4883,122 @@
         "summary": "Create Pairing Session",
         "tags": [
           "pairing"
+        ]
+      }
+    },
+    "/v1/readiness": {
+      "get": {
+        "operationId": "getWorkerReadiness",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkerReadinessResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Request Entity Too Large"
+          },
+          "415": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Unsupported Media Type"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Get Worker Readiness",
+        "tags": [
+          "diagnostics"
         ]
       }
     },

@@ -38,6 +38,8 @@ class ProtocolCapability(StrEnum):
     EVIDENCE_LINKED_ARTIFACTS = "evidence_linked_artifacts"
     PUBLICATION_LEASES = "publication_leases"
     ATOMIC_VAULT_PUBLICATION = "atomic_vault_publication"
+    REVIEW_AUDIO_RANGES = "review_audio_ranges"
+    WORKER_READINESS = "worker_readiness"
 
 
 SUPPORTED_CAPABILITIES = tuple(ProtocolCapability)

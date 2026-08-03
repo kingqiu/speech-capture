@@ -22,6 +22,7 @@ from speech_capture_worker.errors import (
     NormalizedAudioInvalid,
 )
 from speech_capture_worker.job_store import JobStore
+from speech_capture_worker.review_audio import ReviewAudioManager
 
 NORMALIZED_AUDIO_SCHEMA_VERSION = "1.0.0"
 NORMALIZED_SAMPLE_RATE = 16_000
@@ -120,6 +121,7 @@ class AudioPreprocessor:
         min_chunk_ms: int = DEFAULT_MIN_CHUNK_MS,
         boundary_search_ms: int = DEFAULT_BOUNDARY_SEARCH_MS,
         energy_window_ms: int = DEFAULT_ENERGY_WINDOW_MS,
+        review_audio: ReviewAudioManager | None = None,
     ) -> None:
         self.store = store
         self.ffmpeg_executable = ffmpeg_executable or shutil.which("ffmpeg")
@@ -127,6 +129,7 @@ class AudioPreprocessor:
         self.min_chunk_ms = min_chunk_ms
         self.boundary_search_ms = boundary_search_ms
         self.energy_window_ms = energy_window_ms
+        self.review_audio = review_audio or ReviewAudioManager(store)
         _validate_chunk_policy(
             max_chunk_ms=max_chunk_ms,
             min_chunk_ms=min_chunk_ms,
@@ -165,7 +168,13 @@ class AudioPreprocessor:
             source_sha256=job.source_sha256,
             expected_relative_path=expected_relative_path,
         ):
-            return prior, False
+            _, review_changed = self.review_audio.prepare(
+                job_id,
+                normalized_path=normalized_path,
+                normalized_sha256=prior.normalized_sha256,
+                duration_ms=prior.duration_ms,
+            )
+            return prior, review_changed
 
         if normalized_path.is_file() and not normalized_path.is_symlink():
             try:
@@ -202,7 +211,13 @@ class AudioPreprocessor:
             checkpoint_key=CHECKPOINT_KEY,
             payload=plan.to_dict(),
         )
-        return plan, normalized_created or checkpoint_created
+        _, review_changed = self.review_audio.prepare(
+            job_id,
+            normalized_path=normalized_path,
+            normalized_sha256=plan.normalized_sha256,
+            duration_ms=plan.duration_ms,
+        )
+        return plan, normalized_created or checkpoint_created or review_changed
 
     def get_plan(self, job_id: str) -> NormalizedAudioPlan:
         plan = self._load_checkpoint_plan(job_id)

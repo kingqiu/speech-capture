@@ -7,6 +7,7 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from speech_capture_worker.domain import JobState, ModelProfile, UploadState
+from speech_capture_worker.errors import InvalidJobRequest
 from speech_capture_worker.protocol_contract import (
     SEMANTIC_VERSION_PATTERN,
     CompatibilityIssue,
@@ -14,6 +15,7 @@ from speech_capture_worker.protocol_contract import (
     SemanticVersion,
 )
 from speech_capture_worker.recording_context import MAX_RECORDING_CONTEXT_CHARACTERS
+from speech_capture_worker.recording_metadata import normalize_recording_date
 from speech_capture_worker.transcript import (
     DiarizationStatus,
     SpeakerLabelStatus,
@@ -117,8 +119,25 @@ class ApiErrorResponse(PublicSchema):
 
 
 class PairingConfirmRequestSchema(PublicSchema):
-    session_id: str = Field(pattern=r"^pair_[0-9a-f]{32}$")
-    pairing_code: str = Field(min_length=1, max_length=128)
+    pairing_ticket: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=192,
+        pattern=r"^scpair1\.[0-9a-f]{32}\.[A-Za-z0-9_-]+$",
+    )
+    session_id: str | None = Field(default=None, pattern=r"^pair_[0-9a-f]{32}$")
+    pairing_code: str | None = Field(default=None, min_length=1, max_length=128)
+
+    @model_validator(mode="after")
+    def validate_pairing_input(self) -> PairingConfirmRequestSchema:
+        has_ticket = self.pairing_ticket is not None
+        has_legacy = self.session_id is not None or self.pairing_code is not None
+        legacy_complete = self.session_id is not None and self.pairing_code is not None
+        if has_ticket == has_legacy or (has_legacy and not legacy_complete):
+            raise ValueError(
+                "Provide one pairing ticket or the complete legacy session and code."
+            )
+        return self
 
 
 class PairingSessionCreateSchema(PublicSchema):
@@ -130,6 +149,11 @@ class PairingSessionCreateSchema(PublicSchema):
 class PairingSessionSecretSchema(PublicSchema):
     session_id: str = Field(pattern=r"^pair_[0-9a-f]{32}$")
     pairing_code: str
+    pairing_ticket: str = Field(
+        min_length=1,
+        max_length=192,
+        pattern=r"^scpair1\.[0-9a-f]{32}\.[A-Za-z0-9_-]+$",
+    )
     device_id: SafeIdentifier
     allowed_vault_ids: tuple[SafeIdentifier, ...]
     expires_at: str
@@ -262,6 +286,17 @@ class JobCreateSchema(PublicSchema):
         default=None,
         max_length=MAX_RECORDING_CONTEXT_CHARACTERS,
     )
+    recording_date: str | None = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
+
+    @field_validator("recording_date")
+    @classmethod
+    def validate_recording_date(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        try:
+            return normalize_recording_date(value)
+        except InvalidJobRequest as exc:
+            raise ValueError("recording_date must be a valid calendar date.") from exc
 
 
 class JobSchema(PublicSchema):
@@ -276,6 +311,7 @@ class JobSchema(PublicSchema):
     language_hint: str | None
     content_type_override: str | None
     recording_context: str | None
+    recording_date: str | None
     revision: int
     last_error_code: str | None
     last_error_message: str | None
@@ -382,3 +418,51 @@ class ArtifactListResponse(PublicSchema):
     speech_id: str
     manifest_sha256: Sha256String
     artifacts: tuple[ArtifactSchema, ...]
+
+
+class ReviewAudioResponse(PublicSchema):
+    job_id: JobIdentifier
+    status: Literal["available"]
+    media_type: Literal["audio/wav"]
+    size_bytes: int = Field(gt=0)
+    sha256: Sha256String
+    duration_ms: int = Field(gt=0)
+    sample_rate: int = Field(gt=0)
+    channels: int = Field(gt=0)
+    bits_per_sample: int = Field(gt=0)
+    accept_ranges: Literal["bytes"]
+    content_path: str
+    retention: Literal["job_lifetime"]
+
+
+class ProfileReadinessSchema(PublicSchema):
+    model_profile: ModelProfile
+    state: Literal["ready", "warning", "blocked"]
+    can_start: bool
+    issue_codes: tuple[str, ...]
+
+
+class WorkerReadinessResponse(PublicSchema):
+    schema_version: VersionString
+    checked_at: str
+    worker_version: str
+    protocol_version: VersionString
+    state: Literal["ready", "warning", "blocked"]
+    endpoint_mode: Literal["local_only", "private_tls"]
+    tls_enabled: bool
+    storage_ready: bool
+    worker_database_ok: bool
+    security_database_ok: bool
+    ffmpeg_available: bool
+    ffprobe_available: bool
+    ollama_reachable: bool
+    active_model_profile: Literal["accuracy", "speed", "all"] | None
+    disk_total_bytes: int = Field(ge=0)
+    disk_free_bytes: int = Field(ge=0)
+    disk_reserve_bytes: int = Field(ge=0)
+    memory_total_bytes: int = Field(ge=0)
+    memory_available_bytes: int = Field(ge=0)
+    memory_used_percent: float = Field(ge=0, le=100)
+    swap_used_bytes: int = Field(ge=0)
+    profiles: tuple[ProfileReadinessSchema, ...]
+    issue_codes: tuple[str, ...]

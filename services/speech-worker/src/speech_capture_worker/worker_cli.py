@@ -734,6 +734,7 @@ def _dispatch(args: argparse.Namespace) -> int:
                 _write_json({
                     "session_id": session.session_id,
                     "pairing_code": session.pairing_code,
+                    "pairing_ticket": session.pairing_ticket,
                     "device_id": session.device_id,
                     "allowed_vault_ids": session.allowed_vault_ids,
                     "expires_at": session.expires_at,

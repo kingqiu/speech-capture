@@ -123,6 +123,9 @@ def test_openapi_is_versioned_strict_and_has_stable_operation_ids() -> None:
         "/v1/jobs/{job_id}/snapshot",
         "/v1/pairing/confirm",
         "/v1/pairing/sessions",
+        "/v1/readiness",
+        "/v1/jobs/{job_id}/review-audio",
+        "/v1/jobs/{job_id}/review-audio/content",
         "/v1/uploads",
         "/v1/uploads/{upload_id}",
         "/v1/uploads/{upload_id}/complete",
@@ -162,7 +165,9 @@ def test_openapi_is_versioned_strict_and_has_stable_operation_ids() -> None:
         "getDiagnosticsSummary",
         "getJobSnapshot",
         "getJobUpdates",
+        "getJobReviewAudio",
         "getUpload",
+        "getWorkerReadiness",
         "listJobArtifacts",
         "listJobs",
         "listDevices",
@@ -172,6 +177,7 @@ def test_openapi_is_versioned_strict_and_has_stable_operation_ids() -> None:
         "resumeJob",
         "revokeDevice",
         "retryJob",
+        "streamJobReviewAudio",
     }
     for path, methods in schema["paths"].items():
         if path in public_paths:

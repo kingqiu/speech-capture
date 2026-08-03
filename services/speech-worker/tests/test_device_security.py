@@ -10,6 +10,7 @@ from speech_capture_worker.api import create_app
 from speech_capture_worker.device_security import (
     MAX_PAIRING_ATTEMPTS,
     DeviceSecurityStore,
+    parse_pairing_ticket,
 )
 from speech_capture_worker.domain import JobCreateRequest, JobState
 from speech_capture_worker.errors import (
@@ -56,6 +57,64 @@ def test_pairing_issues_token_once_and_authentication_survives_restart(tmp_path)
     assert devices[0].last_used_at is not None
     assert issued.bearer_token not in database.read_bytes().decode("utf-8", errors="ignore")
     assert stat.S_IMODE(database.stat().st_mode) == 0o600
+
+
+def test_single_pairing_ticket_preserves_attempt_limited_session_security(tmp_path) -> None:
+    database = tmp_path / "security.sqlite3"
+    with DeviceSecurityStore(database) as security:
+        session = security.create_pairing_session(
+            device_id="laptop_ticket",
+            allowed_vault_ids=("vault_one",),
+        )
+        decoded = parse_pairing_ticket(session.pairing_ticket)
+        issued = security.confirm_pairing_ticket(session.pairing_ticket)
+
+        assert decoded == (session.session_id, session.pairing_code)
+        assert session.pairing_ticket.startswith("scpair1.")
+        assert security.authenticate(issued.bearer_token) is not None
+        with pytest.raises(PairingSessionExpired):
+            security.confirm_pairing_ticket(session.pairing_ticket)
+
+    database_bytes = database.read_bytes()
+    assert session.pairing_code.encode() not in database_bytes
+    assert session.pairing_ticket.encode() not in database_bytes
+
+
+def test_pairing_api_accepts_one_ticket_field_and_rejects_ambiguous_input(
+    tmp_path,
+) -> None:
+    with (
+        DeviceSecurityStore(tmp_path / "security.sqlite3") as security,
+        JobStore(tmp_path / "worker.sqlite3") as jobs,
+    ):
+        session = security.create_pairing_session(
+            device_id="laptop_ticket_api",
+            allowed_vault_ids=("vault_one",),
+        )
+        client = TestClient(
+            create_app(
+                store=jobs,
+                credential_verifier=security,
+                device_security_store=security,
+            )
+        )
+        ambiguous = client.post(
+            "/v1/pairing/confirm",
+            json={
+                "pairing_ticket": session.pairing_ticket,
+                "session_id": session.session_id,
+                "pairing_code": session.pairing_code,
+            },
+        )
+        confirmation = client.post(
+            "/v1/pairing/confirm",
+            json={"pairing_ticket": session.pairing_ticket},
+        )
+
+    assert ambiguous.status_code == 422
+    assert session.pairing_ticket not in ambiguous.text
+    assert confirmation.status_code == 200
+    assert confirmation.json()["bearer_token"].startswith("scw_")
 
 
 def test_wrong_pairing_codes_are_rate_limited_and_persisted(tmp_path) -> None:

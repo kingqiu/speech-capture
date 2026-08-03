@@ -23,6 +23,7 @@ The Worker core now has an executable local foundation for:
 - alignment and speaker-attribution revisions that preserve stable text;
 - bounded reconnect snapshots and content-free update cursors;
 - deterministic private 16 kHz mono PCM normalization;
+- deterministic private 8 kHz mono review-audio derivation for authenticated range playback;
 - complete frame-based, energy-aware ASR chunk plans;
 - immutable raw ASR attempts with checksummed private files;
 - one-chunk-at-a-time local MLX execution, retry, replay, and safe resource pause;
@@ -37,10 +38,11 @@ The Worker core now has an executable local foundation for:
 - verified seven-file Vault packages written through a temporary sibling and atomic directory rename;
 - idempotent publication retry with existing-user-content and sync-conflict preservation;
 - a developer CLI.
+- an authenticated FastAPI surface, including Vault-scoped review-audio access and content-free readiness.
 
-This is not yet the network Worker service. The local core can run ASR, diarization, structuring,
-artifact generation, and verified Vault publication through backend tools, but it does not yet run a
-continuous background job loop, expose FastAPI, or authenticate and authorize devices.
+The Worker now exposes its versioned authenticated FastAPI surface and can run ASR, diarization,
+structuring, artifact generation, and verified Vault publication. The remaining product boundary is
+the Obsidian client and its approved interaction flow, not a replacement shell-command interface.
 
 ## 2. Core invariants
 
@@ -230,7 +232,9 @@ Upload parts and assembled sources use:
 - generated upload IDs and part numbers rather than user-supplied path components;
 - symbolic-link and resolved-path boundary checks.
 
-Normalized audio and raw ASR attempts use the same private-directory, restrictive-permission, same-directory atomic-write, checksum, and path-boundary rules.
+Normalized audio, review audio, and raw ASR attempts use the same private-directory,
+restrictive-permission, same-directory atomic-write, checksum, and path-boundary rules. Review audio
+is a job-lifetime private derivative and is never included in the published Vault package.
 
 ## 5. State machine
 
@@ -836,6 +840,9 @@ The Worker package currently tests:
 - progressive preview preservation through restart recovery;
 - CLI snapshot and update-feed reconstruction.
 - deterministic PCM normalization and normalized-file recovery;
+- deterministic, private review-audio generation, idempotent recovery, checksum and symlink rejection;
+- authenticated review-audio metadata and standard byte-range playback with Vault isolation;
+- authenticated content-free Worker readiness across storage, memory, tools, model profiles, and endpoint mode;
 - exact frame coverage and low-energy chunk-boundary selection;
 - raw-attempt idempotency, immutability, permissions, checksum verification, and concurrent commit;
 - succeeded-attempt replay without a second model call;
@@ -908,13 +915,13 @@ The scheduler integration continued that source into a bound revision-three queu
 
 ## 15. Next implementation boundary
 
-The next layer will add the formal FastAPI protocol, capability negotiation, device pairing, and
-Vault-scoped authorization around the now-tested local core. The Obsidian frontend remains a later
-stage after that API and security boundary are accepted.
+The next layer is the approved Stage I Obsidian client. It must consume the generated protocol,
+authenticated readiness snapshot, and Vault-scoped review-audio endpoints without exposing private
+paths or treating an unreachable endpoint as proof that a Worker is uninstalled. Each key page must
+be compared against the approved Stage H image at the same viewport and theme; material departures
+return to design review.
 
-Continuous multi-chunk ASR batches are now available through `run-asr-all`; a
-full packaged background stage loop will still be needed for the network
-service. Anonymous speaker attribution is implemented, covered by
+Continuous multi-chunk ASR batches are available through `run-asr-all`. Anonymous speaker attribution is implemented, covered by
 deterministic-engine tests, and validated on a real 60-second excerpt with
 three anonymous speakers. Content classification and evidence-linked
 extraction are implemented with deterministic-engine tests; real Ollama model

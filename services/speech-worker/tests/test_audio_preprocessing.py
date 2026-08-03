@@ -20,6 +20,7 @@ from speech_capture_worker.errors import (
 )
 from speech_capture_worker.job_store import JobStore
 from speech_capture_worker.media_probe import MediaProbeResult
+from speech_capture_worker.review_audio import ReviewAudioManager
 
 
 def wav_bytes(*, duration_seconds: float, sample_rate: int = 16_000) -> bytes:
@@ -130,6 +131,13 @@ def test_normalization_plan_is_private_idempotent_and_survives_reopen(tmp_path) 
         first, first_created = preprocessor.prepare(job.job_id)
         repeated, repeated_created = preprocessor.prepare(job.job_id)
         normalized_path = preprocessor.get_normalized_path(job.job_id)
+        review_manager = ReviewAudioManager(store)
+        review = review_manager.get(
+            job.job_id,
+            normalized_sha256=first.normalized_sha256,
+            duration_ms=first.duration_ms,
+        )
+        review_path = review_manager.path_for(job.job_id, review)
         checkpoints = store.list_checkpoints(job.job_id, stage="preprocessing")
 
     with JobStore(database) as reopened:
@@ -145,6 +153,9 @@ def test_normalization_plan_is_private_idempotent_and_survives_reopen(tmp_path) 
     assert len(first.chunks) == 1
     assert checkpoints[0].checkpoint_key == CHECKPOINT_KEY
     assert stat.S_IMODE(normalized_path.stat().st_mode) & 0o077 == 0
+    assert review.duration_ms == first.duration_ms
+    assert review.sample_rate == 8_000
+    assert stat.S_IMODE(review_path.stat().st_mode) & 0o077 == 0
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")

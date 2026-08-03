@@ -2,7 +2,7 @@
 
 from typing import Final, Literal, NotRequired, TypeAlias, TypedDict
 
-OPENAPI_SHA256: Final = "447e392e161b0cbd8aabecca5dd811f9c4653b4cd93d4c03bacf47e9cb9bf56e"
+OPENAPI_SHA256: Final = "6300b201c29125314cc362e3c8483285a1f38ebba50d0eb485d29f92a9badfa8"
 OPENAPI_VERSION: Final = "3.1.0"
 PROTOCOL_VERSION: Final = "1.0.0"
 
@@ -57,6 +57,8 @@ ProtocolCapability: TypeAlias = Literal[
     'evidence_linked_artifacts',
     'publication_leases',
     'atomic_vault_publication',
+    'review_audio_ranges',
+    'worker_readiness',
 ]
 
 SpeakerLabelStatus: TypeAlias = Literal[
@@ -152,6 +154,7 @@ class JobCreateSchema(TypedDict):
     language_hint: NotRequired[str | None]
     model_profile: NotRequired[ModelProfile]
     recording_context: NotRequired[str | None]
+    recording_date: NotRequired[str | None]
     upload_id: str
 
 class JobProgressSchema(TypedDict):
@@ -175,6 +178,7 @@ class JobSchema(TypedDict):
     last_error_message: str | None
     model_profile: ModelProfile
     recording_context: str | None
+    recording_date: str | None
     revision: int
     source_display_name: str
     source_sha256: str
@@ -202,8 +206,9 @@ class PairedDeviceSchema(TypedDict):
     revoked_at: str | None
 
 class PairingConfirmRequestSchema(TypedDict):
-    pairing_code: str
-    session_id: str
+    pairing_code: NotRequired[str | None]
+    pairing_ticket: NotRequired[str | None]
+    session_id: NotRequired[str | None]
 
 class PairingSessionCreateSchema(TypedDict):
     allowed_vault_ids: list[str]
@@ -215,6 +220,7 @@ class PairingSessionSecretSchema(TypedDict):
     device_id: str
     expires_at: str
     pairing_code: str
+    pairing_ticket: str
     session_id: str
 
 class PreparedCredentialRotationSchema(TypedDict):
@@ -223,6 +229,12 @@ class PreparedCredentialRotationSchema(TypedDict):
     expires_at: str
     generation: int
     rotation_id: str
+
+class ProfileReadinessSchema(TypedDict):
+    can_start: bool
+    issue_codes: list[str]
+    model_profile: ModelProfile
+    state: Literal['ready', 'warning', 'blocked']
 
 class ProtocolLimitsSchema(TypedDict):
     default_upload_chunk_size_bytes: int
@@ -240,6 +252,20 @@ class ProvisionalTranscriptSchema(TypedDict):
     start_ms: int
     text: str
     updated_at: str
+
+class ReviewAudioResponse(TypedDict):
+    accept_ranges: Literal['bytes']
+    bits_per_sample: int
+    channels: int
+    content_path: str
+    duration_ms: int
+    job_id: str
+    media_type: Literal['audio/wav']
+    retention: Literal['job_lifetime']
+    sample_rate: int
+    sha256: str
+    size_bytes: int
+    status: Literal['available']
 
 class TranscriptSegmentSchema(TypedDict):
     confidence: float | None
@@ -360,6 +386,31 @@ class UploadPartEnvelope(TypedDict):
     created: bool
     part: UploadPartSchema
 
+class WorkerReadinessResponse(TypedDict):
+    active_model_profile: Literal['accuracy', 'speed', 'all'] | None
+    checked_at: str
+    disk_free_bytes: int
+    disk_reserve_bytes: int
+    disk_total_bytes: int
+    endpoint_mode: Literal['local_only', 'private_tls']
+    ffmpeg_available: bool
+    ffprobe_available: bool
+    issue_codes: list[str]
+    memory_available_bytes: int
+    memory_total_bytes: int
+    memory_used_percent: float
+    ollama_reachable: bool
+    profiles: list[ProfileReadinessSchema]
+    protocol_version: str
+    schema_version: str
+    security_database_ok: bool
+    state: Literal['ready', 'warning', 'blocked']
+    storage_ready: bool
+    swap_used_bytes: int
+    tls_enabled: bool
+    worker_database_ok: bool
+    worker_version: str
+
 __all__ = [
     "OPENAPI_SHA256",
     "OPENAPI_VERSION",
@@ -398,9 +449,11 @@ __all__ = [
     "PairingSessionCreateSchema",
     "PairingSessionSecretSchema",
     "PreparedCredentialRotationSchema",
+    "ProfileReadinessSchema",
     "ProtocolCapability",
     "ProtocolLimitsSchema",
     "ProvisionalTranscriptSchema",
+    "ReviewAudioResponse",
     "SpeakerLabelStatus",
     "TranscriptOutcome",
     "TranscriptSegmentSchema",
@@ -412,4 +465,5 @@ __all__ = [
     "UploadSchema",
     "UploadState",
     "VersionRangeSchema",
+    "WorkerReadinessResponse",
 ]

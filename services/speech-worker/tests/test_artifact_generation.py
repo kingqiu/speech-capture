@@ -35,6 +35,7 @@ from speech_capture_worker.errors import (
 )
 from speech_capture_worker.job_store import JobStore
 from speech_capture_worker.media_probe import MediaProbeResult
+from speech_capture_worker.recording_metadata import RECORDING_DATE_OPTION
 from speech_capture_worker.resources import (
     GIB,
     DiskSnapshot,
@@ -328,6 +329,7 @@ def create_quality_check_job(
     scene_kind: str | None = None,
     scene_title: str | None = None,
     speaker_id: str | None = None,
+    recording_date: str | None = None,
 ):
     content = wav_bytes(duration_seconds=duration_seconds)
     checksum = hashlib.sha256(content).hexdigest()
@@ -351,6 +353,11 @@ def create_quality_check_job(
     queued, _ = store.create_job_from_upload(
         upload.upload_id,
         idempotency_key=f"artifacts-job-{suffix}",
+        options=(
+            {RECORDING_DATE_OPTION: recording_date}
+            if recording_date is not None
+            else {}
+        ),
     )
     claimed = store.claim_job_for_processing(
         queued.job_id,
@@ -429,6 +436,7 @@ def test_artifact_generation_writes_four_markdown_files_and_two_machine_records(
             store,
             duration_seconds=95,
             suffix="complete",
+            recording_date="2026-07-31",
         )
         result = ArtifactGenerator(store).generate(job.job_id)
         package = store.get_job_stage_directory(job.job_id, stage="artifacts")
@@ -465,6 +473,7 @@ def test_artifact_generation_writes_four_markdown_files_and_two_machine_records(
         assert speech_record["content"]["automatic_type"] == "meeting"
         assert speech_record["document"]["title"] == "平台规划会议"
         assert speech_record["document"]["timeline_sections"]
+        assert speech_record["dates"]["recording_date"] == "2026-07-31"
         assert speech_record["segments"]
         assert speech_record["segments"][0]["raw_text"]
         assert speech_record["findings"][0]["evidence"]
@@ -626,6 +635,7 @@ def test_append_only_corrections_regenerate_only_derived_artifacts(tmp_path) -> 
             duration_seconds=95,
             suffix="corrections",
             speaker_id="speaker_0",
+            recording_date="2026-07-31",
         )
         ArtifactGenerator(store).generate(job.job_id)
         package = store.get_job_stage_directory(job.job_id, stage="artifacts")
@@ -687,7 +697,7 @@ def test_append_only_corrections_regenerate_only_derived_artifacts(tmp_path) -> 
             job.job_id,
             field=CorrectionField.RECORDING_DATE,
             target_id=None,
-            before=None,
+            before="2026-07-31",
             after="2026-08-01",
             author="test-user",
             idempotency_key="correction-date-1",

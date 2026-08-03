@@ -30,6 +30,7 @@ resources.
 GET    /v1/health
 GET    /v1/capabilities
 POST   /v1/capabilities/negotiate
+GET    /v1/readiness
 
 POST   /v1/pairing/sessions
 POST   /v1/pairing/confirm
@@ -54,6 +55,8 @@ POST   /v1/jobs/{job_id}/retry
 GET    /v1/jobs/{job_id}/snapshot
 GET    /v1/jobs/{job_id}/events
 GET    /v1/jobs/{job_id}/artifacts
+GET    /v1/jobs/{job_id}/review-audio
+GET    /v1/jobs/{job_id}/review-audio/content
 
 POST   /v1/jobs/{job_id}/publication-claims
 POST   /v1/jobs/{job_id}/publication-acknowledgements
@@ -69,10 +72,16 @@ POST   /v1/diagnostics/export
 ### 3.1 Implemented Stage F surface
 
 The checked-in OpenAPI now implements pairing, authenticated device management, two-phase credential rotation,
-uploads, jobs, lifecycle actions, bounded snapshots and updates, artifact listing, and integrity-checked artifact
-download. Upload status includes exact missing part numbers; the update feed is bounded and deliberately excludes
-transcript text. The authenticated diagnostic summary exposes only scoped counts, versions, and database health.
-Model management, diagnostic export, and publication lease HTTP routes remain reserved.
+uploads, jobs, lifecycle actions, bounded snapshots and updates, artifact listing, integrity-checked artifact
+download, time-aligned review audio with HTTP byte ranges, and an authenticated content-free readiness snapshot.
+Upload status includes exact missing part numbers; the update feed is bounded and deliberately excludes transcript
+text. Authenticated diagnostics expose only scoped counts, versions, health, resources, runtime availability, active
+model profile, and stable issue codes. Model management, diagnostic export, and publication lease HTTP routes remain
+reserved.
+
+`POST /v1/jobs` also accepts an optional canonical `recording_date` (`YYYY-MM-DD`). It is validated as a real
+calendar date, returned on every job representation, and used only as initial metadata for derived artifacts. A later
+append-only recording-date correction may replace it; neither path mutates the source audio or raw ASR evidence.
 
 ## 4. Authentication
 
@@ -94,6 +103,12 @@ Remote access requires:
 4. an allowed Vault identity.
 
 Pairing creates a per-device revocable credential. Restarting or upgrading the Worker does not require pairing again. Reinstalling or deleting Worker security state does.
+
+The Worker Manager-facing pairing response also includes one short-lived `pairing_ticket`. It combines the public
+session locator and secret code into one pasteable value so the approved client presents only one `配对码` field.
+`POST /v1/pairing/confirm` accepts that single field while retaining the legacy `session_id` plus `pairing_code`
+form for compatibility; supplying both forms is rejected. The ticket inherits the same five-attempt, expiry, and
+single-consumption rules and is never stored in plaintext.
 
 Credentials are not stored in the synchronized Vault.
 
@@ -316,6 +331,31 @@ Stable segments use independent `after_segment_sequence` and `segment_limit` pag
 
 Committed timeline outcomes are `transcribed`, `inaudible`, `non_speech`, or `failed`. Only `transcribed` carries text. Segment text stays stable while alignment and speaker metadata use guarded revisions.
 
+### 8.1 Review audio
+
+The preprocessing boundary creates a deterministic private review WAV from the verified 16 kHz normalized audio.
+It is 8 kHz, 8-bit, mono PCM (64 kbit/s payload), contains no metadata, and must preserve total timeline duration
+within 1 millisecond. The file and a checksum-bound private checkpoint live under the job directory and are not
+added to the Vault artifact package.
+
+`GET /v1/jobs/{job_id}/review-audio` returns only authorized metadata: media type, size, checksum, duration, PCM
+facts, a content path, byte-range support, and `job_lifetime` retention. The content endpoint reuses device bearer
+authentication and job Vault authorization. Standard byte ranges return `206`, `Accept-Ranges`, and
+`Content-Range`, so a client can seek without downloading the whole file. Missing, tampered, symlinked, or
+checksum-incompatible review audio is rejected without exposing its path or content.
+
+The personal MVP uses job-lifetime retention and a normal time slider. Optional waveform peaks, explicit expiry
+policies, and multi-client bandwidth controls remain later operational refinements; their absence does not permit
+public transport or publishing audio into the Vault.
+
+### 8.2 Worker readiness
+
+`GET /v1/readiness` is authenticated and contains no filenames, transcript text, paths, job content, endpoints, or
+credentials. It reports database health, storage readiness, FFmpeg/FFprobe availability, local Ollama reachability,
+the active validated model profile, disk reserve facts, memory/swap facts, per-profile `ready`/`warning`/`blocked`
+decisions, and stable issue codes. A reachable health endpoint is not treated as proof that a new job can start;
+the plugin uses this readiness result after authentication.
+
 ## 9. Event stream
 
 Each event has:
@@ -367,6 +407,9 @@ SOURCE_UNDECODABLE
 AUDIO_NORMALIZATION_UNAVAILABLE
 AUDIO_NORMALIZATION_FAILED
 NORMALIZED_AUDIO_INVALID
+REVIEW_AUDIO_NOT_FOUND
+REVIEW_AUDIO_GENERATION_FAILED
+REVIEW_AUDIO_VERIFICATION_FAILED
 DISK_RESERVE_TOO_LOW
 MEMORY_PRESSURE_PAUSED
 MODEL_NOT_READY

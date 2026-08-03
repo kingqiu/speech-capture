@@ -90,6 +90,7 @@ def _create_job(client: TestClient, upload_id: str) -> dict:
         json={
             "upload_id": upload_id,
             "recording_context": "客户公司正确名称是聚衣堂。",
+            "recording_date": "2026-08-03",
             "content_type_override": "meeting",
         },
     )
@@ -219,6 +220,7 @@ def test_resumable_upload_job_snapshot_updates_and_vault_isolation(tmp_path) -> 
         assert job["created"] is True
         assert job["job"]["state"] == "queued"
         assert job["job"]["recording_context"] == "客户公司正确名称是聚衣堂。"
+        assert job["job"]["recording_date"] == "2026-08-03"
         job_id = job["job"]["job_id"]
 
         pause = client.post(
@@ -270,6 +272,30 @@ def test_resumable_upload_job_snapshot_updates_and_vault_isolation(tmp_path) -> 
     assert "聚衣堂" not in updates.text
     assert [item["job_id"] for item in listing.json()["jobs"]] == [job_id]
     assert denied_listing.status_code == 403
+
+
+def test_job_creation_rejects_invalid_calendar_date_without_echoing_input(tmp_path) -> None:
+    invalid_date = "2026-02-31"
+    with JobStore(
+        tmp_path / "worker.sqlite3",
+        upload_chunk_size_bytes=4,
+        source_probe=_probe,
+    ) as store:
+        client = TestClient(create_app(store=store, credential_verifier=_verifier("vault_primary")))
+        upload = _create_upload(client)
+        _complete_upload(client, upload)
+        response = client.post(
+            "/v1/jobs",
+            headers={**AUTHORIZATION, "Idempotency-Key": "job-invalid-date"},
+            json={
+                "upload_id": upload["upload"]["upload_id"],
+                "recording_date": invalid_date,
+            },
+        )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "REQUEST_VALIDATION_FAILED"
+    assert invalid_date not in response.text
 
 
 def test_existing_resource_in_another_vault_is_hidden(tmp_path) -> None:

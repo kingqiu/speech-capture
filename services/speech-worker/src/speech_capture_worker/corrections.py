@@ -4,13 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 from dataclasses import asdict, dataclass
-from datetime import date
 from enum import StrEnum
 
 from speech_capture_worker.domain import SAFE_IDENTIFIER_PATTERN
 from speech_capture_worker.errors import InvalidJobRequest
+from speech_capture_worker.recording_metadata import normalize_recording_date
 from speech_capture_worker.transcript import validate_speaker_id, validate_transcript_text
 
 MAX_CORRECTION_AUTHOR_CHARACTERS = 200
@@ -133,11 +132,4 @@ def _validate_display_name(value: str) -> None:
 
 
 def _validate_iso_date(value: str) -> None:
-    if not isinstance(value, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
-        raise InvalidJobRequest("recording date must use YYYY-MM-DD.")
-    try:
-        parsed = date.fromisoformat(value)
-    except ValueError as exc:
-        raise InvalidJobRequest("recording date must be a valid calendar date.") from exc
-    if parsed.isoformat() != value:
-        raise InvalidJobRequest("recording date must use YYYY-MM-DD.")
+    normalize_recording_date(value)

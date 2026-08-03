@@ -111,6 +111,18 @@ class NormalizedAudioInvalid(WorkerCoreError):
     code = "NORMALIZED_AUDIO_INVALID"
 
 
+class ReviewAudioNotFound(WorkerCoreError):
+    code = "REVIEW_AUDIO_NOT_FOUND"
+
+
+class ReviewAudioGenerationFailed(WorkerCoreError):
+    code = "REVIEW_AUDIO_GENERATION_FAILED"
+
+
+class ReviewAudioVerificationFailed(WorkerCoreError):
+    code = "REVIEW_AUDIO_VERIFICATION_FAILED"
+
+
 class SpeechActivityDetectionFailed(WorkerCoreError):
     code = "SPEECH_ACTIVITY_DETECTION_FAILED"
 

@@ -42,8 +42,18 @@ Rules:
 - `_Tasks/` contains lightweight submission and processing records. It is not the evidence archive.
 - The date directory represents the recording date, not the import or processing date.
 - Source audio is not part of the default published package.
+- The low-bitrate review-audio copy remains private Worker job data and is not part of the published package.
 - The deterministic `speech_id` suffix prevents collisions and survives title changes.
 - Publication writes to a temporary sibling directory, verifies hashes, and renames atomically.
+
+### 2.1 Private review audio
+
+During preprocessing, the Worker derives an 8 kHz, 8-bit, mono PCM review WAV from the checksum-bound normalized
+audio. It preserves the same start time and duration within 1 millisecond, carries no source metadata, has its own
+SHA-256 checkpoint, and remains under the private job directory. Authorized clients may read it with HTTP byte
+ranges for evidence seeking. Its current retention is the Worker job lifetime; deleting or expiring a job must also
+remove this private derivative. It is never copied to the Vault unless a future explicit audio-archive feature is
+separately designed and enabled.
 
 ## 3. Date resolution
 

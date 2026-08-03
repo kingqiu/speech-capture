@@ -84,6 +84,12 @@ Exercise the plugin, Worker, Manager, and a temporary Vault:
 - reduced-motion mode;
 - narrow panes and long multilingual text;
 - screen-reader names for controls, progress, and status.
+- authenticated review-audio metadata and byte ranges, including seek, invalid ranges, Vault isolation, tampering,
+  symlink rejection, timeline equality, and private permissions;
+- authenticated readiness snapshots for ready, warning, and blocked profiles, with explicit checks that no source
+  name, path, transcript, credential, or private endpoint is returned;
+- one-field pairing-ticket confirmation, ambiguous-input rejection, expiry/single-use behavior, and exclusion of
+  the plaintext ticket from the security database and validation responses;
 
 ## 3. Audio coverage matrix
 
@@ -291,3 +297,20 @@ Each release candidate produces a local redacted report containing:
 - manual review sign-off.
 
 The public repository may receive sanitized aggregate results, never private audio or transcript content.
+
+## 10. Stage I plugin submission contract
+
+The plugin submission tests use synthetic byte strings and synthetic task text only. They verify that:
+
+- source SHA-256 is computed through bounded slices rather than a whole-file allocation;
+- only Worker-reported missing parts are read and uploaded;
+- every uploaded part carries and receives confirmation of its SHA-256 and byte count;
+- upload and job idempotency keys are stable digests and do not expose recording context;
+- recording context is trimmed, and recording date and content type reach the job request;
+- task lists are scoped to the paired Vault, snapshots accept stable and provisional transcript data, and lifecycle
+  actions bind their idempotency key to the current revision;
+- UI connection recovery waits one minute between automatic attempts, stops after three failures, and only then
+  exposes the in-Obsidian manual reconnect action.
+
+No Stage I unit or screenshot fixture may contain a real filename, transcript, Vault name, endpoint, token, or audio
+sample. Visual comparisons must use the approved synthetic Stage H content at the same viewport width and theme.
