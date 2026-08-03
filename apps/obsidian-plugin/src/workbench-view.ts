@@ -36,10 +36,17 @@ import {
   type SubmissionProgress
 } from "./upload-client";
 import {
+  jobProgressLabel,
+  jobStageIndex,
+  resourcePresentation,
+  taskStatePresentation
+} from "./task-state-presentation";
+import {
   confirmPairingTicket,
   probeWorker,
   type WorkerProbeResult
 } from "./worker-probe";
+import { workbenchLayoutSize } from "./workbench-layout";
 
 export const WORKBENCH_VIEW_TYPE = "speech-capture-workbench";
 
@@ -99,6 +106,9 @@ export class SpeechWorkbenchView extends ItemView {
   private connectionRecovery: ConnectionRecovery | null = null;
   private refreshingTasks = false;
   private refreshTimer: number | null = null;
+  private resizeObserver: ResizeObserver | null = null;
+  private workbenchEl: HTMLElement | null = null;
+  private workbenchWidth = 0;
   private draft: IntakeDraft = {
     file: null,
     recordingDate: localDate(new Date()),
@@ -127,6 +137,15 @@ export class SpeechWorkbenchView extends ItemView {
   }
 
   public override async onOpen(): Promise<void> {
+    this.resizeObserver = new ResizeObserver((entries) => {
+      const entry = entries.at(-1);
+      if (!entry) {
+        return;
+      }
+      this.workbenchWidth = entry.contentRect.width;
+      this.applyWorkbenchLayoutSize();
+    });
+    this.resizeObserver.observe(this.contentEl);
     this.render();
     await this.refreshWorker();
     this.refreshTimer = window.setInterval(() => {
@@ -136,6 +155,9 @@ export class SpeechWorkbenchView extends ItemView {
 
   public override async onClose(): Promise<void> {
     this.pairingTicket = "";
+    this.resizeObserver?.disconnect();
+    this.resizeObserver = null;
+    this.workbenchEl = null;
     if (this.refreshTimer !== null) {
       window.clearInterval(this.refreshTimer);
       this.refreshTimer = null;
@@ -146,6 +168,8 @@ export class SpeechWorkbenchView extends ItemView {
     this.contentEl.empty();
     this.contentEl.addClass("speech-capture-view");
     const workbench = this.contentEl.createDiv({ cls: "speech-capture-workbench" });
+    this.workbenchEl = workbench;
+    this.applyWorkbenchLayoutSize();
     this.renderHeader(workbench);
 
     const layout = workbench.createDiv({ cls: "speech-capture-layout" });
@@ -174,6 +198,16 @@ export class SpeechWorkbenchView extends ItemView {
       this.renderConfirmation(layout);
       this.renderRestoreHandles(layout);
     }
+  }
+
+  private applyWorkbenchLayoutSize(): void {
+    if (!this.workbenchEl) {
+      return;
+    }
+    const width = this.workbenchWidth || this.contentEl.clientWidth;
+    const size = workbenchLayoutSize(width);
+    this.workbenchEl.toggleClass("is-compact", size !== "wide");
+    this.workbenchEl.toggleClass("is-narrow", size === "narrow");
   }
 
   private renderHeader(parent: HTMLElement): void {
@@ -265,8 +299,9 @@ export class SpeechWorkbenchView extends ItemView {
       text: jobStateLabel(job.state)
     });
 
-    this.renderStageRail(main, job);
+    this.renderStageRail(main, snapshot, job);
     this.renderResourceNotice(main, snapshot);
+    this.renderTaskStateNotice(main, snapshot);
     this.renderTaskProgress(main, snapshot);
     this.renderTranscriptPreview(main, snapshot);
     if (this.connectionRecovery) {
@@ -326,24 +361,47 @@ export class SpeechWorkbenchView extends ItemView {
 
     const actions = aside.createDiv({ cls: "speech-capture-current-actions" });
     actions.createEl("h3", { text: "当前可做" });
+    const statePresentation = job
+      ? taskStatePresentation(job, this.selectedSnapshot?.resource_report ?? null)
+      : null;
+    const blockedResource = resourcePresentation(
+      this.selectedSnapshot?.resource_report ?? null
+    );
     if (
-      job?.state === "failed" ||
-      job?.state === "partial" ||
-      job?.state === "waiting_user"
+      blockedResource?.kind === "blocked" &&
+      blockedResource.actionLabel &&
+      (job?.state === "waiting_user" || job?.state === "failed")
     ) {
-      const retryStage = actions.createEl("button", {
-        text: "重试当前阶段",
+      const retryResource = actions.createEl("button", {
+        text: blockedResource.actionLabel,
         attr: { type: "button" }
       });
-      retryStage.prepend(this.choiceMark("rotate-cw"));
-      retryStage.addEventListener("click", () => void this.performTaskAction("retry"));
-    } else if (job?.state === "paused") {
-      const resume = actions.createEl("button", {
-        text: "继续处理",
+      retryResource.prepend(this.choiceMark("refresh-cw"));
+      retryResource.addEventListener("click", () =>
+        void this.performTaskAction("retry")
+      );
+    } else if (statePresentation?.action && statePresentation.actionLabel) {
+      const stateAction = statePresentation.action;
+      const action = actions.createEl("button", {
+        text: statePresentation.actionLabel,
         attr: { type: "button" }
       });
-      resume.prepend(this.choiceMark("play-circle"));
-      resume.addEventListener("click", () => void this.performTaskAction("resume"));
+      action.prepend(
+        this.choiceMark(
+          stateAction === "resume"
+            ? "play-circle"
+            : stateAction === "new_task"
+              ? "file-plus-2"
+              : "rotate-cw"
+        )
+      );
+      action.addEventListener("click", () => {
+        if (stateAction === "new_task") {
+          this.openIntake();
+          return;
+        }
+        void this.performTaskAction(stateAction);
+      });
     } else if (job && isPausable(job.state)) {
       const pause = actions.createEl("button", {
         text: "安全暂停",
@@ -352,14 +410,19 @@ export class SpeechWorkbenchView extends ItemView {
       pause.prepend(this.choiceMark("pause-circle"));
       pause.addEventListener("click", () => void this.performTaskAction("pause"));
     }
-    const background = actions.createEl("button", {
-      text: "在后台继续",
-      attr: { type: "button" }
-    });
-    background.prepend(this.choiceMark("play-circle"));
-    background.addEventListener("click", () => this.openIntake());
+    if (job && isPausable(job.state)) {
+      const background = actions.createEl("button", {
+        text: "在后台继续",
+        attr: { type: "button" }
+      });
+      background.prepend(this.choiceMark("play-circle"));
+      background.addEventListener("click", () => this.openIntake());
+    }
     actions.createEl("p", {
-      text: "上传已完成，现在可以关闭 Obsidian，Worker 会继续处理。"
+      text:
+        job && isPausable(job.state)
+          ? "上传已完成，现在可以关闭 Obsidian，Worker 会继续处理。"
+          : "已上传音频、稳定逐字稿和处理检查点均会保留。"
     });
   }
 
@@ -712,13 +775,6 @@ export class SpeechWorkbenchView extends ItemView {
         "aria-label": "配对码"
       }
     });
-    input.addEventListener("input", () => {
-      this.pairingTicket = input.value;
-      if (this.pairingState.state === "error") {
-        this.pairingState = { state: "idle" };
-      }
-    });
-
     const scope = this.pairingSection(main, "shield-check", "授权范围");
     scope.createEl("p", { text: `仅允许当前 Vault：${this.app.vault.getName()}` });
     scope.createEl("p", { text: "凭据安全保存到系统 Secret Storage" });
@@ -737,6 +793,14 @@ export class SpeechWorkbenchView extends ItemView {
     });
     connect.disabled =
       this.pairingState.state === "submitting" || !this.pairingTicket.trim();
+    input.addEventListener("input", () => {
+      this.pairingTicket = input.value;
+      if (this.pairingState.state === "error") {
+        this.pairingState = { state: "idle" };
+        main.querySelector(".speech-capture-pairing__error")?.remove();
+      }
+      connect.disabled = !this.pairingTicket.trim();
+    });
     connect.addEventListener("click", () => void this.submitPairing());
     const cancel = main.createEl("button", {
       cls: "speech-capture-text-button speech-capture-pairing__cancel",
@@ -867,8 +931,12 @@ export class SpeechWorkbenchView extends ItemView {
     return button;
   }
 
-  private renderStageRail(parent: HTMLElement, job: JobSchema): void {
-    const currentIndex = jobStageIndex(job.state);
+  private renderStageRail(
+    parent: HTMLElement,
+    snapshot: JobSnapshotResponse | null,
+    job: JobSchema
+  ): void {
+    const currentIndex = jobStageIndex(job.state, snapshot?.progress?.stage ?? null);
     const rail = parent.createDiv({ cls: "speech-capture-stage-rail" });
     for (const [index, label] of JOB_STAGES.entries()) {
       const item = rail.createDiv({
@@ -896,7 +964,11 @@ export class SpeechWorkbenchView extends ItemView {
     });
     card.createEl("p", {
       text: snapshot?.progress
-        ? `本阶段已完成 ${progress}%${snapshot.progress.estimated_remaining_seconds === null ? "" : ` · 预计还需 ${formatRemaining(snapshot.progress.estimated_remaining_seconds)}`}`
+        ? jobProgressLabel(
+            snapshot.job.state,
+            progress,
+            snapshot.progress.estimated_remaining_seconds
+          )
         : "任务已进入队列，等待 Worker 更新进度"
     });
     const track = card.createDiv({ cls: "speech-capture-progress is-large" });
@@ -928,16 +1000,42 @@ export class SpeechWorkbenchView extends ItemView {
     const copy = notice.createDiv();
     copy.createEl("strong", { text: presentation.title });
     copy.createEl("p", { text: presentation.detail });
-    if (
-      presentation.kind === "blocked" &&
-      (snapshot?.job.state === "waiting_user" || snapshot?.job.state === "failed")
-    ) {
-      const retry = notice.createEl("button", {
-        text: "释放 Worker 空间后重新检测",
-        attr: { type: "button" }
+    if (presentation.diskFacts) {
+      const facts = copy.createDiv({ cls: "speech-capture-resource-notice__facts" });
+      facts.createSpan({
+        text: `预计还需要 ${formatBytes(presentation.diskFacts.requiredBytes)}`
       });
-      retry.addEventListener("click", () => void this.performTaskAction("retry"));
+      facts.createSpan({
+        text: `当前可用 ${formatBytes(presentation.diskFacts.availableBytes)}`
+      });
+      facts.createSpan({
+        text: `安全保留 ${formatBytes(presentation.diskFacts.reserveBytes)}`
+      });
     }
+  }
+
+  private renderTaskStateNotice(
+    parent: HTMLElement,
+    snapshot: JobSnapshotResponse | null
+  ): void {
+    if (!snapshot) {
+      return;
+    }
+    const presentation = taskStatePresentation(
+      snapshot.job,
+      snapshot.resource_report ?? null
+    );
+    if (!presentation) {
+      return;
+    }
+    const notice = parent.createDiv({
+      cls: `speech-capture-resource-notice is-${presentation.kind}`
+    });
+    const icon = notice.createSpan({ cls: "speech-capture-resource-notice__icon" });
+    setIcon(icon, presentation.icon);
+    const copy = notice.createDiv();
+    copy.createEl("strong", { text: presentation.title });
+    copy.createEl("p", { text: presentation.detail });
   }
 
   private renderTranscriptPreview(
@@ -1501,30 +1599,6 @@ function jobStateTone(state: JobSchema["state"]): "good" | "active" | "warning" 
   return "active";
 }
 
-function jobStageIndex(state: JobSchema["state"]): number {
-  switch (state) {
-    case "created":
-    case "uploading":
-      return 0;
-    case "verifying":
-      return 1;
-    case "queued":
-    case "paused":
-      return 2;
-    case "preprocessing":
-    case "transcribing":
-      return 3;
-    case "aligning":
-      return 4;
-    case "diarizing":
-      return 5;
-    case "structuring":
-      return 6;
-    default:
-      return 7;
-  }
-}
-
 function isPausable(state: JobSchema["state"]): boolean {
   return [
     "queued",
@@ -1563,78 +1637,10 @@ function formatDuration(milliseconds: number): string {
     : `${minutes.toString().padStart(2, "0")}:${seconds.toString().padStart(2, "0")}`;
 }
 
-function formatRemaining(seconds: number): string {
-  if (seconds < 60) {
-    return "不到 1 分钟";
-  }
-  return `约 ${Math.ceil(seconds / 60).toString()} 分钟`;
-}
-
 function speakerLabel(speakerId: string | null): string {
   if (!speakerId) {
     return "说话人待识别";
   }
   const suffix = speakerId.match(/(\d+)$/)?.[1];
   return suffix ? `说话人 ${Number(suffix) + 1}` : "说话人";
-}
-
-function resourcePresentation(report: Readonly<Record<string, unknown>> | null): {
-  readonly kind: "ready" | "warning" | "blocked";
-  readonly icon: string;
-  readonly shortText: string;
-  readonly title: string;
-  readonly detail: string;
-} | null {
-  if (!report) {
-    return null;
-  }
-  const issues = Array.isArray(report.issues)
-    ? report.issues.filter(isUnknownRecord)
-    : [];
-  const codes = new Set(
-    issues.flatMap((issue) =>
-      typeof issue.code === "string" ? [issue.code] : []
-    )
-  );
-  if (report.status === "blocked") {
-    if (codes.has("DISK_RESERVE_TOO_LOW")) {
-      return {
-        kind: "blocked",
-        icon: "hard-drive",
-        shortText: "磁盘空间不足 · 已安全暂停",
-        title: "可用空间不足，任务已安全暂停",
-        detail: "已上传音频、稳定逐字稿和处理检查点都已保留。请先在 Worker 所在 Mac 释放空间，再重新检测。"
-      };
-    }
-    return {
-      kind: "blocked",
-      icon: "circle-alert",
-      shortText: "资源不足 · 已安全暂停",
-      title: "Worker 资源不足，任务已安全暂停",
-      detail: "已经完成的内容不会丢失。请先处理 Worker 上显示的资源问题，再重试当前阶段。"
-    };
-  }
-  if (report.status === "warning") {
-    const memoryWarning =
-      codes.has("MEMORY_PRESSURE_WARNING") ||
-      codes.has("SWAP_USAGE_WARNING");
-    return {
-      kind: "warning",
-      icon: "circle-alert",
-      shortText: memoryWarning ? "内存压力中等 · 处理可能稍慢" : "资源接近安全余量",
-      title: memoryWarning ? "内存压力中等，处理可能稍慢" : "Worker 资源接近安全余量",
-      detail: "不会影响已经保存的内容；Worker 会继续在安全边界内处理。"
-    };
-  }
-  return {
-    kind: "ready",
-    icon: "circle-check",
-    shortText: "资源状态正常",
-    title: "资源状态正常",
-    detail: ""
-  };
-}
-
-function isUnknownRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

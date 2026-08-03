@@ -700,6 +700,22 @@
   margin-top: 5px !important;
 }
 
+.speech-capture-resource-notice__facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 9px;
+}
+
+.speech-capture-resource-notice__facts span {
+  background: color-mix(in srgb, var(--background-primary) 58%, transparent);
+  border: 1px solid var(--speech-border);
+  border-radius: 5px;
+  color: var(--text-muted);
+  font-size: 11px;
+  padding: 4px 7px;
+}
+
 .speech-capture-resource-notice button {
   align-self: center;
   white-space: nowrap;
@@ -873,7 +889,10 @@
 }
 
 .speech-capture-layout.is-pairing {
-  grid-template-columns: 364px minmax(600px, 1fr) 438px;
+  grid-template-columns:
+    minmax(240px, 0.82fr)
+    minmax(480px, 1.35fr)
+    minmax(300px, 1fr);
 }
 
 .speech-capture-text-button {
@@ -1132,100 +1151,117 @@
   white-space: nowrap;
 }
 
-@media (max-width: 1180px) {
-  .speech-capture-layout,
-  .speech-capture-layout.is-left-collapsed,
+.speech-capture-workbench.is-compact .speech-capture-layout,
+.speech-capture-workbench.is-compact
   .speech-capture-layout.is-right-collapsed {
     grid-template-columns: 220px minmax(0, 1fr);
-  }
-
-  .speech-capture-confirmation,
-  .speech-capture-current-task {
-    grid-column: 2;
-  }
-
-  .speech-capture-layout.is-left-collapsed .speech-capture-confirmation,
-  .speech-capture-layout.is-left-collapsed .speech-capture-current-task {
-    grid-column: 1;
-  }
-
-  .speech-capture-layout.is-pairing {
-    grid-template-columns: 220px minmax(0, 1fr);
-  }
-
-  .speech-capture-pairing-confirmation {
-    grid-column: 2;
-  }
 }
 
-@media (max-width: 860px) {
-  .speech-capture-header {
+.speech-capture-workbench.is-compact
+  .speech-capture-layout.is-left-collapsed {
+    grid-template-columns: minmax(0, 1fr) 320px;
+}
+
+.speech-capture-workbench.is-compact
+  .speech-capture-layout.is-left-collapsed.is-right-collapsed {
+    grid-template-columns: minmax(0, 1fr);
+}
+
+.speech-capture-workbench.is-compact .speech-capture-confirmation,
+.speech-capture-workbench.is-compact .speech-capture-current-task {
+    grid-column: 2;
+}
+
+.speech-capture-workbench.is-compact
+  .speech-capture-layout.is-left-collapsed
+  .speech-capture-confirmation,
+.speech-capture-workbench.is-compact
+  .speech-capture-layout.is-left-collapsed
+  .speech-capture-current-task {
+    grid-column: 2;
+}
+
+.speech-capture-workbench.is-compact .speech-capture-layout.is-pairing {
+    grid-template-columns: 220px minmax(0, 1fr);
+}
+
+.speech-capture-workbench.is-compact .speech-capture-pairing-confirmation {
+    grid-column: 2;
+}
+
+.speech-capture-workbench.is-narrow .speech-capture-header {
     align-items: flex-start;
     flex-direction: column;
     min-height: auto;
-  }
+}
 
-  .speech-capture-layout,
+.speech-capture-workbench.is-narrow .speech-capture-layout,
+.speech-capture-workbench.is-narrow
   .speech-capture-layout.is-left-collapsed,
+.speech-capture-workbench.is-narrow
   .speech-capture-layout.is-right-collapsed,
+.speech-capture-workbench.is-narrow
   .speech-capture-layout.is-left-collapsed.is-right-collapsed {
     display: flex;
     flex-direction: column;
     padding-left: 0;
     padding-right: 0;
-  }
+}
 
-  .speech-capture-task-panel {
+.speech-capture-workbench.is-narrow .speech-capture-task-panel {
     display: block !important;
     order: 0;
-  }
+}
 
-  .speech-capture-task-panel .speech-capture-panel__title,
-  .speech-capture-task-panel .speech-capture-empty-copy,
-  .speech-capture-collapse-button,
-  .speech-capture-restore-handle {
+.speech-capture-workbench.is-narrow
+  .speech-capture-task-panel
+  .speech-capture-panel__title,
+.speech-capture-workbench.is-narrow
+  .speech-capture-task-panel
+  .speech-capture-empty-copy,
+.speech-capture-workbench.is-narrow .speech-capture-collapse-button,
+.speech-capture-workbench.is-narrow .speech-capture-restore-handle {
     display: none !important;
-  }
+}
 
-  .speech-capture-new-task {
+.speech-capture-workbench.is-narrow .speech-capture-new-task {
     min-height: 40px;
-  }
+}
 
-  .speech-capture-intake {
+.speech-capture-workbench.is-narrow .speech-capture-intake {
     order: 1;
-  }
+}
 
-  .speech-capture-confirmation,
-  .speech-capture-current-task {
+.speech-capture-workbench.is-narrow .speech-capture-confirmation,
+.speech-capture-workbench.is-narrow .speech-capture-current-task {
     display: flex !important;
     order: 2;
-  }
+}
 
-  .speech-capture-choice-grid {
+.speech-capture-workbench.is-narrow .speech-capture-choice-grid {
     grid-template-columns: 1fr;
-  }
+}
 
-  .speech-capture-stage-rail {
+.speech-capture-workbench.is-narrow .speech-capture-stage-rail {
     grid-template-columns: repeat(8, 68px);
     overflow-x: auto;
     padding-bottom: 6px;
-  }
+}
 
-  .speech-capture-transcript-row {
+.speech-capture-workbench.is-narrow .speech-capture-transcript-row {
     grid-template-columns: 92px 44px minmax(0, 1fr);
-  }
+}
 
-  .speech-capture-device-panel {
+.speech-capture-workbench.is-narrow .speech-capture-device-panel {
     display: block !important;
-  }
+}
 
-  .speech-capture-pairing-confirmation {
+.speech-capture-workbench.is-narrow .speech-capture-pairing-confirmation {
     display: block !important;
-  }
+}
 
-  .speech-capture-pairing-help {
+.speech-capture-workbench.is-narrow .speech-capture-pairing-help {
     margin-top: 16px;
-  }
 }
 
 @media (prefers-reduced-motion: reduce) {
