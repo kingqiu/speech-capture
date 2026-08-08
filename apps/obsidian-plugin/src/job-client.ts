@@ -2,10 +2,14 @@ import { sha256 } from "@noble/hashes/sha2.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
 
 import type {
+  CorrectionListResponse,
+  CorrectionSchema,
   JobActionEnvelope,
   JobListResponse,
   JobSchema,
-  JobSnapshotResponse
+  JobSnapshotResponse,
+  SegmentReviewEnvelope,
+  TranscriptSegmentSchema
 } from "../../../packages/protocol/generated/typescript/speech-capture-protocol";
 
 import type { WorkerConnectionSettings } from "./settings";
@@ -48,12 +52,26 @@ export async function getJobSnapshot(
   bearerToken: string,
   jobId: string
 ): Promise<JobSnapshotResponse> {
-  const response = await transport.request(
-    worker,
-    `/v1/jobs/${encodeURIComponent(jobId)}/snapshot?segment_limit=100`,
-    { bearerToken }
-  );
-  const value = parseSuccess(response);
+  const segments: TranscriptSegmentSchema[] = [];
+  let after = 0;
+  let snapshot: JobSnapshotResponse | null = null;
+  do {
+    const response = await transport.request(
+      worker,
+      `/v1/jobs/${encodeURIComponent(jobId)}/snapshot?segment_limit=500&after_segment_sequence=${after.toString()}`,
+      { bearerToken }
+    );
+    const value = parseSuccess(response);
+    validateSnapshot(value);
+    const page = value as unknown as JobSnapshotResponse;
+    segments.push(...page.stable_segments);
+    snapshot = page;
+    after = page.next_after_segment_sequence;
+  } while (snapshot.has_more_segments);
+  return { ...snapshot, stable_segments: segments };
+}
+
+function validateSnapshot(value: Record<string, unknown>): void {
   if (
     !isJobSummary(value.job) ||
     !Array.isArray(value.stable_segments) ||
@@ -63,7 +81,92 @@ export async function getJobSnapshot(
   ) {
     throw new JobClientError("invalid", "Worker 返回了无法识别的任务进度。");
   }
-  return value as unknown as JobSnapshotResponse;
+}
+
+export async function listJobCorrections(
+  transport: WorkerTransport,
+  worker: WorkerConnectionSettings,
+  bearerToken: string,
+  jobId: string
+): Promise<readonly CorrectionSchema[]> {
+  const response = await transport.request(
+    worker,
+    `/v1/jobs/${encodeURIComponent(jobId)}/corrections`,
+    { bearerToken }
+  );
+  const value = parseSuccess(response);
+  if (!Array.isArray(value.corrections) || !value.corrections.every(isCorrection)) {
+    throw new JobClientError("invalid", "Worker 返回了无法识别的修订记录。");
+  }
+  return (value as unknown as CorrectionListResponse).corrections;
+}
+
+export async function reviewTranscriptSegment(
+  transport: WorkerTransport,
+  worker: WorkerConnectionSettings,
+  bearerToken: string,
+  request: {
+    readonly job: Pick<JobSchema, "job_id" | "revision">;
+    readonly segmentId: string;
+    readonly beforeText: string;
+    readonly afterText: string;
+    readonly beforeSpeakerId: string | null;
+    readonly afterSpeakerId: string | null;
+  }
+): Promise<SegmentReviewEnvelope> {
+  const body = {
+    expected_revision: request.job.revision,
+    segment_id: request.segmentId,
+    before_text: request.beforeText,
+    after_text: request.afterText,
+    before_speaker_id: request.beforeSpeakerId,
+    after_speaker_id: request.afterSpeakerId,
+    author: "obsidian-user"
+  };
+  const idempotency = bytesToHex(
+    sha256(new TextEncoder().encode(JSON.stringify(body)))
+  );
+  const response = await transport.request(
+    worker,
+    `/v1/jobs/${encodeURIComponent(request.job.job_id)}/segment-review`,
+    {
+      method: "POST",
+      body,
+      bearerToken,
+      headers: { "Idempotency-Key": `obsidian-${idempotency}` }
+    }
+  );
+  const value = parseSuccess(response);
+  if (!isJobSummary(value.job) || !isCorrection(value.correction)) {
+    throw new JobClientError("invalid", "Worker 返回了无法识别的片段修订结果。");
+  }
+  return value as unknown as SegmentReviewEnvelope;
+}
+
+export function effectiveTranscriptSegment(
+  segment: TranscriptSegmentSchema,
+  corrections: readonly CorrectionSchema[]
+): { readonly text: string; readonly speakerId: string | null; readonly revised: boolean } {
+  let text = segment.text ?? "";
+  let speakerId = segment.speaker_id;
+  let revised = false;
+  for (const correction of corrections) {
+    if (correction.target_id !== segment.segment_id) {
+      continue;
+    }
+    if (correction.field === "transcript_text") {
+      text = correction.after;
+      revised = true;
+    } else if (correction.field === "segment_review") {
+      const review = parseSegmentReview(correction.after);
+      if (review) {
+        text = review.text;
+        speakerId = review.speakerId;
+        revised = true;
+      }
+    }
+  }
+  return { text, speakerId, revised };
 }
 
 export async function applyJobAction(
@@ -133,6 +236,35 @@ function isTranscriptSegment(value: unknown): value is Record<string, unknown> {
     typeof value.end_ms === "number" &&
     (value.text === null || typeof value.text === "string")
   );
+}
+
+function isCorrection(value: unknown): value is Record<string, unknown> {
+  return (
+    isRecord(value) &&
+    typeof value.correction_id === "string" &&
+    typeof value.field === "string" &&
+    (value.target_id === null || typeof value.target_id === "string") &&
+    typeof value.after === "string" &&
+    typeof value.job_revision === "number"
+  );
+}
+
+function parseSegmentReview(
+  value: string
+): { readonly text: string; readonly speakerId: string | null } | null {
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (
+      isRecord(parsed) &&
+      typeof parsed.text === "string" &&
+      (parsed.speaker_id === null || typeof parsed.speaker_id === "string")
+    ) {
+      return { text: parsed.text, speakerId: parsed.speaker_id };
+    }
+  } catch {
+    // Invalid correction data is ignored here and remains available for diagnostics.
+  }
+  return null;
 }
 
 function isProvisional(value: unknown): boolean {

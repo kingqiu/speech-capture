@@ -6,6 +6,7 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from speech_capture_worker.corrections import CorrectionField
 from speech_capture_worker.domain import JobState, ModelProfile, UploadState
 from speech_capture_worker.errors import InvalidJobRequest
 from speech_capture_worker.protocol_contract import (
@@ -388,6 +389,40 @@ class JobSnapshotResponse(PublicSchema):
     latest_event_sequence: int
     next_after_segment_sequence: int
     has_more_segments: bool
+
+
+class CorrectionSchema(PublicSchema):
+    sequence: int = Field(gt=0)
+    correction_id: SafeIdentifier
+    job_id: JobIdentifier
+    job_revision: int = Field(ge=0)
+    field: CorrectionField
+    target_id: SafeIdentifier | None
+    before: str | None
+    after: str
+    author: str
+    idempotency_key: str
+    created_at: str
+
+
+class CorrectionListResponse(PublicSchema):
+    corrections: tuple[CorrectionSchema, ...]
+
+
+class SegmentReviewRequestSchema(PublicSchema):
+    expected_revision: int = Field(ge=0)
+    segment_id: SegmentIdentifier
+    before_text: str = Field(min_length=1)
+    after_text: str = Field(min_length=1)
+    before_speaker_id: SafeIdentifier | None
+    after_speaker_id: SafeIdentifier | None
+    author: str = Field(min_length=1, max_length=200)
+
+
+class SegmentReviewEnvelope(PublicSchema):
+    job: JobSchema
+    correction: CorrectionSchema
+    created: bool
 
 
 class JobUpdateSchema(PublicSchema):

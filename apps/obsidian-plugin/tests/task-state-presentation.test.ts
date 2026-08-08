@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  canCancelJob,
   jobProgressLabel,
   jobStageIndex,
   resourcePresentation,
@@ -14,6 +15,8 @@ describe("task state presentation", () => {
     expect(jobStageIndex("waiting_user", "transcribing")).toBe(3);
     expect(jobStageIndex("paused", "aligning")).toBe(4);
     expect(jobStageIndex("failed", "diarizing")).toBe(5);
+    expect(jobStageIndex("cancelled", "aligning")).toBe(4);
+    expect(jobStageIndex("cancelled")).toBe(2);
   });
 
   it("does not show a live ETA while processing is interrupted", () => {
@@ -54,6 +57,30 @@ describe("task state presentation", () => {
     expect(
       taskStatePresentation({ state: "failed", last_error_code: "STAGE_FAILED" }, null)
     ).toMatchObject({ action: "retry", actionLabel: "重试当前阶段" });
+  });
+
+  it("presents cancellation as a retained but unrecoverable terminal state", () => {
+    expect(
+      taskStatePresentation({ state: "cancelled", last_error_code: null }, null)
+    ).toEqual({
+      kind: "warning",
+      icon: "ban",
+      title: "任务已取消",
+      detail: "Worker 已停止后续处理。已上传音频、稳定逐字稿和处理检查点仍会保留；这个任务不能恢复。",
+      action: "new_task",
+      actionLabel: "新建语音任务"
+    });
+  });
+
+  it("only offers cancellation before a terminal or publishing state", () => {
+    expect(canCancelJob("created")).toBe(true);
+    expect(canCancelJob("transcribing")).toBe(true);
+    expect(canCancelJob("paused")).toBe(true);
+    expect(canCancelJob("failed")).toBe(true);
+    expect(canCancelJob("processed")).toBe(false);
+    expect(canCancelJob("publishing")).toBe(false);
+    expect(canCancelJob("published")).toBe(false);
+    expect(canCancelJob("cancelled")).toBe(false);
   });
 
   it("routes an unreadable source back to a new task", () => {

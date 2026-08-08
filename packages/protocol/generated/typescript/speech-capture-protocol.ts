@@ -1,5 +1,5 @@
 // Generated Worker protocol wire types. Do not edit manually.
-export const OPENAPI_SHA256 = "6300b201c29125314cc362e3c8483285a1f38ebba50d0eb485d29f92a9badfa8" as const;
+export const OPENAPI_SHA256 = "bcf537c8552166a59bef13e26f1ea68c2922ae9438aea3fcefd6a5702911ccb5" as const;
 export const OPENAPI_VERSION = "3.1.0" as const;
 export const PROTOCOL_VERSION = "1.0.0" as const;
 
@@ -63,6 +63,30 @@ export interface CompatibilityResponse {
   readonly issues: ReadonlyArray<CompatibilityIssue>;
   readonly missing_features: ReadonlyArray<string>;
   readonly protocol_version: string | null;
+}
+
+export type CorrectionField =
+  | "transcript_text"
+  | "segment_review"
+  | "speaker_display_name"
+  | "recording_date";
+
+export interface CorrectionListResponse {
+  readonly corrections: ReadonlyArray<CorrectionSchema>;
+}
+
+export interface CorrectionSchema {
+  readonly after: string;
+  readonly author: string;
+  readonly before: string | null;
+  readonly correction_id: string;
+  readonly created_at: string;
+  readonly field: CorrectionField;
+  readonly idempotency_key: string;
+  readonly job_id: string;
+  readonly job_revision: number;
+  readonly sequence: number;
+  readonly target_id: string | null;
 }
 
 export interface CredentialRotationActivateRequestSchema {
@@ -317,6 +341,22 @@ export interface ReviewAudioResponse {
   readonly sha256: string;
   readonly size_bytes: number;
   readonly status: "available";
+}
+
+export interface SegmentReviewEnvelope {
+  readonly correction: CorrectionSchema;
+  readonly created: boolean;
+  readonly job: JobSchema;
+}
+
+export interface SegmentReviewRequestSchema {
+  readonly after_speaker_id: string | null;
+  readonly after_text: string;
+  readonly author: string;
+  readonly before_speaker_id: string | null;
+  readonly before_text: string;
+  readonly expected_revision: number;
+  readonly segment_id: string;
 }
 
 export type SpeakerLabelStatus =

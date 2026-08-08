@@ -1,6 +1,13 @@
 import { describe, expect, it } from "vitest";
 
-import { applyJobAction, getJobSnapshot, listJobs } from "../src/job-client";
+import {
+  applyJobAction,
+  effectiveTranscriptSegment,
+  getJobSnapshot,
+  listJobCorrections,
+  listJobs,
+  reviewTranscriptSegment
+} from "../src/job-client";
 import type { WorkerConnectionSettings } from "../src/settings";
 import type {
   WorkerTransport,
@@ -85,7 +92,101 @@ describe("job client", () => {
       /^obsidian-[0-9a-f]{64}$/
     );
   });
+
+  it("reads every transcript page instead of truncating long recordings", async () => {
+    const transport = new QueueTransport([
+      response(200, snapshotPage([segment(1)], true, 1)),
+      response(200, snapshotPage([segment(2)], false, 2))
+    ]);
+
+    const snapshot = await getJobSnapshot(
+      transport,
+      WORKER,
+      "secret",
+      JOB.job_id
+    );
+
+    expect(snapshot.stable_segments.map((item) => item.segment_sequence)).toEqual([
+      1,
+      2
+    ]);
+    expect(transport.requests[0]?.path).toContain("segment_limit=500");
+    expect(transport.requests[1]?.path).toContain("after_segment_sequence=1");
+  });
+
+  it("saves text and speaker attribution together and overlays the ledger", async () => {
+    const correction = {
+      correction_id: "cor_test",
+      job_revision: 5,
+      field: "segment_review",
+      target_id: "seg_00000001",
+      after: JSON.stringify({ speaker_id: null, text: "校订后的文字" })
+    };
+    const transport = new QueueTransport([
+      response(200, { corrections: [correction] }),
+      response(200, { created: true, correction, job: { ...JOB, revision: 5 } })
+    ]);
+
+    const corrections = await listJobCorrections(
+      transport,
+      WORKER,
+      "secret",
+      JOB.job_id
+    );
+    const reviewed = effectiveTranscriptSegment(
+      segment(1) as never,
+      corrections as never
+    );
+    const saved = await reviewTranscriptSegment(
+      transport,
+      WORKER,
+      "secret",
+      {
+        job: JOB,
+        segmentId: "seg_00000001",
+        beforeText: "合成文字 1",
+        afterText: "校订后的文字",
+        beforeSpeakerId: "speaker_0",
+        afterSpeakerId: null
+      }
+    );
+
+    expect(reviewed).toEqual({
+      text: "校订后的文字",
+      speakerId: null,
+      revised: true
+    });
+    expect(saved.created).toBe(true);
+    expect(transport.requests[1]?.body).toMatchObject({
+      before_text: "合成文字 1",
+      after_text: "校订后的文字",
+      before_speaker_id: "speaker_0",
+      after_speaker_id: null
+    });
+  });
 });
+
+function segment(sequence: number) {
+  return {
+    segment_id: `seg_${sequence.toString().padStart(8, "0")}`,
+    segment_sequence: sequence,
+    start_ms: (sequence - 1) * 5_000,
+    end_ms: sequence * 5_000,
+    text: `合成文字 ${sequence.toString()}`,
+    speaker_id: "speaker_0"
+  };
+}
+
+function snapshotPage(segments: unknown[], hasMore: boolean, next: number) {
+  return {
+    job: JOB,
+    stable_segments: segments,
+    provisional: null,
+    progress: null,
+    has_more_segments: hasMore,
+    next_after_segment_sequence: next
+  };
+}
 
 function response(status: number, json: unknown): WorkerTransportResponse {
   return { status, json };

@@ -17,8 +17,13 @@ from speech_capture_worker.artifact_generation import (
     ARTIFACT_SCHEMA_VERSION,
     ARTIFACT_STAGE,
 )
+from speech_capture_worker.domain import JobState
 from speech_capture_worker.job_store import MAX_UPLOAD_CHUNK_SIZE_BYTES, JobStore
 from speech_capture_worker.media_probe import MediaProbeResult
+from speech_capture_worker.transcript import (
+    SpeakerLabelStatus,
+    TranscriptOutcome,
+)
 
 SOURCE = b"abcdefghij"
 TOKEN = "test-token-abcdefghijklmnopqrstuvwxyz0123456789"
@@ -96,6 +101,101 @@ def _create_job(client: TestClient, upload_id: str) -> dict:
     )
     assert response.status_code == 200, response.text
     return response.json()
+
+
+def _advance_to_processed_review_job(store: JobStore, job_id: str) -> None:
+    queued = store.get_job(job_id)
+    preprocessing = store.claim_job_for_processing(
+        job_id,
+        expected_revision=queued.revision,
+    )
+    transcribing = store.transition_job(
+        job_id,
+        JobState.TRANSCRIBING,
+        expected_revision=preprocessing.revision,
+    )
+    store.commit_transcript_segment(
+        job_id,
+        commit_key="api-review-segment",
+        start_ms=0,
+        end_ms=5_000,
+        outcome=TranscriptOutcome.TRANSCRIBED,
+        text="这是合成逐字稿。",
+        language="zh",
+        speaker_id="speaker_0",
+        speaker_label_status=SpeakerLabelStatus.ANONYMOUS,
+    )
+    current = transcribing
+    for state in (
+        JobState.ALIGNING,
+        JobState.DIARIZING,
+        JobState.STRUCTURING,
+        JobState.QUALITY_CHECK,
+        JobState.PROCESSED,
+    ):
+        current = store.transition_job(
+            job_id,
+            state,
+            expected_revision=current.revision,
+        )
+
+
+def test_segment_review_is_atomic_revision_guarded_and_listable(tmp_path) -> None:
+    with JobStore(
+        tmp_path / "worker.sqlite3",
+        upload_chunk_size_bytes=4,
+        source_probe=_probe,
+    ) as store:
+        client = TestClient(
+            create_app(store=store, credential_verifier=_verifier("vault_primary"))
+        )
+        upload = _create_upload(client)
+        _complete_upload(client, upload)
+        created = _create_job(client, upload["upload"]["upload_id"])
+        job_id = created["job"]["job_id"]
+        _advance_to_processed_review_job(store, job_id)
+        current = store.get_job(job_id)
+
+        saved = client.post(
+            f"/v1/jobs/{job_id}/segment-review",
+            headers={**AUTHORIZATION, "Idempotency-Key": "review-segment-primary"},
+            json={
+                "expected_revision": current.revision,
+                "segment_id": "seg_00000001",
+                "before_text": "这是合成逐字稿。",
+                "after_text": "这是校订后的合成逐字稿。",
+                "before_speaker_id": "speaker_0",
+                "after_speaker_id": None,
+                "author": "obsidian-user",
+            },
+        )
+        replayed = client.post(
+            f"/v1/jobs/{job_id}/segment-review",
+            headers={**AUTHORIZATION, "Idempotency-Key": "review-segment-primary"},
+            json={
+                "expected_revision": current.revision,
+                "segment_id": "seg_00000001",
+                "before_text": "这是合成逐字稿。",
+                "after_text": "这是校订后的合成逐字稿。",
+                "before_speaker_id": "speaker_0",
+                "after_speaker_id": None,
+                "author": "obsidian-user",
+            },
+        )
+        listed = client.get(
+            f"/v1/jobs/{job_id}/corrections",
+            headers=AUTHORIZATION,
+        )
+        raw_segment = store.get_job_snapshot(job_id).stable_segments[0]
+
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["created"] is True
+    assert replayed.status_code == 200
+    assert replayed.json()["created"] is False
+    assert listed.status_code == 200
+    assert listed.json()["corrections"][0]["field"] == "segment_review"
+    assert raw_segment.text == "这是合成逐字稿。"
+    assert raw_segment.speaker_id == "speaker_0"
 
 
 def test_private_routes_require_authentication_and_redact_validation_input(tmp_path) -> None:

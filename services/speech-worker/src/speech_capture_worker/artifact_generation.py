@@ -7,7 +7,7 @@ import importlib.metadata
 import json
 import os
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
@@ -24,6 +24,7 @@ from speech_capture_worker.corrections import (
     CorrectionField,
     CorrectionRecord,
     corrections_sha256,
+    decode_segment_review,
 )
 from speech_capture_worker.domain import JobRecord, JobState
 from speech_capture_worker.errors import (
@@ -97,6 +98,7 @@ class ArtifactResult:
 @dataclass(frozen=True)
 class EffectiveCorrections:
     transcript_edits: dict[str, str]
+    speaker_assignments: dict[str, str | None]
     speaker_display_names: dict[str, str]
     recording_date: str | None
     document: Any
@@ -289,6 +291,19 @@ class ArtifactGenerator:
         )
         transcript_edits = effective.transcript_edits
         document = effective.document
+        raw_speaker_ids = {
+            segment.segment_id: segment.speaker_id for segment in segments
+        }
+        segments = [
+            replace(
+                segment,
+                speaker_id=effective.speaker_assignments.get(
+                    segment.segment_id,
+                    segment.speaker_id,
+                ),
+            )
+            for segment in segments
+        ]
         context_corrections = structuring_raw.get("context_corrections", [])
         if not isinstance(context_corrections, list):
             raise ArtifactGenerationFailed(
@@ -333,6 +348,7 @@ class ArtifactGenerator:
             context_corrections=context_corrections,
             manual_corrections=corrections,
             speaker_display_names=effective.speaker_display_names,
+            raw_speaker_ids=raw_speaker_ids,
             recording_date=effective.recording_date,
         )
         note_markdown = _build_note_markdown(
@@ -576,6 +592,9 @@ def _apply_corrections(
     revised_edits = dict(transcript_edits)
     revised_document = document
     segment_map = {segment.segment_id: segment for segment in segments}
+    speaker_assignments = {
+        segment.segment_id: segment.speaker_id for segment in segments
+    }
     speaker_ids = sorted({segment.speaker_id for segment in segments if segment.speaker_id})
     speaker_names = {speaker_id: _default_speaker_name(speaker_id) for speaker_id in speaker_ids}
     if isinstance(document, dict) and isinstance(document.get("speaker_summaries"), list):
@@ -609,6 +628,27 @@ def _apply_corrections(
                 before=correction.before,
                 after=correction.after,
             )
+        elif correction.field is CorrectionField.SEGMENT_REVIEW:
+            segment = segment_map.get(correction.target_id or "")
+            if segment is None or correction.before is None:
+                raise ArtifactGenerationFailed(
+                    f"Correction {correction.correction_id} targets a missing segment."
+                )
+            before_text, before_speaker_id = decode_segment_review(correction.before)
+            after_text, after_speaker_id = decode_segment_review(correction.after)
+            current_text = revised_edits.get(segment.segment_id, segment.text or "")
+            current_speaker_id = speaker_assignments.get(segment.segment_id)
+            if current_text != before_text or current_speaker_id != before_speaker_id:
+                raise ArtifactGenerationFailed(
+                    f"Correction {correction.correction_id} no longer matches the reviewed segment."
+                )
+            revised_edits[segment.segment_id] = after_text
+            speaker_assignments[segment.segment_id] = after_speaker_id
+            revised_document = _replace_derived_text(
+                revised_document,
+                before=before_text,
+                after=after_text,
+            )
         elif correction.field is CorrectionField.SPEAKER_DISPLAY_NAME:
             speaker_id = correction.target_id or ""
             current = speaker_names.get(speaker_id)
@@ -630,6 +670,7 @@ def _apply_corrections(
             recording_date = correction.after
     return EffectiveCorrections(
         transcript_edits=revised_edits,
+        speaker_assignments=speaker_assignments,
         speaker_display_names=speaker_names,
         recording_date=recording_date,
         document=revised_document,
@@ -798,6 +839,7 @@ def _build_speech_record(
     context_corrections: list[Any],
     manual_corrections: list[CorrectionRecord],
     speaker_display_names: dict[str, str],
+    raw_speaker_ids: dict[str, str | None],
     recording_date: str | None,
 ) -> dict[str, Any]:
     status = (
@@ -844,6 +886,7 @@ def _build_speech_record(
                 "start_ms": segment.start_ms,
                 "end_ms": segment.end_ms,
                 "speaker_id": segment.speaker_id,
+                "raw_speaker_id": raw_speaker_ids.get(segment.segment_id),
                 "text": transcript_edits.get(segment.segment_id, segment.text),
                 "raw_text": segment.text,
                 "revision": segment.revision,

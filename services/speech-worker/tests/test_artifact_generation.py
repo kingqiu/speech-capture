@@ -23,7 +23,7 @@ from speech_capture_worker.artifact_generation import (
     _read_manual_section,
 )
 from speech_capture_worker.asr_execution import AsrChunkExecutor, AsrRunOutcome
-from speech_capture_worker.corrections import CorrectionField
+from speech_capture_worker.corrections import CorrectionField, encode_segment_review
 from speech_capture_worker.domain import JobState, ResourceStatus, UploadCreateRequest
 from speech_capture_worker.errors import (
     ArtifactGenerationFailed,
@@ -640,9 +640,9 @@ def test_append_only_corrections_regenerate_only_derived_artifacts(tmp_path) -> 
         ArtifactGenerator(store).generate(job.job_id)
         package = store.get_job_stage_directory(job.job_id, stage="artifacts")
         raw_before = (package / "transcript.raw.json").read_bytes()
-        original_segment = store.get_job_snapshot(job.job_id).stable_segments[0]
+        original_segment = store.get_job_snapshot(job.job_id).stable_segments[1]
         original_record = json.loads((package / "speech-record.json").read_text("utf-8"))
-        current_text = original_record["segments"][0]["text"]
+        current_text = original_record["segments"][1]["text"]
         revised_text = current_text.replace("稳定文字", "校订文字")
 
         current_job = store.get_job(job.job_id)
@@ -682,6 +682,26 @@ def test_append_only_corrections_regenerate_only_derived_artifacts(tmp_path) -> 
             )
 
         current_job = store.get_job(job.job_id)
+        segment_review, created = store.append_correction(
+            job.job_id,
+            field=CorrectionField.SEGMENT_REVIEW,
+            target_id=original_segment.segment_id,
+            before=encode_segment_review(
+                text=revised_text,
+                speaker_id=original_segment.speaker_id,
+            ),
+            after=encode_segment_review(
+                text=revised_text + "并已复核。",
+                speaker_id="speaker_0",
+            ),
+            author="test-user",
+            idempotency_key="correction-segment-review-1",
+            expected_revision=current_job.revision,
+        )
+        assert created is True
+        assert segment_review.field is CorrectionField.SEGMENT_REVIEW
+
+        current_job = store.get_job(job.job_id)
         store.append_correction(
             job.job_id,
             field=CorrectionField.SPEAKER_DISPLAY_NAME,
@@ -715,14 +735,17 @@ def test_append_only_corrections_regenerate_only_derived_artifacts(tmp_path) -> 
     assert already.outcome is ArtifactOutcome.ALREADY_GENERATED
     assert (package / "transcript.raw.json").read_bytes() == raw_before
     assert stable_after.text == original_segment.text
-    assert revised_text in transcript
+    assert revised_text + "并已复核。" in transcript
     assert "· 王总" in transcript
-    assert record["segments"][0]["text"] == revised_text
-    assert record["segments"][0]["raw_text"] == original_segment.text
+    assert record["segments"][1]["text"] == revised_text + "并已复核。"
+    assert record["segments"][1]["raw_text"] == original_segment.text
+    assert record["segments"][1]["speaker_id"] == "speaker_0"
+    assert record["segments"][1]["raw_speaker_id"] is None
     assert record["dates"]["recording_date"] == "2026-08-01"
-    assert record["speakers"] == [{"display_name": "王总", "speaker_id": "speaker_0"}]
-    assert [item["field"] for item in record["corrections"][-3:]] == [
+    assert {"display_name": "王总", "speaker_id": "speaker_0"} in record["speakers"]
+    assert [item["field"] for item in record["corrections"][-4:]] == [
         "transcript_text",
+        "segment_review",
         "speaker_display_name",
         "recording_date",
     ]

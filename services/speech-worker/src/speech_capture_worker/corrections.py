@@ -18,6 +18,7 @@ MAX_SPEAKER_DISPLAY_NAME_CHARACTERS = 200
 
 class CorrectionField(StrEnum):
     TRANSCRIPT_TEXT = "transcript_text"
+    SEGMENT_REVIEW = "segment_review"
     SPEAKER_DISPLAY_NAME = "speaker_display_name"
     RECORDING_DATE = "recording_date"
 
@@ -63,6 +64,16 @@ def validate_correction(
         validate_transcript_text(before)
         validate_transcript_text(after)
         return
+    if field is CorrectionField.SEGMENT_REVIEW:
+        if target_id is None or not SAFE_IDENTIFIER_PATTERN.fullmatch(target_id):
+            raise InvalidJobRequest("A segment review requires a safe segment_id.")
+        if not target_id.startswith("seg_"):
+            raise InvalidJobRequest("A segment review target must be a segment_id.")
+        if before is None:
+            raise InvalidJobRequest("A segment review requires the current value.")
+        decode_segment_review(before)
+        decode_segment_review(after)
+        return
     if field is CorrectionField.SPEAKER_DISPLAY_NAME:
         if target_id is None:
             raise InvalidJobRequest("A speaker-name correction requires a speaker_id.")
@@ -103,6 +114,37 @@ def corrections_sha256(corrections: list[CorrectionRecord]) -> str:
         sort_keys=True,
     )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def encode_segment_review(*, text: str, speaker_id: str | None) -> str:
+    validate_transcript_text(text)
+    if speaker_id is not None:
+        validate_speaker_id(speaker_id)
+    return json.dumps(
+        {"speaker_id": speaker_id, "text": text},
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def decode_segment_review(value: str) -> tuple[str, str | None]:
+    try:
+        payload = json.loads(value)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise InvalidJobRequest("segment review value must be valid JSON.") from exc
+    if not isinstance(payload, dict) or set(payload) != {"speaker_id", "text"}:
+        raise InvalidJobRequest("segment review value has unsupported fields.")
+    text = payload.get("text")
+    speaker_id = payload.get("speaker_id")
+    if not isinstance(text, str):
+        raise InvalidJobRequest("segment review text must be a string.")
+    validate_transcript_text(text)
+    if speaker_id is not None:
+        if not isinstance(speaker_id, str):
+            raise InvalidJobRequest("segment review speaker_id must be a string or null.")
+        validate_speaker_id(speaker_id)
+    return text, speaker_id
 
 
 def _validate_author(value: str) -> None:

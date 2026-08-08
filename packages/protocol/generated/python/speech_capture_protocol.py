@@ -2,7 +2,7 @@
 
 from typing import Final, Literal, NotRequired, TypeAlias, TypedDict
 
-OPENAPI_SHA256: Final = "6300b201c29125314cc362e3c8483285a1f38ebba50d0eb485d29f92a9badfa8"
+OPENAPI_SHA256: Final = "bcf537c8552166a59bef13e26f1ea68c2922ae9438aea3fcefd6a5702911ccb5"
 OPENAPI_VERSION: Final = "3.1.0"
 PROTOCOL_VERSION: Final = "1.0.0"
 
@@ -10,6 +10,13 @@ CompatibilityIssue: TypeAlias = Literal[
     'protocol_version_incompatible',
     'artifact_schema_incompatible',
     'required_capability_unavailable',
+]
+
+CorrectionField: TypeAlias = Literal[
+    'transcript_text',
+    'segment_review',
+    'speaker_display_name',
+    'recording_date',
 ]
 
 DiarizationStatus: TypeAlias = Literal[
@@ -112,6 +119,19 @@ class CompatibilityResponse(TypedDict):
     issues: list[CompatibilityIssue]
     missing_features: list[str]
     protocol_version: str | None
+
+class CorrectionSchema(TypedDict):
+    after: str
+    author: str
+    before: str | None
+    correction_id: str
+    created_at: str
+    field: CorrectionField
+    idempotency_key: str
+    job_id: str
+    job_revision: int
+    sequence: int
+    target_id: str | None
 
 class CredentialRotationActivateRequestSchema(TypedDict):
     device_id: str
@@ -267,6 +287,15 @@ class ReviewAudioResponse(TypedDict):
     size_bytes: int
     status: Literal['available']
 
+class SegmentReviewRequestSchema(TypedDict):
+    after_speaker_id: str | None
+    after_text: str
+    author: str
+    before_speaker_id: str | None
+    before_text: str
+    expected_revision: int
+    segment_id: str
+
 class TranscriptSegmentSchema(TypedDict):
     confidence: float | None
     created_at: str
@@ -348,6 +377,9 @@ class CompatibilityRequestSchema(TypedDict):
     protocol: VersionRangeSchema
     required_features: NotRequired[list[str]]
 
+class CorrectionListResponse(TypedDict):
+    corrections: list[CorrectionSchema]
+
 class JobActionEnvelope(TypedDict):
     applied: bool
     job: JobSchema
@@ -376,6 +408,11 @@ class JobUpdatesResponse(TypedDict):
 
 class PairedDeviceListResponse(TypedDict):
     devices: list[PairedDeviceSchema]
+
+class SegmentReviewEnvelope(TypedDict):
+    correction: CorrectionSchema
+    created: bool
+    job: JobSchema
 
 class UploadEnvelope(TypedDict):
     created: NotRequired[bool | None]
@@ -424,6 +461,9 @@ __all__ = [
     "CompatibilityIssue",
     "CompatibilityRequestSchema",
     "CompatibilityResponse",
+    "CorrectionField",
+    "CorrectionListResponse",
+    "CorrectionSchema",
     "CredentialRotationActivateRequestSchema",
     "CredentialRotationPrepareRequestSchema",
     "DeviceRevocationResponse",
@@ -454,6 +494,8 @@ __all__ = [
     "ProtocolLimitsSchema",
     "ProvisionalTranscriptSchema",
     "ReviewAudioResponse",
+    "SegmentReviewEnvelope",
+    "SegmentReviewRequestSchema",
     "SpeakerLabelStatus",
     "TranscriptOutcome",
     "TranscriptSegmentSchema",

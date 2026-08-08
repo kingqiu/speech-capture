@@ -3087,3 +3087,35 @@ Stage H 已批准的 V3 在线/离线稿、六人说话人清单和原始 ASR �
   Obsidian 实例。真实宿主验证继续只使用项目所有者手动打开的独立测试 Vault。
 
 明天新对话可直接要求完整读取交接与总体进度文档，并从交接记录第 38 节继续。
+
+---
+
+## 64. 2026-08-08 Stage I 取消终态与逐字稿复核第一批
+
+- 任务取消已形成简单不可恢复终态：活动任务经确认后停止后续处理，保留已接收音频、稳定逐字稿和
+  检查点；取消任务不显示恢复/重试，唯一后续动作是新建任务；无进度快照时阶段不会误落到质量检查；
+- Worker correction ledger 新增原子 `segment_review`，一次保存当前片段文字与说话人归属，保持
+  append-only、revision、幂等和旧值校验。新增修订列表与单段复核 API，派生产物叠加有效修订，
+  原始 ASR、原始逐字稿段和原始说话人不变；
+- `speech-record.json` 在修订后的说话人之外保留 `raw_speaker_id`，与既有 `raw_text` 共同构成原始
+  证据边界；协议 OpenAPI 和 Python/TypeScript 生成类型已同步；
+- 插件复核首批包含完整分页逐字稿、片段选择、说话人筛选、六人可搜索清单、`暂不确定`、文字与
+  单段归属原子保存、证据状态、左右栏收起与紧凑布局；尚未实现批量说话人显示名，因此不能宣称
+  复核功能全部完成；
+- 音频实现为当前设备同源文件优先，其次 Worker 鉴权 metadata + HTTP Range 片段流；只下载当前
+  片段所需 PCM 并生成小 WAV。Worker 离线时播放和滑杆禁用，逐字稿与修订保持可用；
+- 真实 Obsidian 宿主发现并修复处理完成任务轮询清空草稿、紧凑逐字稿行重叠、复核页断线不重绘、
+  Obsidian 网络异常未映射到恢复状态机四个问题。在线保存、超过轮询周期的未保存草稿、取消终态和
+  Worker 离线均已用独立测试 Vault 与合成数据验证；
+- 正式实现截图为 `docs/design/stage-i/images/08-cancelled-terminal-host-v1.png`、
+  `09-transcript-review-host-v1.png`、`10-transcript-review-offline-host-v1.png` 和
+  `11-transcript-review-reconnect-host-v1.png`；不含私有数据；
+- 当前回归为 Worker `436 passed`、Ruff 和协议漂移检查通过；插件 `36 passed`、严格类型检查和生产
+  构建通过。
+- 合成 Worker 已停止，测试 Secret Storage 凭据、Vault ID 和 Worker 选择已清除，测试插件已停用；
+  独立测试 Vault 和模拟运行数据继续由 Git 忽略。
+
+下一步继续 Stage I 复核第一批剩余项：先把批量说话人显示名与单段归属分开实现，再用合成数据完成
+Range 实际播放、本地同源优先、多人搜索滚动和窄窗就地修订宿主验证。仍不进入发布页或 Stage J，
+不重跑真实音频，不启动第二个 Obsidian，私有 Vault、音频、逐字稿、Note、数据库、凭据、
+`reference/`、`tmp/` 和构建产物不得进入 Git。

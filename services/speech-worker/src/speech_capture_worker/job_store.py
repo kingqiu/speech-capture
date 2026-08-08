@@ -19,6 +19,8 @@ from speech_capture_worker.asr_domain import AsrAttemptRecord, AsrAttemptState
 from speech_capture_worker.corrections import (
     CorrectionField,
     CorrectionRecord,
+    decode_segment_review,
+    encode_segment_review,
     validate_correction,
 )
 from speech_capture_worker.domain import (
@@ -547,6 +549,21 @@ class JobStore:
                 field=field,
                 target_id=target_id,
             )
+            if field is CorrectionField.SEGMENT_REVIEW:
+                _after_text, after_speaker_id = decode_segment_review(after)
+                if after_speaker_id is not None:
+                    speaker_exists = self._connection.execute(
+                        """
+                        SELECT 1 FROM transcript_segments
+                        WHERE job_id = ? AND speaker_id = ?
+                        LIMIT 1
+                        """,
+                        (job_id, after_speaker_id),
+                    ).fetchone()
+                    if speaker_exists is None:
+                        raise InvalidJobRequest(
+                            "The reviewed speaker_id does not exist in this job."
+                        )
             previous = self._connection.execute(
                 """
                 SELECT after_value
@@ -562,6 +579,43 @@ class JobStore:
                     "The corrected value changed after the caller's snapshot.",
                     details={"job_id": job_id, "field": field.value, "target_id": target_id},
                 )
+            if field is CorrectionField.SEGMENT_REVIEW:
+                assert target_id is not None and before is not None
+                segment = self._row_to_transcript_segment(
+                    self._fetch_transcript_segment_row(job_id, target_id)
+                )
+                current_text = segment.text or ""
+                current_speaker_id = segment.speaker_id
+                review_rows = self._connection.execute(
+                    """
+                    SELECT field, after_value FROM corrections
+                    WHERE job_id = ? AND target_id = ?
+                      AND field IN (?, ?)
+                    ORDER BY sequence ASC
+                    """,
+                    (
+                        job_id,
+                        target_id,
+                        CorrectionField.TRANSCRIPT_TEXT.value,
+                        CorrectionField.SEGMENT_REVIEW.value,
+                    ),
+                ).fetchall()
+                for review_row in review_rows:
+                    if str(review_row["field"]) == CorrectionField.TRANSCRIPT_TEXT.value:
+                        current_text = str(review_row["after_value"])
+                    else:
+                        current_text, current_speaker_id = decode_segment_review(
+                            str(review_row["after_value"])
+                        )
+                expected_before = encode_segment_review(
+                    text=current_text,
+                    speaker_id=current_speaker_id,
+                )
+                if before != expected_before:
+                    raise RevisionConflict(
+                        "The reviewed segment changed after the caller's snapshot.",
+                        details={"job_id": job_id, "segment_id": target_id},
+                    )
             revision = current.revision + 1
             correction_id = f"cor_{uuid4().hex}"
             now = _utc_now()
@@ -4004,7 +4058,7 @@ class JobStore:
         field: CorrectionField,
         target_id: str | None,
     ) -> None:
-        if field is CorrectionField.TRANSCRIPT_TEXT:
+        if field in {CorrectionField.TRANSCRIPT_TEXT, CorrectionField.SEGMENT_REVIEW}:
             assert target_id is not None
             segment = self._row_to_transcript_segment(
                 self._fetch_transcript_segment_row(job_id, target_id)

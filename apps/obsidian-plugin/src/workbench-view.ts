@@ -1,8 +1,10 @@
-import { ItemView, setIcon, type WorkspaceLeaf } from "obsidian";
+import { ItemView, Modal, setIcon, type WorkspaceLeaf } from "obsidian";
 
 import type {
+  CorrectionSchema,
   JobSchema,
-  JobSnapshotResponse
+  JobSnapshotResponse,
+  TranscriptSegmentSchema
 } from "../../../packages/protocol/generated/typescript/speech-capture-protocol";
 
 import {
@@ -25,17 +27,22 @@ import {
 import type SpeechCapturePlugin from "./main";
 import {
   applyJobAction,
+  effectiveTranscriptSegment,
   getJobSnapshot,
   JobClientError,
-  listJobs
+  listJobCorrections,
+  listJobs,
+  reviewTranscriptSegment
 } from "./job-client";
 import { ObsidianWorkerTransport } from "./obsidian-worker-transport";
+import { loadReviewAudioSegment } from "./review-audio-client";
 import {
   SubmissionError,
   submitRecording,
   type SubmissionProgress
 } from "./upload-client";
 import {
+  canCancelJob,
   jobProgressLabel,
   jobStageIndex,
   resourcePresentation,
@@ -102,6 +109,12 @@ export class SpeechWorkbenchView extends ItemView {
   private jobs: readonly JobSchema[] = [];
   private selectedJobId: string | null = null;
   private selectedSnapshot: JobSnapshotResponse | null = null;
+  private corrections: readonly CorrectionSchema[] = [];
+  private selectedSegmentId: string | null = null;
+  private speakerSearch = "";
+  private reviewSaving = false;
+  private reviewAudioUrl: string | null = null;
+  private readonly localAudioByJobId = new Map<string, File>();
   private taskError: string | null = null;
   private connectionRecovery: ConnectionRecovery | null = null;
   private refreshingTasks = false;
@@ -162,6 +175,7 @@ export class SpeechWorkbenchView extends ItemView {
       window.clearInterval(this.refreshTimer);
       this.refreshTimer = null;
     }
+    this.releaseReviewAudioUrl();
   }
 
   private render(): void {
@@ -189,8 +203,13 @@ export class SpeechWorkbenchView extends ItemView {
       this.renderPairingConfirmation(layout);
     } else if (this.viewMode === "task" && this.selectedJobId) {
       this.renderTaskSidebar(layout);
-      this.renderActiveTask(layout);
-      this.renderCurrentTask(layout);
+      if (this.selectedSnapshot?.job.state === "processed") {
+        this.renderTranscriptReview(layout);
+        this.renderReviewSidebar(layout);
+      } else {
+        this.renderActiveTask(layout);
+        this.renderCurrentTask(layout);
+      }
       this.renderRestoreHandles(layout);
     } else {
       this.renderTaskSidebar(layout);
@@ -326,6 +345,331 @@ export class SpeechWorkbenchView extends ItemView {
     }
   }
 
+  private renderTranscriptReview(layout: HTMLElement): void {
+    const main = layout.createEl("main", {
+      cls: "speech-capture-panel speech-capture-review"
+    });
+    const snapshot = this.selectedSnapshot;
+    if (!snapshot) {
+      main.createEl("p", { text: "正在读取完整逐字稿…" });
+      return;
+    }
+    const selected = this.selectedReviewSegment();
+    const heading = main.createDiv({ cls: "speech-capture-review__heading" });
+    const copy = heading.createDiv();
+    copy.createEl("h2", { text: "逐字稿与证据复核" });
+    copy.createEl("p", {
+      text: "点击文字定位音频；修订只影响校订稿，不覆盖原始识别证据"
+    });
+    heading.createEl("span", {
+      cls: "speech-capture-job-state is-good",
+      text: "处理完成 · 可复核"
+    });
+
+    this.renderReviewAudio(main, snapshot, selected);
+    if (this.taskError) {
+      main.createEl("p", {
+        cls: "speech-capture-inline-warning",
+        text: this.taskError
+      });
+    }
+
+    const section = main.createDiv({ cls: "speech-capture-review-transcript" });
+    section.createEl("h3", { text: "完整校订逐字稿" });
+    const speakerIds = this.reviewSpeakerIds();
+    const filters = section.createDiv({ cls: "speech-capture-review-filters" });
+    filters.createEl("button", {
+      cls: "is-selected",
+      text: "全部",
+      attr: { type: "button" }
+    });
+    for (const speakerId of speakerIds) {
+      filters.createEl("button", {
+        text: speakerLabel(speakerId),
+        attr: { type: "button" }
+      });
+    }
+    const revisedCount = snapshot.stable_segments.filter(
+      (segment) => effectiveTranscriptSegment(segment, this.corrections).revised
+    ).length;
+    if (revisedCount > 0) {
+      filters.createEl("span", {
+        cls: "speech-capture-review-filters__count",
+        text: `已修订 ${revisedCount.toString()}`
+      });
+    }
+
+    const rows = section.createDiv({ cls: "speech-capture-review-rows" });
+    const narrow = workbenchLayoutSize(
+      this.workbenchWidth || this.contentEl.clientWidth
+    ) === "narrow";
+    for (const segment of snapshot.stable_segments) {
+      if (segment.outcome !== "transcribed") {
+        continue;
+      }
+      const effective = effectiveTranscriptSegment(segment, this.corrections);
+      const row = rows.createEl("button", {
+        cls: `speech-capture-review-row ${segment.segment_id === selected?.segment_id ? "is-selected" : ""}`,
+        attr: { type: "button" }
+      });
+      row.createEl("time", { text: formatDuration(segment.start_ms) });
+      row.createEl("strong", { text: speakerLabel(effective.speakerId) });
+      row.createEl("span", {
+        cls: "speech-capture-review-row__text",
+        text: effective.text
+      });
+      row.createEl("small", { text: segment.segment_id });
+      if (effective.revised) {
+        row.createEl("span", {
+          cls: "speech-capture-review-row__revised",
+          text: "已修订"
+        });
+      }
+      row.addEventListener("click", () => {
+        this.selectedSegmentId = segment.segment_id;
+        this.speakerSearch = "";
+        this.render();
+      });
+      if (narrow && segment.segment_id === selected?.segment_id) {
+        this.renderSegmentEditor(rows, segment, true);
+      }
+    }
+  }
+
+  private renderReviewAudio(
+    parent: HTMLElement,
+    snapshot: JobSnapshotResponse,
+    selected: TranscriptSegmentSchema | null
+  ): void {
+    const card = parent.createDiv({ cls: "speech-capture-review-audio" });
+    const audio = card.createEl("audio", { attr: { preload: "none" } });
+    const play = card.createEl("button", {
+      cls: "speech-capture-review-play",
+      attr: {
+        type: "button",
+        "aria-label": selected ? "播放当前片段" : "没有可播放片段"
+      }
+    });
+    const playIcon = play.createSpan();
+    setIcon(playIcon, "play");
+    const duration = Math.max(
+      snapshot.progress?.duration_ms ?? 0,
+      ...snapshot.stable_segments.map((segment) => segment.end_ms)
+    );
+    const current = selected?.start_ms ?? 0;
+    const time = card.createEl("strong", {
+      text: `${formatDuration(current)} / ${formatDuration(duration)}`
+    });
+    const slider = card.createEl("input", {
+      cls: "speech-capture-review-audio__slider",
+      attr: {
+        type: "range",
+        min: "0",
+        max: Math.max(1, duration).toString(),
+        step: "1000",
+        value: current.toString(),
+        "aria-label": "音频时间位置"
+      }
+    });
+    slider.addEventListener("input", () => {
+      time.setText(
+        `${formatDuration(Number(slider.value))} / ${formatDuration(duration)}`
+      );
+    });
+    slider.addEventListener("change", () => {
+      const target = Number(slider.value);
+      const nearest = snapshot.stable_segments.find(
+        (segment) => segment.start_ms <= target && segment.end_ms >= target
+      ) ?? snapshot.stable_segments.reduce<TranscriptSegmentSchema | null>(
+        (best, segment) =>
+          best === null ||
+          Math.abs(segment.start_ms - target) < Math.abs(best.start_ms - target)
+            ? segment
+            : best,
+        null
+      );
+      if (nearest) {
+        this.selectedSegmentId = nearest.segment_id;
+        this.render();
+      }
+    });
+    const workerName = this.plugin.preferredWorker()?.displayName ?? "Worker";
+    const offline = this.connectionRecovery !== null;
+    const source = card.createDiv({ cls: "speech-capture-review-audio__source" });
+    const sourceCopy = source.createDiv({
+      cls: "speech-capture-review-audio__source-copy"
+    });
+    sourceCopy.createSpan({
+      text: offline
+        ? "当前无法播放音频，逐字稿仍可阅读和修改"
+        : this.localAudioByJobId.has(snapshot.job.job_id)
+          ? "当前设备原始音频 · 本地播放"
+          : `${workerName} 在线 · 流式播放`
+    });
+    if (offline) {
+      play.disabled = true;
+      slider.disabled = true;
+      if (this.connectionRecovery?.state === "retrying") {
+        sourceCopy.createEl("small", {
+          text: `系统将在 1 分钟后自动重试（已尝试 ${this.connectionRecovery.attemptsCompleted}/3 次）`
+        });
+      } else {
+        const reconnect = source.createEl("button", {
+          text: `重新连接${workerName}`,
+          attr: { type: "button" }
+        });
+        reconnect.addEventListener("click", () =>
+          void this.refreshJobs("manual")
+        );
+      }
+    } else {
+      play.disabled = selected === null;
+      play.addEventListener("click", () => {
+        if (selected) {
+          void this.playReviewSegment(audio, snapshot.job.job_id, selected, play);
+        }
+      });
+    }
+    const navigation = card.createDiv({ cls: "speech-capture-review-audio__nav" });
+    const segments = snapshot.stable_segments.filter(
+      (segment) => segment.outcome === "transcribed"
+    );
+    const index = selected
+      ? segments.findIndex((segment) => segment.segment_id === selected.segment_id)
+      : -1;
+    const previous = navigation.createEl("button", {
+      text: "上一条证据",
+      attr: { type: "button" }
+    });
+    previous.disabled = index <= 0;
+    previous.addEventListener("click", () => this.selectReviewSegment(segments[index - 1]));
+    const next = navigation.createEl("button", {
+      text: "下一条证据",
+      attr: { type: "button" }
+    });
+    next.disabled = index < 0 || index >= segments.length - 1;
+    next.addEventListener("click", () => this.selectReviewSegment(segments[index + 1]));
+  }
+
+  private renderReviewSidebar(layout: HTMLElement): void {
+    const aside = layout.createEl("aside", {
+      cls: "speech-capture-panel speech-capture-review-sidebar",
+      attr: { "aria-label": "当前片段" }
+    });
+    const title = aside.createDiv({ cls: "speech-capture-panel__title" });
+    title.createEl("h2", { text: "当前片段" });
+    title.appendChild(
+      this.collapseButton("right", "收起当前片段栏", "panel-right-close")
+    );
+    const selected = this.selectedReviewSegment();
+    if (!selected) {
+      aside.createEl("p", {
+        cls: "speech-capture-empty-copy",
+        text: "选择一段逐字稿后，可以在这里复核。"
+      });
+      return;
+    }
+    aside.createEl("p", {
+      cls: "speech-capture-review-sidebar__range",
+      text: `${formatDuration(selected.start_ms)}–${formatDuration(selected.end_ms)} · 已对齐 · 原始证据已保存`
+    });
+    const narrow = workbenchLayoutSize(
+      this.workbenchWidth || this.contentEl.clientWidth
+    ) === "narrow";
+    if (!narrow) {
+      this.renderSegmentEditor(aside, selected, false);
+    }
+    const evidence = aside.createDiv({ cls: "speech-capture-review-evidence" });
+    evidence.createEl("h3", { text: "证据状态" });
+    this.assurance(evidence, "circle-check", "原始识别已保存");
+    this.assurance(evidence, "circle-check", "时间范围已对齐");
+    evidence.createEl("p", {
+      text: "保存修订会新增一条记录，不会重写原始 ASR。"
+    });
+  }
+
+  private renderSegmentEditor(
+    parent: HTMLElement,
+    segment: TranscriptSegmentSchema,
+    inline: boolean
+  ): void {
+    const effective = effectiveTranscriptSegment(segment, this.corrections);
+    const editor = parent.createDiv({
+      cls: `speech-capture-segment-editor ${inline ? "is-inline" : ""}`
+    });
+    const speaker = editor.createDiv({ cls: "speech-capture-segment-editor__group" });
+    speaker.createEl("h3", { text: "这段话是谁说的？" });
+    speaker.createEl("p", { text: "只修正当前这一段，不会影响其他段落。" });
+    const search = speaker.createEl("input", {
+      attr: {
+        type: "search",
+        placeholder: "搜索说话人",
+        value: this.speakerSearch,
+        "aria-label": "搜索说话人"
+      }
+    });
+    const select = speaker.createEl("select", {
+      attr: { size: "6", "aria-label": "选择当前片段说话人" }
+    });
+    const uncertain = select.createEl("option", {
+      text: "暂不确定",
+      value: ""
+    });
+    uncertain.selected = effective.speakerId === null;
+    for (const speakerId of this.reviewSpeakerIds()) {
+      const option = select.createEl("option", {
+        text: speakerLabel(speakerId),
+        value: speakerId
+      });
+      option.selected = speakerId === effective.speakerId;
+    }
+    search.addEventListener("input", () => {
+      this.speakerSearch = search.value;
+      const needle = search.value.trim().toLocaleLowerCase();
+      for (const option of Array.from(select.options)) {
+        option.hidden =
+          option.value !== "" && !option.text.toLocaleLowerCase().includes(needle);
+      }
+    });
+
+    const text = editor.createDiv({ cls: "speech-capture-segment-editor__group" });
+    text.createEl("h3", { text: "文字校订" });
+    const textarea = text.createEl("textarea", {
+      attr: {
+        rows: "5",
+        "aria-label": "当前片段校订文字"
+      }
+    });
+    textarea.value = effective.text;
+    text.createEl("p", {
+      text: "原始 ASR 不会被改写，修改会记录为新修订。"
+    });
+    const save = editor.createEl("button", {
+      cls: "mod-cta speech-capture-segment-editor__save",
+      text: this.reviewSaving ? "正在保存…" : "保存此段修订",
+      attr: { type: "button" }
+    });
+    const updateDisabled = (): void => {
+      save.disabled =
+        this.reviewSaving ||
+        !textarea.value.trim() ||
+        (textarea.value.trim() === effective.text &&
+          (select.value || null) === effective.speakerId);
+    };
+    textarea.addEventListener("input", updateDisabled);
+    select.addEventListener("change", updateDisabled);
+    updateDisabled();
+    save.addEventListener("click", () =>
+      void this.saveSegmentReview(
+        segment,
+        effective.text,
+        effective.speakerId,
+        textarea.value.trim(),
+        select.value || null
+      )
+    );
+  }
+
   private renderCurrentTask(layout: HTMLElement): void {
     const aside = layout.createEl("aside", {
       cls: "speech-capture-panel speech-capture-current-task",
@@ -417,6 +761,15 @@ export class SpeechWorkbenchView extends ItemView {
       });
       background.prepend(this.choiceMark("play-circle"));
       background.addEventListener("click", () => this.openIntake());
+    }
+    if (job && canCancelJob(job.state)) {
+      const cancel = actions.createEl("button", {
+        cls: "speech-capture-task-cancel",
+        text: "取消任务",
+        attr: { type: "button" }
+      });
+      cancel.prepend(this.choiceMark("ban"));
+      cancel.addEventListener("click", () => this.openCancelConfirmation());
     }
     actions.createEl("p", {
       text:
@@ -881,7 +1234,15 @@ export class SpeechWorkbenchView extends ItemView {
     left.addEventListener("click", () => void this.toggleSidebar("left", false));
     const right = layout.createEl("button", {
       cls: "speech-capture-restore-handle is-right",
-      attr: { type: "button", "aria-label": "展开提交确认栏" }
+      attr: {
+        type: "button",
+        "aria-label":
+          this.selectedSnapshot?.job.state === "processed"
+            ? "展开当前片段栏"
+            : this.viewMode === "task"
+              ? "展开当前任务栏"
+              : "展开提交确认栏"
+      }
     });
     setIcon(right, "chevron-left");
     right.addEventListener("click", () => void this.toggleSidebar("right", false));
@@ -969,7 +1330,9 @@ export class SpeechWorkbenchView extends ItemView {
             progress,
             snapshot.progress.estimated_remaining_seconds
           )
-        : "任务已进入队列，等待 Worker 更新进度"
+        : snapshot?.job.state === "cancelled"
+          ? "任务已停止，最后保存的内容仍可查看"
+          : "任务已进入队列，等待 Worker 更新进度"
     });
     const track = card.createDiv({ cls: "speech-capture-progress is-large" });
     track.createDiv({
@@ -1137,7 +1500,9 @@ export class SpeechWorkbenchView extends ItemView {
       : side === "left"
         ? ".speech-capture-task-panel .speech-capture-collapse-button"
         : this.viewMode === "task"
-          ? ".speech-capture-current-task .speech-capture-collapse-button"
+          ? this.selectedSnapshot?.job.state === "processed"
+            ? ".speech-capture-review-sidebar .speech-capture-collapse-button"
+            : ".speech-capture-current-task .speech-capture-collapse-button"
           : ".speech-capture-confirmation .speech-capture-collapse-button";
     this.contentEl.querySelector<HTMLButtonElement>(selector)?.focus();
   }
@@ -1190,6 +1555,9 @@ export class SpeechWorkbenchView extends ItemView {
       return;
     }
     this.refreshingTasks = true;
+    const wasReviewingProcessed = this.selectedSnapshot?.job.state === "processed";
+    const previousRevision = this.selectedSnapshot?.job.revision ?? null;
+    const previousCorrectionSequence = this.corrections.at(-1)?.sequence ?? 0;
     try {
       this.jobs = await listJobs(
         new ObsidianWorkerTransport(),
@@ -1204,9 +1572,38 @@ export class SpeechWorkbenchView extends ItemView {
           token,
           this.selectedJobId
         );
+        this.corrections =
+          this.selectedSnapshot.job.state === "processed"
+            ? await listJobCorrections(
+                new ObsidianWorkerTransport(),
+                worker,
+                token,
+                this.selectedJobId
+              )
+            : [];
+        if (
+          !this.selectedSegmentId ||
+          !this.selectedSnapshot.stable_segments.some(
+            (segment) => segment.segment_id === this.selectedSegmentId
+          )
+        ) {
+          this.selectedSegmentId =
+            this.selectedSnapshot.stable_segments.find(
+              (segment) => segment.outcome === "transcribed"
+            )?.segment_id ?? null;
+        }
       }
       this.taskError = null;
       this.connectionRecovery = null;
+      if (
+        mode === "normal" &&
+        wasReviewingProcessed &&
+        this.selectedSnapshot?.job.state === "processed" &&
+        this.selectedSnapshot.job.revision === previousRevision &&
+        (this.corrections.at(-1)?.sequence ?? 0) === previousCorrectionSequence
+      ) {
+        return;
+      }
       this.render();
     } catch (error) {
       if (error instanceof JobClientError && error.code === "unavailable") {
@@ -1215,9 +1612,7 @@ export class SpeechWorkbenchView extends ItemView {
           mode,
           Date.now()
         );
-        if (this.viewMode === "task") {
-          this.render();
-        }
+        this.render();
       } else if (this.viewMode === "task" || mode === "manual") {
         this.taskError =
           error instanceof JobClientError
@@ -1233,6 +1628,9 @@ export class SpeechWorkbenchView extends ItemView {
   private async selectJob(jobId: string): Promise<void> {
     this.selectedJobId = jobId;
     this.selectedSnapshot = null;
+    this.corrections = [];
+    this.selectedSegmentId = null;
+    this.speakerSearch = "";
     this.taskError = null;
     this.connectionRecovery = null;
     this.viewMode = "task";
@@ -1241,12 +1639,158 @@ export class SpeechWorkbenchView extends ItemView {
   }
 
   private openIntake(): void {
+    this.releaseReviewAudioUrl();
     this.viewMode = "intake";
     this.selectedJobId = null;
     this.selectedSnapshot = null;
+    this.corrections = [];
+    this.selectedSegmentId = null;
     this.taskError = null;
     this.connectionRecovery = null;
     this.render();
+  }
+
+  private selectedReviewSegment(): TranscriptSegmentSchema | null {
+    const segments = this.selectedSnapshot?.stable_segments ?? [];
+    return (
+      segments.find((segment) => segment.segment_id === this.selectedSegmentId) ??
+      segments.find((segment) => segment.outcome === "transcribed") ??
+      null
+    );
+  }
+
+  private reviewSpeakerIds(): string[] {
+    const values = new Set<string>();
+    for (const segment of this.selectedSnapshot?.stable_segments ?? []) {
+      if (segment.speaker_id) {
+        values.add(segment.speaker_id);
+      }
+      const effective = effectiveTranscriptSegment(segment, this.corrections);
+      if (effective.speakerId) {
+        values.add(effective.speakerId);
+      }
+    }
+    return [...values].sort((left, right) => left.localeCompare(right));
+  }
+
+  private selectReviewSegment(segment: TranscriptSegmentSchema | undefined): void {
+    if (!segment) {
+      return;
+    }
+    this.selectedSegmentId = segment.segment_id;
+    this.speakerSearch = "";
+    this.render();
+  }
+
+  private async saveSegmentReview(
+    segment: TranscriptSegmentSchema,
+    beforeText: string,
+    beforeSpeakerId: string | null,
+    afterText: string,
+    afterSpeakerId: string | null
+  ): Promise<void> {
+    const worker = this.plugin.preferredWorker();
+    const token = worker ? this.plugin.credentials.get(worker.id) : null;
+    const job = this.selectedSnapshot?.job;
+    if (!worker || !token || !job || this.reviewSaving) {
+      return;
+    }
+    this.reviewSaving = true;
+    this.taskError = null;
+    this.render();
+    try {
+      await reviewTranscriptSegment(
+        new ObsidianWorkerTransport(),
+        worker,
+        token,
+        {
+          job,
+          segmentId: segment.segment_id,
+          beforeText,
+          afterText,
+          beforeSpeakerId,
+          afterSpeakerId
+        }
+      );
+      this.reviewSaving = false;
+      await this.refreshJobs();
+    } catch (error) {
+      this.taskError =
+        error instanceof JobClientError
+          ? error.message
+          : "这段修订未能保存，请重新读取后再试。";
+      if (error instanceof JobClientError && error.code === "conflict") {
+        await this.refreshJobs();
+      } else {
+        this.render();
+      }
+    } finally {
+      this.reviewSaving = false;
+    }
+  }
+
+  private async playReviewSegment(
+    audio: HTMLAudioElement,
+    jobId: string,
+    segment: TranscriptSegmentSchema,
+    button: HTMLButtonElement
+  ): Promise<void> {
+    const worker = this.plugin.preferredWorker();
+    const token = worker ? this.plugin.credentials.get(worker.id) : null;
+    if (!worker || !token) {
+      return;
+    }
+    button.disabled = true;
+    this.releaseReviewAudioUrl();
+    try {
+      const local = this.localAudioByJobId.get(jobId);
+      if (local) {
+        this.reviewAudioUrl = URL.createObjectURL(local);
+        audio.src = this.reviewAudioUrl;
+        audio.addEventListener(
+          "loadedmetadata",
+          () => {
+            audio.currentTime = segment.start_ms / 1_000;
+            void audio.play();
+          },
+          { once: true }
+        );
+        const stopAtEnd = (): void => {
+          if (audio.currentTime >= segment.end_ms / 1_000) {
+            audio.pause();
+            audio.removeEventListener("timeupdate", stopAtEnd);
+          }
+        };
+        audio.addEventListener("timeupdate", stopAtEnd);
+      } else {
+        const loaded = await loadReviewAudioSegment(
+          new ObsidianWorkerTransport(),
+          worker,
+          token,
+          jobId,
+          segment.start_ms,
+          segment.end_ms
+        );
+        this.reviewAudioUrl = URL.createObjectURL(loaded.blob);
+        audio.src = this.reviewAudioUrl;
+        await audio.play();
+      }
+    } catch (error) {
+      this.taskError =
+        error instanceof JobClientError
+          ? error.message
+          : "当前片段的音频暂时无法播放。";
+      this.render();
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  private releaseReviewAudioUrl(): void {
+    if (this.reviewAudioUrl) {
+      URL.revokeObjectURL(this.reviewAudioUrl);
+      this.reviewAudioUrl = null;
+    }
   }
 
   private selectedJob(): JobSchema | null {
@@ -1278,6 +1822,37 @@ export class SpeechWorkbenchView extends ItemView {
           : "任务操作未完成，请重新读取后再试。";
       await this.refreshJobs();
     }
+  }
+
+  private openCancelConfirmation(): void {
+    const job = this.selectedSnapshot?.job ?? this.selectedJob();
+    if (!job || !canCancelJob(job.state)) {
+      return;
+    }
+    const modal = new Modal(this.app);
+    modal.titleEl.setText("取消这个任务？");
+    modal.contentEl.createEl("p", {
+      text: "Worker 将停止后续处理。已上传音频、稳定逐字稿和处理检查点会继续保留；任务取消后不能恢复。"
+    });
+    const actions = modal.contentEl.createDiv({
+      cls: "speech-capture-confirm-actions"
+    });
+    const keep = actions.createEl("button", {
+      text: "继续保留任务",
+      attr: { type: "button" }
+    });
+    keep.addEventListener("click", () => modal.close());
+    const confirm = actions.createEl("button", {
+      cls: "mod-warning",
+      text: "确认取消任务",
+      attr: { type: "button" }
+    });
+    confirm.addEventListener("click", () => {
+      modal.close();
+      void this.performTaskAction("cancel");
+    });
+    modal.open();
+    keep.focus();
   }
 
   private openPairing(): void {
@@ -1383,6 +1958,7 @@ export class SpeechWorkbenchView extends ItemView {
           this.render();
         }
       });
+      this.localAudioByJobId.set(result.job.job_id, file);
       this.submissionState = { state: "complete", jobId: result.job.job_id };
       this.jobs = [
         result.job,
@@ -1470,6 +2046,9 @@ export class SpeechWorkbenchView extends ItemView {
     }
     if (this.probingWorker) {
       return { text: `${workerName} · 正在检测`, className: "is-neutral" };
+    }
+    if (this.connectionRecovery) {
+      return { text: `${workerName} · 连接中断`, className: "is-warning" };
     }
     if (this.viewMode === "task") {
       const job = this.selectedSnapshot?.job ?? this.selectedJob();

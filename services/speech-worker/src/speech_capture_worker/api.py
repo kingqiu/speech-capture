@@ -22,6 +22,8 @@ from speech_capture_worker.api_schemas import (
     CapabilitiesResponse,
     CompatibilityRequestSchema,
     CompatibilityResponse,
+    CorrectionListResponse,
+    CorrectionSchema,
     CredentialRotationActivateRequestSchema,
     CredentialRotationPrepareRequestSchema,
     DeviceRevocationResponse,
@@ -47,6 +49,8 @@ from speech_capture_worker.api_schemas import (
     ProvisionalTranscriptSchema,
     ReviewAudioResponse,
     SafeIdentifier,
+    SegmentReviewEnvelope,
+    SegmentReviewRequestSchema,
     Sha256String,
     TranscriptSegmentSchema,
     UploadCreateSchema,
@@ -58,6 +62,7 @@ from speech_capture_worker.api_schemas import (
 )
 from speech_capture_worker.artifact_access import load_artifact_package
 from speech_capture_worker.audio_preprocessing import AudioPreprocessor
+from speech_capture_worker.corrections import CorrectionField, encode_segment_review
 from speech_capture_worker.device_security import DeviceSecurityStore
 from speech_capture_worker.domain import (
     JobRecord,
@@ -784,6 +789,63 @@ def create_app(
             segment_limit=segment_limit,
         )
         return _snapshot_schema(snapshot)
+
+    @app.get(
+        "/v1/jobs/{job_id}/corrections",
+        response_model=CorrectionListResponse,
+        operation_id="listJobCorrections",
+        tags=["corrections"],
+        responses=PRIVATE_ERROR_RESPONSES,
+    )
+    def list_job_corrections(
+        job_id: str,
+        principal: Principal,
+        worker_store: Store,
+    ) -> CorrectionListResponse:
+        _authorized_job(worker_store, principal, job_id)
+        return CorrectionListResponse(
+            corrections=tuple(
+                CorrectionSchema.model_validate(item.to_dict())
+                for item in worker_store.list_corrections(job_id)
+            )
+        )
+
+    @app.post(
+        "/v1/jobs/{job_id}/segment-review",
+        response_model=SegmentReviewEnvelope,
+        operation_id="reviewJobTranscriptSegment",
+        tags=["corrections"],
+        responses=PRIVATE_ERROR_RESPONSES,
+    )
+    def review_job_transcript_segment(
+        job_id: str,
+        request: SegmentReviewRequestSchema,
+        principal: Principal,
+        worker_store: Store,
+        idempotency_key: Annotated[str, Header(alias="Idempotency-Key")],
+    ) -> SegmentReviewEnvelope:
+        _authorized_job(worker_store, principal, job_id)
+        correction, created = worker_store.append_correction(
+            job_id,
+            field=CorrectionField.SEGMENT_REVIEW,
+            target_id=request.segment_id,
+            before=encode_segment_review(
+                text=request.before_text,
+                speaker_id=request.before_speaker_id,
+            ),
+            after=encode_segment_review(
+                text=request.after_text,
+                speaker_id=request.after_speaker_id,
+            ),
+            author=request.author,
+            idempotency_key=idempotency_key,
+            expected_revision=request.expected_revision,
+        )
+        return SegmentReviewEnvelope(
+            job=_job_schema(worker_store.get_job(job_id)),
+            correction=CorrectionSchema.model_validate(correction.to_dict()),
+            created=created,
+        )
 
     @app.get(
         "/v1/jobs/{job_id}/events",

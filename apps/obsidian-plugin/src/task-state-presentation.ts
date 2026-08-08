@@ -31,10 +31,13 @@ export function jobStageIndex(
   lastProgressStage: JobState | null = null
 ): number {
   const effectiveState =
-    ["paused", "waiting_user", "partial", "failed"].includes(state) &&
+    ["paused", "waiting_user", "partial", "failed", "cancelled"].includes(state) &&
     lastProgressStage
       ? lastProgressStage
       : state;
+  if (effectiveState === "cancelled") {
+    return 2;
+  }
   switch (effectiveState) {
     case "created":
     case "uploading":
@@ -126,7 +129,36 @@ export function taskStatePresentation(
       actionLabel: "重试当前阶段"
     };
   }
+  if (job.state === "cancelled") {
+    return {
+      kind: "warning",
+      icon: "ban",
+      title: "任务已取消",
+      detail: "Worker 已停止后续处理。已上传音频、稳定逐字稿和处理检查点仍会保留；这个任务不能恢复。",
+      action: "new_task",
+      actionLabel: "新建语音任务"
+    };
+  }
   return null;
+}
+
+export function canCancelJob(state: JobState): boolean {
+  return [
+    "created",
+    "uploading",
+    "verifying",
+    "queued",
+    "preprocessing",
+    "transcribing",
+    "aligning",
+    "diarizing",
+    "structuring",
+    "quality_check",
+    "paused",
+    "waiting_user",
+    "partial",
+    "failed"
+  ].includes(state);
 }
 
 export function resourcePresentation(
