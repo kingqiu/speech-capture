@@ -2,10 +2,12 @@ import { describe, expect, it } from "vitest";
 
 import {
   applyJobAction,
+  effectiveSpeakerDisplayName,
   effectiveTranscriptSegment,
   getJobSnapshot,
   listJobCorrections,
   listJobs,
+  renameJobSpeakerDisplayName,
   reviewTranscriptSegment
 } from "../src/job-client";
 import type { WorkerConnectionSettings } from "../src/settings";
@@ -163,6 +165,59 @@ describe("job client", () => {
       before_speaker_id: "speaker_0",
       after_speaker_id: null
     });
+  });
+
+  it("renames one anonymous speaker label without changing segment attribution", async () => {
+    const correction = {
+      correction_id: "cor_speaker_name",
+      job_revision: 5,
+      field: "speaker_display_name",
+      target_id: "speaker_0",
+      after: "王总"
+    };
+    const transport = new QueueTransport([
+      response(200, {
+        created: true,
+        correction,
+        job: { ...JOB, revision: 5 }
+      })
+    ]);
+
+    expect(effectiveSpeakerDisplayName("speaker_0", [])).toEqual({
+      displayName: "Speaker 0",
+      revised: false
+    });
+    expect(effectiveSpeakerDisplayName("speaker_0", [correction] as never)).toEqual({
+      displayName: "王总",
+      revised: true
+    });
+
+    const saved = await renameJobSpeakerDisplayName(
+      transport,
+      WORKER,
+      "secret",
+      {
+        job: JOB,
+        speakerId: "speaker_0",
+        before: "Speaker 0",
+        after: "王总"
+      }
+    );
+
+    expect(saved.created).toBe(true);
+    expect(transport.requests[0]).toMatchObject({
+      path: `/v1/jobs/${JOB.job_id}/speaker-display-name`,
+      body: {
+        expected_revision: 4,
+        speaker_id: "speaker_0",
+        before: "Speaker 0",
+        after: "王总",
+        author: "obsidian-user"
+      }
+    });
+    expect(transport.requests[0]?.headers?.["Idempotency-Key"]).toMatch(
+      /^obsidian-[0-9a-f]{64}$/
+    );
   });
 });
 

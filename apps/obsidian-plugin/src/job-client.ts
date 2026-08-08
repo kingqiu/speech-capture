@@ -9,6 +9,7 @@ import type {
   JobSchema,
   JobSnapshotResponse,
   SegmentReviewEnvelope,
+  SpeakerDisplayNameEnvelope,
   TranscriptSegmentSchema
 } from "../../../packages/protocol/generated/typescript/speech-capture-protocol";
 
@@ -169,6 +170,62 @@ export function effectiveTranscriptSegment(
   return { text, speakerId, revised };
 }
 
+export function effectiveSpeakerDisplayName(
+  speakerId: string,
+  corrections: readonly CorrectionSchema[]
+): { readonly displayName: string; readonly revised: boolean } {
+  let displayName = canonicalSpeakerDisplayName(speakerId);
+  let revised = false;
+  for (const correction of corrections) {
+    if (
+      correction.field === "speaker_display_name" &&
+      correction.target_id === speakerId
+    ) {
+      displayName = correction.after;
+      revised = true;
+    }
+  }
+  return { displayName, revised };
+}
+
+export async function renameJobSpeakerDisplayName(
+  transport: WorkerTransport,
+  worker: WorkerConnectionSettings,
+  bearerToken: string,
+  request: {
+    readonly job: Pick<JobSchema, "job_id" | "revision">;
+    readonly speakerId: string;
+    readonly before: string;
+    readonly after: string;
+  }
+): Promise<SpeakerDisplayNameEnvelope> {
+  const body = {
+    expected_revision: request.job.revision,
+    speaker_id: request.speakerId,
+    before: request.before,
+    after: request.after,
+    author: "obsidian-user"
+  };
+  const idempotency = bytesToHex(
+    sha256(new TextEncoder().encode(JSON.stringify(body)))
+  );
+  const response = await transport.request(
+    worker,
+    `/v1/jobs/${encodeURIComponent(request.job.job_id)}/speaker-display-name`,
+    {
+      method: "POST",
+      body,
+      bearerToken,
+      headers: { "Idempotency-Key": `obsidian-${idempotency}` }
+    }
+  );
+  const value = parseSuccess(response);
+  if (!isJobSummary(value.job) || !isCorrection(value.correction)) {
+    throw new JobClientError("invalid", "Worker 返回了无法识别的说话人改名结果。");
+  }
+  return value as unknown as SpeakerDisplayNameEnvelope;
+}
+
 export async function applyJobAction(
   transport: WorkerTransport,
   worker: WorkerConnectionSettings,
@@ -265,6 +322,11 @@ function parseSegmentReview(
     // Invalid correction data is ignored here and remains available for diagnostics.
   }
   return null;
+}
+
+function canonicalSpeakerDisplayName(speakerId: string): string {
+  const suffix = speakerId.match(/(\d+)$/)?.[1];
+  return suffix ? `Speaker ${Number(suffix).toString()}` : speakerId;
 }
 
 function isProvisional(value: unknown): boolean {

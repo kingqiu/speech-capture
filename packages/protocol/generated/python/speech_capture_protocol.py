@@ -2,7 +2,7 @@
 
 from typing import Final, Literal, NotRequired, TypeAlias, TypedDict
 
-OPENAPI_SHA256: Final = "bcf537c8552166a59bef13e26f1ea68c2922ae9438aea3fcefd6a5702911ccb5"
+OPENAPI_SHA256: Final = "c5a2bbe8b41715997dd1f99be4a60f89c09181c18c2eabaf8e69617b323d926c"
 OPENAPI_VERSION: Final = "3.1.0"
 PROTOCOL_VERSION: Final = "1.0.0"
 
@@ -296,6 +296,13 @@ class SegmentReviewRequestSchema(TypedDict):
     expected_revision: int
     segment_id: str
 
+class SpeakerDisplayNameRequestSchema(TypedDict):
+    after: str
+    author: str
+    before: str
+    expected_revision: int
+    speaker_id: str
+
 class TranscriptSegmentSchema(TypedDict):
     confidence: float | None
     created_at: str
@@ -414,6 +421,11 @@ class SegmentReviewEnvelope(TypedDict):
     created: bool
     job: JobSchema
 
+class SpeakerDisplayNameEnvelope(TypedDict):
+    correction: CorrectionSchema
+    created: bool
+    job: JobSchema
+
 class UploadEnvelope(TypedDict):
     created: NotRequired[bool | None]
     missing_part_numbers: list[int]
@@ -496,6 +508,8 @@ __all__ = [
     "ReviewAudioResponse",
     "SegmentReviewEnvelope",
     "SegmentReviewRequestSchema",
+    "SpeakerDisplayNameEnvelope",
+    "SpeakerDisplayNameRequestSchema",
     "SpeakerLabelStatus",
     "TranscriptOutcome",
     "TranscriptSegmentSchema",

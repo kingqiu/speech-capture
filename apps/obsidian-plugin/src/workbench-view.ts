@@ -27,11 +27,13 @@ import {
 import type SpeechCapturePlugin from "./main";
 import {
   applyJobAction,
+  effectiveSpeakerDisplayName,
   effectiveTranscriptSegment,
   getJobSnapshot,
   JobClientError,
   listJobCorrections,
   listJobs,
+  renameJobSpeakerDisplayName,
   reviewTranscriptSegment
 } from "./job-client";
 import { ObsidianWorkerTransport } from "./obsidian-worker-transport";
@@ -111,8 +113,10 @@ export class SpeechWorkbenchView extends ItemView {
   private selectedSnapshot: JobSnapshotResponse | null = null;
   private corrections: readonly CorrectionSchema[] = [];
   private selectedSegmentId: string | null = null;
+  private speakerFilterId: string | null = null;
   private speakerSearch = "";
   private reviewSaving = false;
+  private speakerRenameSaving = false;
   private reviewAudioUrl: string | null = null;
   private readonly localAudioByJobId = new Map<string, File>();
   private taskError: string | null = null;
@@ -378,16 +382,19 @@ export class SpeechWorkbenchView extends ItemView {
     section.createEl("h3", { text: "完整校订逐字稿" });
     const speakerIds = this.reviewSpeakerIds();
     const filters = section.createDiv({ cls: "speech-capture-review-filters" });
-    filters.createEl("button", {
-      cls: "is-selected",
+    const allSpeakers = filters.createEl("button", {
+      cls: this.speakerFilterId === null ? "is-selected" : "",
       text: "全部",
       attr: { type: "button" }
     });
+    allSpeakers.addEventListener("click", () => this.selectSpeakerFilter(null));
     for (const speakerId of speakerIds) {
-      filters.createEl("button", {
-        text: speakerLabel(speakerId),
+      const filter = filters.createEl("button", {
+        cls: this.speakerFilterId === speakerId ? "is-selected" : "",
+        text: this.speakerPrimaryLabel(speakerId),
         attr: { type: "button" }
       });
+      filter.addEventListener("click", () => this.selectSpeakerFilter(speakerId));
     }
     const revisedCount = snapshot.stable_segments.filter(
       (segment) => effectiveTranscriptSegment(segment, this.corrections).revised
@@ -408,12 +415,22 @@ export class SpeechWorkbenchView extends ItemView {
         continue;
       }
       const effective = effectiveTranscriptSegment(segment, this.corrections);
+      if (
+        this.speakerFilterId !== null &&
+        effective.speakerId !== this.speakerFilterId
+      ) {
+        continue;
+      }
       const row = rows.createEl("button", {
         cls: `speech-capture-review-row ${segment.segment_id === selected?.segment_id ? "is-selected" : ""}`,
         attr: { type: "button" }
       });
       row.createEl("time", { text: formatDuration(segment.start_ms) });
-      row.createEl("strong", { text: speakerLabel(effective.speakerId) });
+      row.createEl("strong", {
+        text: effective.speakerId
+          ? this.speakerPrimaryLabel(effective.speakerId)
+          : speakerLabel(null)
+      });
       row.createEl("span", {
         cls: "speech-capture-review-row__text",
         text: effective.text
@@ -573,6 +590,7 @@ export class SpeechWorkbenchView extends ItemView {
       cls: "speech-capture-review-sidebar__range",
       text: `${formatDuration(selected.start_ms)}–${formatDuration(selected.end_ms)} · 已对齐 · 原始证据已保存`
     });
+    this.renderSpeakerDisplayNameEditor(aside, selected);
     const narrow = workbenchLayoutSize(
       this.workbenchWidth || this.contentEl.clientWidth
     ) === "narrow";
@@ -618,19 +636,23 @@ export class SpeechWorkbenchView extends ItemView {
     uncertain.selected = effective.speakerId === null;
     for (const speakerId of this.reviewSpeakerIds()) {
       const option = select.createEl("option", {
-        text: speakerLabel(speakerId),
+        text: this.speakerOptionLabel(speakerId),
         value: speakerId
       });
       option.selected = speakerId === effective.speakerId;
     }
-    search.addEventListener("input", () => {
-      this.speakerSearch = search.value;
+    const applySpeakerSearch = (): void => {
       const needle = search.value.trim().toLocaleLowerCase();
       for (const option of Array.from(select.options)) {
         option.hidden =
           option.value !== "" && !option.text.toLocaleLowerCase().includes(needle);
       }
+    };
+    search.addEventListener("input", () => {
+      this.speakerSearch = search.value;
+      applySpeakerSearch();
     });
+    applySpeakerSearch();
 
     const text = editor.createDiv({ cls: "speech-capture-segment-editor__group" });
     text.createEl("h3", { text: "文字校订" });
@@ -668,6 +690,79 @@ export class SpeechWorkbenchView extends ItemView {
         select.value || null
       )
     );
+  }
+
+  private renderSpeakerDisplayNameEditor(
+    parent: HTMLElement,
+    selectedSegment: TranscriptSegmentSchema
+  ): void {
+    const speakerIds = this.reviewSpeakerIds();
+    if (speakerIds.length === 0) {
+      return;
+    }
+    const selectedEffective = effectiveTranscriptSegment(
+      selectedSegment,
+      this.corrections
+    );
+    const initialSpeakerId =
+      selectedEffective.speakerId && speakerIds.includes(selectedEffective.speakerId)
+        ? selectedEffective.speakerId
+        : speakerIds[0]!;
+    const editor = parent.createDiv({
+      cls: "speech-capture-speaker-name-editor"
+    });
+    editor.createEl("h3", { text: "说话人显示名" });
+    editor.createEl("p", {
+      text: "批量改名只改变人物标签，不会改变任何片段的说话人归属。"
+    });
+    const select = editor.createEl("select", {
+      attr: { "aria-label": "选择要批量改名的说话人" }
+    });
+    for (const speakerId of speakerIds) {
+      const option = select.createEl("option", {
+        text: this.speakerOptionLabel(speakerId),
+        value: speakerId
+      });
+      option.selected = speakerId === initialSpeakerId;
+    }
+    const input = editor.createEl("input", {
+      attr: {
+        type: "text",
+        maxlength: "200",
+        placeholder: "例如：访谈嘉宾",
+        "aria-label": "新的说话人显示名"
+      }
+    });
+    const save = editor.createEl("button", {
+      text: this.speakerRenameSaving ? "正在保存…" : "批量改显示名",
+      attr: { type: "button" }
+    });
+    const loadSelectedName = (): void => {
+      const current = effectiveSpeakerDisplayName(select.value, this.corrections);
+      input.value = current.revised ? current.displayName : "";
+    };
+    const updateDisabled = (): void => {
+      const current = effectiveSpeakerDisplayName(select.value, this.corrections);
+      save.disabled =
+        this.speakerRenameSaving ||
+        !input.value.trim() ||
+        input.value.trim() === current.displayName;
+    };
+    select.addEventListener("change", () => {
+      loadSelectedName();
+      updateDisabled();
+    });
+    input.addEventListener("input", updateDisabled);
+    loadSelectedName();
+    updateDisabled();
+    save.addEventListener("click", () => {
+      const current = effectiveSpeakerDisplayName(select.value, this.corrections);
+      void this.saveSpeakerDisplayName(
+        select.value,
+        current.displayName,
+        input.value.trim()
+      );
+    });
   }
 
   private renderCurrentTask(layout: HTMLElement): void {
@@ -1630,6 +1725,7 @@ export class SpeechWorkbenchView extends ItemView {
     this.selectedSnapshot = null;
     this.corrections = [];
     this.selectedSegmentId = null;
+    this.speakerFilterId = null;
     this.speakerSearch = "";
     this.taskError = null;
     this.connectionRecovery = null;
@@ -1645,6 +1741,7 @@ export class SpeechWorkbenchView extends ItemView {
     this.selectedSnapshot = null;
     this.corrections = [];
     this.selectedSegmentId = null;
+    this.speakerFilterId = null;
     this.taskError = null;
     this.connectionRecovery = null;
     this.render();
@@ -1680,6 +1777,34 @@ export class SpeechWorkbenchView extends ItemView {
     this.selectedSegmentId = segment.segment_id;
     this.speakerSearch = "";
     this.render();
+  }
+
+  private selectSpeakerFilter(speakerId: string | null): void {
+    this.speakerFilterId = speakerId;
+    if (speakerId !== null) {
+      const first = this.selectedSnapshot?.stable_segments.find(
+        (segment) =>
+          segment.outcome === "transcribed" &&
+          effectiveTranscriptSegment(segment, this.corrections).speakerId === speakerId
+      );
+      if (first) {
+        this.selectedSegmentId = first.segment_id;
+      }
+    }
+    this.speakerSearch = "";
+    this.render();
+  }
+
+  private speakerPrimaryLabel(speakerId: string): string {
+    const current = effectiveSpeakerDisplayName(speakerId, this.corrections);
+    return current.revised ? current.displayName : speakerLabel(speakerId);
+  }
+
+  private speakerOptionLabel(speakerId: string): string {
+    const current = effectiveSpeakerDisplayName(speakerId, this.corrections);
+    return current.revised
+      ? `${current.displayName} · ${speakerLabel(speakerId)}`
+      : speakerLabel(speakerId);
   }
 
   private async saveSegmentReview(
@@ -1726,6 +1851,43 @@ export class SpeechWorkbenchView extends ItemView {
       }
     } finally {
       this.reviewSaving = false;
+    }
+  }
+
+  private async saveSpeakerDisplayName(
+    speakerId: string,
+    before: string,
+    after: string
+  ): Promise<void> {
+    const worker = this.plugin.preferredWorker();
+    const token = worker ? this.plugin.credentials.get(worker.id) : null;
+    const job = this.selectedSnapshot?.job;
+    if (!worker || !token || !job || this.speakerRenameSaving || !after) {
+      return;
+    }
+    this.speakerRenameSaving = true;
+    this.taskError = null;
+    this.render();
+    try {
+      await renameJobSpeakerDisplayName(
+        new ObsidianWorkerTransport(),
+        worker,
+        token,
+        { job, speakerId, before, after }
+      );
+      this.speakerRenameSaving = false;
+      await this.refreshJobs();
+    } catch (error) {
+      this.speakerRenameSaving = false;
+      this.taskError =
+        error instanceof JobClientError
+          ? error.message
+          : "说话人显示名未能保存，请重新读取后再试。";
+      if (error instanceof JobClientError && error.code === "conflict") {
+        await this.refreshJobs();
+      } else {
+        this.render();
+      }
     }
   }
 

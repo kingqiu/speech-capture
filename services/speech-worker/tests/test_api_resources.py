@@ -182,6 +182,17 @@ def test_segment_review_is_atomic_revision_guarded_and_listable(tmp_path) -> Non
                 "author": "obsidian-user",
             },
         )
+        renamed = client.post(
+            f"/v1/jobs/{job_id}/speaker-display-name",
+            headers={**AUTHORIZATION, "Idempotency-Key": "rename-speaker-primary"},
+            json={
+                "expected_revision": saved.json()["job"]["revision"],
+                "speaker_id": "speaker_0",
+                "before": "Speaker 0",
+                "after": "王总",
+                "author": "obsidian-user",
+            },
+        )
         listed = client.get(
             f"/v1/jobs/{job_id}/corrections",
             headers=AUTHORIZATION,
@@ -192,8 +203,14 @@ def test_segment_review_is_atomic_revision_guarded_and_listable(tmp_path) -> Non
     assert saved.json()["created"] is True
     assert replayed.status_code == 200
     assert replayed.json()["created"] is False
+    assert renamed.status_code == 200, renamed.text
+    assert renamed.json()["created"] is True
+    assert renamed.json()["correction"]["field"] == "speaker_display_name"
     assert listed.status_code == 200
-    assert listed.json()["corrections"][0]["field"] == "segment_review"
+    assert [item["field"] for item in listed.json()["corrections"]] == [
+        "segment_review",
+        "speaker_display_name",
+    ]
     assert raw_segment.text == "这是合成逐字稿。"
     assert raw_segment.speaker_id == "speaker_0"
 

@@ -610,6 +610,7 @@ def _apply_corrections(
                 and display_name.strip()
             ):
                 speaker_names[speaker_id] = display_name.strip()
+    renamed_speaker_ids: set[str] = set()
     for correction in corrections:
         if correction.field is CorrectionField.TRANSCRIPT_TEXT:
             segment = segment_map.get(correction.target_id or "")
@@ -652,11 +653,12 @@ def _apply_corrections(
         elif correction.field is CorrectionField.SPEAKER_DISPLAY_NAME:
             speaker_id = correction.target_id or ""
             current = speaker_names.get(speaker_id)
-            if current != correction.before:
+            if speaker_id in renamed_speaker_ids and current != correction.before:
                 raise ArtifactGenerationFailed(
                     f"Correction {correction.correction_id} no longer matches the speaker name."
                 )
             speaker_names[speaker_id] = correction.after
+            renamed_speaker_ids.add(speaker_id)
             revised_document = _replace_speaker_display_name(
                 revised_document,
                 speaker_id=speaker_id,

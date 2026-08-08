@@ -122,6 +122,7 @@ def test_openapi_is_versioned_strict_and_has_stable_operation_ids() -> None:
         "/v1/jobs/{job_id}/resume",
         "/v1/jobs/{job_id}/retry",
         "/v1/jobs/{job_id}/segment-review",
+        "/v1/jobs/{job_id}/speaker-display-name",
         "/v1/jobs/{job_id}/snapshot",
         "/v1/pairing/confirm",
         "/v1/pairing/sessions",
@@ -181,6 +182,7 @@ def test_openapi_is_versioned_strict_and_has_stable_operation_ids() -> None:
         "revokeDevice",
         "retryJob",
         "reviewJobTranscriptSegment",
+        "renameJobSpeakerDisplayName",
         "streamJobReviewAudio",
     }
     for path, methods in schema["paths"].items():

@@ -425,6 +425,20 @@ class SegmentReviewEnvelope(PublicSchema):
     created: bool
 
 
+class SpeakerDisplayNameRequestSchema(PublicSchema):
+    expected_revision: int = Field(ge=0)
+    speaker_id: SafeIdentifier
+    before: str = Field(min_length=1, max_length=200)
+    after: str = Field(min_length=1, max_length=200)
+    author: str = Field(min_length=1, max_length=200)
+
+
+class SpeakerDisplayNameEnvelope(PublicSchema):
+    job: JobSchema
+    correction: CorrectionSchema
+    created: bool
+
+
 class JobUpdateSchema(PublicSchema):
     sequence: int
     job_id: JobIdentifier

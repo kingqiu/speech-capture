@@ -52,6 +52,8 @@ from speech_capture_worker.api_schemas import (
     SegmentReviewEnvelope,
     SegmentReviewRequestSchema,
     Sha256String,
+    SpeakerDisplayNameEnvelope,
+    SpeakerDisplayNameRequestSchema,
     TranscriptSegmentSchema,
     UploadCreateSchema,
     UploadEnvelope,
@@ -842,6 +844,37 @@ def create_app(
             expected_revision=request.expected_revision,
         )
         return SegmentReviewEnvelope(
+            job=_job_schema(worker_store.get_job(job_id)),
+            correction=CorrectionSchema.model_validate(correction.to_dict()),
+            created=created,
+        )
+
+    @app.post(
+        "/v1/jobs/{job_id}/speaker-display-name",
+        response_model=SpeakerDisplayNameEnvelope,
+        operation_id="renameJobSpeakerDisplayName",
+        tags=["corrections"],
+        responses=PRIVATE_ERROR_RESPONSES,
+    )
+    def rename_job_speaker_display_name(
+        job_id: str,
+        request: SpeakerDisplayNameRequestSchema,
+        principal: Principal,
+        worker_store: Store,
+        idempotency_key: Annotated[str, Header(alias="Idempotency-Key")],
+    ) -> SpeakerDisplayNameEnvelope:
+        _authorized_job(worker_store, principal, job_id)
+        correction, created = worker_store.append_correction(
+            job_id,
+            field=CorrectionField.SPEAKER_DISPLAY_NAME,
+            target_id=request.speaker_id,
+            before=request.before,
+            after=request.after,
+            author=request.author,
+            idempotency_key=idempotency_key,
+            expected_revision=request.expected_revision,
+        )
+        return SpeakerDisplayNameEnvelope(
             job=_job_schema(worker_store.get_job(job_id)),
             correction=CorrectionSchema.model_validate(correction.to_dict()),
             created=created,

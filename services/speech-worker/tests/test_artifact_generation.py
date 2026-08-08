@@ -19,11 +19,16 @@ from speech_capture_worker.alignment import (
 from speech_capture_worker.artifact_generation import (
     ArtifactGenerator,
     ArtifactOutcome,
+    _apply_corrections,
     _filter_scene_actions,
     _read_manual_section,
 )
 from speech_capture_worker.asr_execution import AsrChunkExecutor, AsrRunOutcome
-from speech_capture_worker.corrections import CorrectionField, encode_segment_review
+from speech_capture_worker.corrections import (
+    CorrectionField,
+    CorrectionRecord,
+    encode_segment_review,
+)
 from speech_capture_worker.domain import JobState, ResourceStatus, UploadCreateRequest
 from speech_capture_worker.errors import (
     ArtifactGenerationFailed,
@@ -46,7 +51,12 @@ from speech_capture_worker.resources import (
 from speech_capture_worker.structuring_execution import (
     StructuringExecutor,
 )
-from speech_capture_worker.transcript import SpeakerLabelStatus
+from speech_capture_worker.transcript import (
+    SpeakerLabelStatus,
+    TranscriptOutcome,
+    TranscriptSegment,
+    TranscriptTimingStatus,
+)
 from speech_capture_worker.vault_publication import (
     PUBLISHED_PACKAGE_FILES,
     VaultPublicationOutcome,
@@ -91,6 +101,65 @@ def test_speech_actions_require_independent_action_evidence() -> None:
 
     assert filtered["actions"] == [{"task": "明确安排", "evidence": ["seg_action"]}]
     assert len(document["actions"]) == 2
+
+
+def test_first_explicit_speaker_rename_overrides_derived_display_name() -> None:
+    segment = TranscriptSegment(
+        job_id="job_speaker_rename",
+        segment_sequence=1,
+        segment_id="seg_speaker_rename",
+        commit_key="speaker-rename-segment",
+        revision=1,
+        start_ms=0,
+        end_ms=1_000,
+        outcome=TranscriptOutcome.TRANSCRIBED,
+        text="王总介绍了客户背景。",
+        language="zh",
+        confidence=0.9,
+        timing_status=TranscriptTimingStatus.ALIGNED,
+        speaker_id="speaker_0",
+        speaker_label_status=SpeakerLabelStatus.ANONYMOUS,
+        error_code=None,
+        created_at="2026-08-08T00:00:00Z",
+        updated_at="2026-08-08T00:00:00Z",
+    )
+    document = {
+        "speaker_summaries": [
+            {
+                "speaker_id": "speaker_0",
+                "display_name": "模型推断名称",
+                "affiliation": "",
+                "role": "",
+                "summary": "介绍了客户背景。",
+                "evidence": [segment.segment_id],
+            }
+        ]
+    }
+    correction = CorrectionRecord(
+        sequence=1,
+        correction_id="cor_speaker_rename",
+        job_id=segment.job_id,
+        job_revision=2,
+        field=CorrectionField.SPEAKER_DISPLAY_NAME,
+        target_id="speaker_0",
+        before="Speaker 0",
+        after="王总",
+        author="test-user",
+        idempotency_key="speaker-rename-1",
+        created_at="2026-08-08T00:00:01Z",
+    )
+
+    effective = _apply_corrections(
+        segments=[segment],
+        transcript_edits={},
+        document=document,
+        corrections=[correction],
+        recording_date=None,
+    )
+
+    assert effective.speaker_display_names == {"speaker_0": "王总"}
+    assert effective.speaker_assignments == {segment.segment_id: "speaker_0"}
+    assert effective.document["speaker_summaries"][0]["display_name"] == "王总"
 
 
 def test_manual_section_reader_rejects_symlink_and_invalid_utf8(tmp_path) -> None:

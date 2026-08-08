@@ -1,5 +1,5 @@
 // Generated Worker protocol wire types. Do not edit manually.
-export const OPENAPI_SHA256 = "bcf537c8552166a59bef13e26f1ea68c2922ae9438aea3fcefd6a5702911ccb5" as const;
+export const OPENAPI_SHA256 = "c5a2bbe8b41715997dd1f99be4a60f89c09181c18c2eabaf8e69617b323d926c" as const;
 export const OPENAPI_VERSION = "3.1.0" as const;
 export const PROTOCOL_VERSION = "1.0.0" as const;
 
@@ -357,6 +357,20 @@ export interface SegmentReviewRequestSchema {
   readonly before_text: string;
   readonly expected_revision: number;
   readonly segment_id: string;
+}
+
+export interface SpeakerDisplayNameEnvelope {
+  readonly correction: CorrectionSchema;
+  readonly created: boolean;
+  readonly job: JobSchema;
+}
+
+export interface SpeakerDisplayNameRequestSchema {
+  readonly after: string;
+  readonly author: string;
+  readonly before: string;
+  readonly expected_revision: number;
+  readonly speaker_id: string;
 }
 
 export type SpeakerLabelStatus =

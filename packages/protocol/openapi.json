@@ -1686,6 +1686,70 @@
         "title": "SegmentReviewRequestSchema",
         "type": "object"
       },
+      "SpeakerDisplayNameEnvelope": {
+        "additionalProperties": false,
+        "properties": {
+          "correction": {
+            "$ref": "#/components/schemas/CorrectionSchema"
+          },
+          "created": {
+            "title": "Created",
+            "type": "boolean"
+          },
+          "job": {
+            "$ref": "#/components/schemas/JobSchema"
+          }
+        },
+        "required": [
+          "job",
+          "correction",
+          "created"
+        ],
+        "title": "SpeakerDisplayNameEnvelope",
+        "type": "object"
+      },
+      "SpeakerDisplayNameRequestSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "after": {
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "After",
+            "type": "string"
+          },
+          "author": {
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Author",
+            "type": "string"
+          },
+          "before": {
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Before",
+            "type": "string"
+          },
+          "expected_revision": {
+            "minimum": 0.0,
+            "title": "Expected Revision",
+            "type": "integer"
+          },
+          "speaker_id": {
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$",
+            "title": "Speaker Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "expected_revision",
+          "speaker_id",
+          "before",
+          "after",
+          "author"
+        ],
+        "title": "SpeakerDisplayNameRequestSchema",
+        "type": "object"
+      },
       "SpeakerLabelStatus": {
         "enum": [
           "pending",
@@ -5136,6 +5200,152 @@
         "summary": "Get Job Snapshot",
         "tags": [
           "jobs"
+        ]
+      }
+    },
+    "/v1/jobs/{job_id}/speaker-display-name": {
+      "post": {
+        "operationId": "renameJobSpeakerDisplayName",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "title": "Job Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "title": "Idempotency-Key",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SpeakerDisplayNameRequestSchema"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SpeakerDisplayNameEnvelope"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Request Entity Too Large"
+          },
+          "415": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Unsupported Media Type"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Rename Job Speaker Display Name",
+        "tags": [
+          "corrections"
         ]
       }
     },
