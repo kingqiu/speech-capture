@@ -50,15 +50,31 @@ The build does not stop after PyInstaller reports success. It also:
 - validates manifest paths, permissions, file hashes and internal symlinks;
 - removes temporary smoke-test data automatically.
 
-The final local build produced 3,392 packaged entries, occupies about 703 MiB on disk, and has runtime manifest
-SHA-256 `3ad1d8e85ffdda0b1eca85e674dd6b88892ec1ca3cc6010a23ecee4bb5984f1b`. Additional real checks confirmed:
+The current local build produced 3,392 packaged entries, occupies about 703 MiB on disk, and has runtime manifest
+SHA-256 `498885ca71ef2c5db003ede0c32aae4db5c9142263cee547253cf0e14dbcba9d`. Additional real checks confirmed:
 
 - bundled FFmpeg 8.0.1 and FFprobe run with the minimal system `PATH`;
 - FFmpeg/FFprobe link only to package-relative `@rpath` libraries or macOS system frameworks/libraries;
 - the frozen archive includes MLX ASR/aligner modules and pyannote audio pipelines;
 - the packaged Manager fully hash-validates all five installed model identities;
 - the packaged Worker starts on loopback and `/v1/health` reports Worker `0.1.0a0`, protocol `1.0.0`;
+- its capability negotiation includes the complete Stage I set, including `review_audio_ranges` and
+  `worker_readiness`;
 - shutdown is clean and all temporary runtime data was removed.
+
+The Stage I local-alpha install audit found that the earlier 2026-08-02 package predated those last two capabilities.
+Obsidian correctly blocked it as incompatible. The runtime was rebuilt from the current source, fully verified, and
+installed without weakening the plugin's required capability list. The current package was then exercised as a
+per-user launchd service: first-time Obsidian Secret Storage pairing, validated accuracy-profile activation, normal
+service restart, and Obsidian reload all recovered to the ready state without re-pairing. The test credential was
+revoked and removed from Obsidian after validation; the installed service remains on loopback for the next Stage I
+local-alpha check and contains no jobs, uploads, corrections, publication leases, or receipts.
+
+The final Stage I audit also corrected a readiness ambiguity: the speaker-diarization model remains an optional,
+non-blocking capability, but its absence is now reported as `SPEAKER_DIARIZATION_MODEL_MISSING`. Obsidian can still
+start transcription while clearly warning that multi-speaker attribution may require manual review. The rebuilt
+package containing this behavior replaced the prior installed copy and recovered health on the same launchd service;
+the replaced runtime was moved to Trash after verification.
 
 ## 4. Distribution boundary
 

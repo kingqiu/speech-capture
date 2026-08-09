@@ -27,6 +27,7 @@ import {
   suggestRecordingDate,
   type RecordingDateSuggestion
 } from "./intake-draft";
+import { sameJobListPresentation } from "./job-list-refresh";
 import type SpeechCapturePlugin from "./main";
 import {
   applyJobAction,
@@ -53,6 +54,11 @@ import {
   type DownloadedPublicationPackage
 } from "./publication-client";
 import { loadReviewAudioSegment } from "./review-audio-client";
+import {
+  isSegmentReviewDraftDirty,
+  segmentReviewDraftKey,
+  type SegmentReviewDraft
+} from "./review-draft";
 import {
   SubmissionError,
   submitRecording,
@@ -168,6 +174,8 @@ export class SpeechWorkbenchView extends ItemView {
   private speakerRenameSaving = false;
   private reviewAudioUrl: string | null = null;
   private readonly localAudioByJobId = new Map<string, File>();
+  private readonly segmentReviewDrafts = new Map<string, SegmentReviewDraft>();
+  private readonly lastAnnouncedStableSegmentByJobId = new Map<string, string>();
   private taskError: string | null = null;
   private connectionRecovery: ConnectionRecovery | null = null;
   private refreshingTasks = false;
@@ -418,7 +426,8 @@ export class SpeechWorkbenchView extends ItemView {
     } else if (this.taskError) {
       main.createEl("p", {
         cls: "speech-capture-inline-warning",
-        text: this.taskError
+        text: this.taskError,
+        attr: { role: "alert" }
       });
     }
   }
@@ -481,7 +490,8 @@ export class SpeechWorkbenchView extends ItemView {
     if (this.taskError) {
       main.createEl("p", {
         cls: "speech-capture-inline-warning",
-        text: this.taskError
+        text: this.taskError,
+        attr: { role: "alert" }
       });
     }
 
@@ -492,14 +502,20 @@ export class SpeechWorkbenchView extends ItemView {
     const allSpeakers = filters.createEl("button", {
       cls: this.speakerFilterId === null ? "is-selected" : "",
       text: "全部",
-      attr: { type: "button" }
+      attr: {
+        type: "button",
+        "aria-pressed": this.speakerFilterId === null ? "true" : "false"
+      }
     });
     allSpeakers.addEventListener("click", () => this.selectSpeakerFilter(null));
     for (const speakerId of speakerIds) {
       const filter = filters.createEl("button", {
         cls: this.speakerFilterId === speakerId ? "is-selected" : "",
         text: this.speakerPrimaryLabel(speakerId),
-        attr: { type: "button" }
+        attr: {
+          type: "button",
+          "aria-pressed": this.speakerFilterId === speakerId ? "true" : "false"
+        }
       });
       filter.addEventListener("click", () => this.selectSpeakerFilter(speakerId));
     }
@@ -530,7 +546,11 @@ export class SpeechWorkbenchView extends ItemView {
       }
       const row = rows.createEl("button", {
         cls: `speech-capture-review-row ${segment.segment_id === selected?.segment_id ? "is-selected" : ""}`,
-        attr: { type: "button" }
+        attr: {
+          type: "button",
+          "aria-pressed": segment.segment_id === selected?.segment_id ? "true" : "false",
+          "data-segment-id": segment.segment_id
+        }
       });
       row.createEl("time", { text: formatDuration(segment.start_ms) });
       row.createEl("strong", {
@@ -550,9 +570,7 @@ export class SpeechWorkbenchView extends ItemView {
         });
       }
       row.addEventListener("click", () => {
-        this.selectedSegmentId = segment.segment_id;
-        this.speakerSearch = "";
-        this.render();
+        this.selectReviewSegment(segment, narrow);
       });
       if (narrow && segment.segment_id === selected?.segment_id) {
         this.renderSegmentEditor(rows, segment, true);
@@ -666,13 +684,17 @@ export class SpeechWorkbenchView extends ItemView {
       attr: { type: "button" }
     });
     previous.disabled = index <= 0;
-    previous.addEventListener("click", () => this.selectReviewSegment(segments[index - 1]));
+    previous.addEventListener("click", () =>
+      this.selectReviewSegment(segments[index - 1], this.isNarrowWorkbench())
+    );
     const next = navigation.createEl("button", {
       text: "下一条证据",
       attr: { type: "button" }
     });
     next.disabled = index < 0 || index >= segments.length - 1;
-    next.addEventListener("click", () => this.selectReviewSegment(segments[index + 1]));
+    next.addEventListener("click", () =>
+      this.selectReviewSegment(segments[index + 1], this.isNarrowWorkbench())
+    );
   }
 
   private renderReviewSidebar(layout: HTMLElement): void {
@@ -1028,6 +1050,7 @@ export class SpeechWorkbenchView extends ItemView {
     }
     if (state.state === "published") {
       const card = main.createDiv({ cls: "speech-capture-publication-result is-success" });
+      card.setAttrs({ role: "status", "aria-live": "polite" });
       setIcon(card.createSpan(), "circle-check-big");
       const result = card.createDiv();
       result.createEl("h3", { text: "已发布到 Obsidian" });
@@ -1042,6 +1065,7 @@ export class SpeechWorkbenchView extends ItemView {
     }
     if (state.state === "waiting_other_client") {
       const card = main.createDiv({ cls: "speech-capture-publication-result is-waiting" });
+      card.setAttrs({ role: "status", "aria-live": "polite" });
       setIcon(card.createSpan(), "clock-3");
       const result = card.createDiv();
       result.createEl("h3", { text: "另一台已授权设备正在发布" });
@@ -1050,6 +1074,7 @@ export class SpeechWorkbenchView extends ItemView {
     }
     if (state.state === "error") {
       const card = main.createDiv({ cls: "speech-capture-publication-result is-error" });
+      card.setAttrs({ role: "alert", "aria-live": "assertive" });
       setIcon(card.createSpan(), "shield-alert");
       const result = card.createDiv();
       result.createEl("h3", { text: "发布尚未完成" });
@@ -1064,6 +1089,7 @@ export class SpeechWorkbenchView extends ItemView {
     }
 
     const card = main.createDiv({ cls: "speech-capture-publication-result is-waiting" });
+    card.setAttrs({ role: "status", "aria-live": "polite" });
     setIcon(card.createSpan(), state.state === "publishing" ? "refresh-cw" : "circle-check-big");
     const result = card.createDiv();
     result.createEl("h3", {
@@ -1245,11 +1271,19 @@ export class SpeechWorkbenchView extends ItemView {
     inline: boolean
   ): void {
     const effective = effectiveTranscriptSegment(segment, this.corrections);
+    const draftKey = this.segmentReviewDraftKey(segment.segment_id);
+    const draft = this.segmentReviewDrafts.get(draftKey) ?? {
+      text: effective.text,
+      speakerId: effective.speakerId
+    };
     const editor = parent.createDiv({
       cls: `speech-capture-segment-editor ${inline ? "is-inline" : ""}`
     });
     const speaker = editor.createDiv({ cls: "speech-capture-segment-editor__group" });
-    speaker.createEl("h3", { text: "这段话是谁说的？" });
+    speaker.createEl("h3", {
+      text: "这段话是谁说的？",
+      attr: inline ? { tabindex: "-1" } : {}
+    });
     speaker.createEl("p", { text: "只修正当前这一段，不会影响其他段落。" });
     const search = speaker.createEl("input", {
       attr: {
@@ -1266,13 +1300,13 @@ export class SpeechWorkbenchView extends ItemView {
       text: "暂不确定",
       value: ""
     });
-    uncertain.selected = effective.speakerId === null;
+    uncertain.selected = draft.speakerId === null;
     for (const speakerId of this.reviewSpeakerIds()) {
       const option = select.createEl("option", {
         text: this.speakerOptionLabel(speakerId),
         value: speakerId
       });
-      option.selected = speakerId === effective.speakerId;
+      option.selected = speakerId === draft.speakerId;
     }
     const applySpeakerSearch = (): void => {
       const needle = search.value.trim().toLocaleLowerCase();
@@ -1295,7 +1329,7 @@ export class SpeechWorkbenchView extends ItemView {
         "aria-label": "当前片段校订文字"
       }
     });
-    textarea.value = effective.text;
+    textarea.value = draft.text;
     text.createEl("p", {
       text: "原始 ASR 不会被改写，修改会记录为新修订。"
     });
@@ -1305,6 +1339,15 @@ export class SpeechWorkbenchView extends ItemView {
       attr: { type: "button" }
     });
     const updateDisabled = (): void => {
+      const nextDraft = {
+        text: textarea.value,
+        speakerId: select.value || null
+      };
+      if (!isSegmentReviewDraftDirty(nextDraft, effective)) {
+        this.segmentReviewDrafts.delete(draftKey);
+      } else {
+        this.segmentReviewDrafts.set(draftKey, nextDraft);
+      }
       save.disabled =
         this.reviewSaving ||
         !textarea.value.trim() ||
@@ -1540,12 +1583,16 @@ export class SpeechWorkbenchView extends ItemView {
   private renderSourceField(parent: HTMLElement): void {
     const field = this.field(parent, "来源文件");
     const dropZone = field.createDiv({
-      cls: "speech-capture-drop-zone",
-      attr: { tabindex: "0" }
+      cls: "speech-capture-drop-zone"
     });
     const input = dropZone.createEl("input", {
       cls: "speech-capture-visually-hidden",
-      attr: { type: "file", accept: "audio/*" }
+      attr: {
+        type: "file",
+        accept: "audio/*",
+        tabindex: "-1",
+        "aria-label": "选择音频文件"
+      }
     });
     input.disabled = this.submissionState.state === "running";
     const fileIcon = dropZone.createSpan({ cls: "speech-capture-file-icon" });
@@ -1591,7 +1638,11 @@ export class SpeechWorkbenchView extends ItemView {
   private renderDateField(parent: HTMLElement): void {
     const field = this.field(parent, "录音日期");
     const input = field.createEl("input", {
-      attr: { type: "date", value: this.draft.recordingDate }
+      attr: {
+        type: "date",
+        value: this.draft.recordingDate,
+        "aria-label": "录音日期"
+      }
     });
     input.disabled = this.submissionState.state === "running";
     input.addEventListener("change", () => {
@@ -1609,7 +1660,8 @@ export class SpeechWorkbenchView extends ItemView {
     const textarea = field.createEl("textarea", {
       attr: {
         placeholder: "可以写会议主题、参与者、公司名或你认为有帮助的任何信息",
-        rows: "4"
+        rows: "4",
+        "aria-label": "补充背景（可选）"
       }
     });
     textarea.value = this.draft.context;
@@ -1631,7 +1683,7 @@ export class SpeechWorkbenchView extends ItemView {
       const worker = choices.createEl("button", {
         cls: `speech-capture-choice is-selected ${this.workerProbe?.state === "blocked" ? "is-blocked" : ""}`,
         text: this.workerStatusPresentation(preferredWorker.displayName).text,
-        attr: { type: "button" }
+        attr: { type: "button", "aria-pressed": "true" }
       });
       worker.prepend(this.choiceMark("server"));
       if (this.workerProbe?.state === "pairing_required") {
@@ -1662,6 +1714,11 @@ export class SpeechWorkbenchView extends ItemView {
         attr: { type: "button" }
       });
       retry.addEventListener("click", () => void this.refreshWorker());
+      const help = warning.createEl("button", {
+        text: "查看安装或启动说明",
+        attr: { type: "button" }
+      });
+      help.addEventListener("click", () => this.openLocalWorkerHelp());
     } else if (this.workerProbe?.state === "pairing_required") {
       const warning = field.createDiv({ cls: "speech-capture-inline-warning" });
       warning.createSpan({ text: "需要连接此设备。配对完成前不会上传音频。" });
@@ -1671,15 +1728,49 @@ export class SpeechWorkbenchView extends ItemView {
       });
       connect.addEventListener("click", () => this.openPairing());
     } else if (this.workerProbe?.state === "incompatible") {
-      field.createEl("p", {
-        cls: "speech-capture-inline-warning",
-        text: "当前版本无法与此 Worker 一起使用。"
+      const warning = field.createDiv({ cls: "speech-capture-inline-warning" });
+      warning.createSpan({
+        text: "当前版本无法与此 Worker 一起使用。更新插件或 Worker 后请重新检测。"
       });
+      const retry = warning.createEl("button", {
+        text: "重新检测",
+        attr: { type: "button" }
+      });
+      retry.addEventListener("click", () => void this.refreshWorker());
+    } else if (this.workerProbe?.state === "warning") {
+      const warning = field.createDiv({ cls: "speech-capture-inline-warning" });
+      warning.createSpan({
+        text: this.workerProbe.readiness.issue_codes.includes(
+          "SPEAKER_DIARIZATION_MODEL_MISSING"
+        )
+          ? "Worker 可以转写，但多人说话人识别模型尚未准备好；人物归属可能需要人工复核。"
+          : "Worker 可以开始处理，但当前资源状态需要留意。"
+      });
+      const retry = warning.createEl("button", {
+        text: "重新检测",
+        attr: { type: "button" }
+      });
+      retry.addEventListener("click", () => void this.refreshWorker());
+      const help = warning.createEl("button", {
+        text: "查看处理说明",
+        attr: { type: "button" }
+      });
+      help.addEventListener("click", () => this.openLocalWorkerHelp());
     } else if (this.workerProbe?.state === "blocked") {
-      field.createEl("p", {
-        cls: "speech-capture-inline-warning",
+      const warning = field.createDiv({ cls: "speech-capture-inline-warning" });
+      warning.createSpan({
         text: "Worker 已连接，但资源或模型尚未准备好。"
       });
+      const retry = warning.createEl("button", {
+        text: "重新检测",
+        attr: { type: "button" }
+      });
+      retry.addEventListener("click", () => void this.refreshWorker());
+      const help = warning.createEl("button", {
+        text: "查看处理说明",
+        attr: { type: "button" }
+      });
+      help.addEventListener("click", () => this.openLocalWorkerHelp());
     }
   }
 
@@ -1960,24 +2051,29 @@ export class SpeechWorkbenchView extends ItemView {
     });
     setIcon(left, "chevron-right");
     left.addEventListener("click", () => void this.toggleSidebar("left", false));
+    const hasUnsavedReview =
+      this.taskDetailMode === "review" && this.hasUnsavedSelectedReviewDraft();
+    const rightLabel =
+      this.taskDetailMode === "publication" ||
+      this.selectedSnapshot?.job.state === "publishing" ||
+      this.selectedSnapshot?.job.state === "published"
+        ? "展开发布目标栏"
+        : this.selectedSnapshot?.job.state === "processed"
+        ? this.taskDetailMode === "review"
+          ? "展开当前片段栏"
+          : this.taskDetailMode === "summary"
+            ? "展开版本确认栏"
+            : "展开记录说明栏"
+        : this.viewMode === "task"
+          ? "展开当前任务栏"
+          : "展开提交确认栏";
     const right = layout.createEl("button", {
-      cls: "speech-capture-restore-handle is-right",
+      cls: `speech-capture-restore-handle is-right ${hasUnsavedReview ? "has-unsaved-review" : ""}`,
       attr: {
         type: "button",
-        "aria-label":
-          this.taskDetailMode === "publication" ||
-          this.selectedSnapshot?.job.state === "publishing" ||
-          this.selectedSnapshot?.job.state === "published"
-            ? "展开发布目标栏"
-            : this.selectedSnapshot?.job.state === "processed"
-            ? this.taskDetailMode === "review"
-              ? "展开当前片段栏"
-              : this.taskDetailMode === "summary"
-                ? "展开版本确认栏"
-                : "展开记录说明栏"
-            : this.viewMode === "task"
-              ? "展开当前任务栏"
-              : "展开提交确认栏"
+        "aria-label": hasUnsavedReview
+          ? `${rightLabel}。当前片段有未保存的修订`
+          : rightLabel
       }
     });
     setIcon(right, "chevron-left");
@@ -2019,7 +2115,10 @@ export class SpeechWorkbenchView extends ItemView {
   ): HTMLButtonElement {
     const button = parent.createEl("button", {
       cls: `speech-capture-profile ${this.draft.profile === profile ? "is-selected" : ""}`,
-      attr: { type: "button" }
+      attr: {
+        type: "button",
+        "aria-pressed": this.draft.profile === profile ? "true" : "false"
+      }
     });
     button.appendChild(this.choiceMark(iconName));
     const copy = button.createSpan();
@@ -2070,7 +2169,17 @@ export class SpeechWorkbenchView extends ItemView {
           ? "任务已停止，最后保存的内容仍可查看"
           : "任务已进入队列，等待 Worker 更新进度"
     });
-    const track = card.createDiv({ cls: "speech-capture-progress is-large" });
+    const track = card.createDiv({
+      cls: "speech-capture-progress is-large",
+      attr: {
+        role: "progressbar",
+        "aria-label": "当前处理阶段进度",
+        "aria-valuemin": "0",
+        "aria-valuemax": "100",
+        "aria-valuenow": progress.toString(),
+        "aria-valuetext": `${progress.toString()}%`
+      }
+    });
     track.createDiv({
       cls: "speech-capture-progress__fill",
       attr: { style: `width: ${progress}%` }
@@ -2167,6 +2276,23 @@ export class SpeechWorkbenchView extends ItemView {
         cls: "speech-capture-empty-copy",
         text: "稳定文字会在处理过程中逐段出现在这里。"
       });
+    }
+    const jobId = snapshot?.job.job_id;
+    const latestStable = snapshot?.stable_segments.at(-1);
+    if (jobId && latestStable) {
+      const previous = this.lastAnnouncedStableSegmentByJobId.get(jobId);
+      this.lastAnnouncedStableSegmentByJobId.set(jobId, latestStable.segment_id);
+      if (previous && previous !== latestStable.segment_id) {
+        panel.createDiv({
+          cls: "speech-capture-visually-hidden",
+          text: `新增稳定逐字稿：${latestStable.text ?? "此段无法识别"}`,
+          attr: {
+            role: "status",
+            "aria-live": "polite",
+            "aria-atomic": "true"
+          }
+        });
+      }
     }
     panel.createEl("p", {
       cls: "speech-capture-field__hint",
@@ -2297,6 +2423,9 @@ export class SpeechWorkbenchView extends ItemView {
       return;
     }
     this.refreshingTasks = true;
+    const previousJobs = this.jobs;
+    const hadTaskError = this.taskError !== null;
+    const hadConnectionRecovery = this.connectionRecovery !== null;
     const wasReviewingProcessed = this.selectedSnapshot?.job.state === "processed";
     const previousRevision = this.selectedSnapshot?.job.revision ?? null;
     const previousCorrectionSequence = this.corrections.at(-1)?.sequence ?? 0;
@@ -2356,6 +2485,15 @@ export class SpeechWorkbenchView extends ItemView {
       }
       this.taskError = null;
       this.connectionRecovery = null;
+      if (
+        mode === "normal" &&
+        !this.selectedJobId &&
+        !hadTaskError &&
+        !hadConnectionRecovery &&
+        sameJobListPresentation(previousJobs, this.jobs)
+      ) {
+        return;
+      }
       if (
         mode === "normal" &&
         wasReviewingProcessed &&
@@ -2495,13 +2633,56 @@ export class SpeechWorkbenchView extends ItemView {
     return [...values].sort((left, right) => left.localeCompare(right));
   }
 
-  private selectReviewSegment(segment: TranscriptSegmentSchema | undefined): void {
+  private selectReviewSegment(
+    segment: TranscriptSegmentSchema | undefined,
+    focusInlineEditor = false
+  ): void {
     if (!segment) {
       return;
     }
     this.selectedSegmentId = segment.segment_id;
     this.speakerSearch = "";
     this.render();
+    if (focusInlineEditor) {
+      this.contentEl
+        .querySelector<HTMLElement>(
+          ".speech-capture-segment-editor.is-inline h3[tabindex='-1']"
+        )
+        ?.focus();
+    }
+  }
+
+  private segmentReviewDraftKey(segmentId: string): string {
+    return segmentReviewDraftKey(
+      this.selectedSnapshot?.job.job_id ?? this.selectedJobId ?? "unknown",
+      segmentId
+    );
+  }
+
+  private hasUnsavedSelectedReviewDraft(): boolean {
+    const selected = this.selectedReviewSegment();
+    if (!selected) {
+      return false;
+    }
+    return this.segmentReviewDrafts.has(
+      this.segmentReviewDraftKey(selected.segment_id)
+    );
+  }
+
+  private focusSelectedReviewRow(): void {
+    const selectedId = this.selectedSegmentId;
+    if (!selectedId) {
+      return;
+    }
+    const rows = this.contentEl.querySelectorAll<HTMLButtonElement>(
+      ".speech-capture-review-row[data-segment-id]"
+    );
+    for (const row of rows) {
+      if (row.dataset.segmentId === selectedId) {
+        row.focus();
+        return;
+      }
+    }
   }
 
   private selectSpeakerFilter(speakerId: string | null): void {
@@ -2545,6 +2726,7 @@ export class SpeechWorkbenchView extends ItemView {
     if (!worker || !token || !job || this.reviewSaving) {
       return;
     }
+    const shouldRestoreRowFocus = this.isNarrowWorkbench();
     this.reviewSaving = true;
     this.taskError = null;
     this.render();
@@ -2563,7 +2745,13 @@ export class SpeechWorkbenchView extends ItemView {
         }
       );
       this.reviewSaving = false;
+      this.segmentReviewDrafts.delete(
+        this.segmentReviewDraftKey(segment.segment_id)
+      );
       await this.refreshJobs();
+      if (shouldRestoreRowFocus) {
+        this.focusSelectedReviewRow();
+      }
     } catch (error) {
       this.taskError =
         error instanceof JobClientError
@@ -3012,6 +3200,32 @@ export class SpeechWorkbenchView extends ItemView {
     }
   }
 
+  private openLocalWorkerHelp(): void {
+    const modal = new Modal(this.app);
+    modal.titleEl.setText("这台 Mac 的 Worker 尚未就绪");
+    modal.contentEl.createEl("p", {
+      text: "仅凭 Obsidian 当前无法判断 Worker 尚未安装、服务没有启动，还是模型或空间条件尚未完成。"
+    });
+    const steps = modal.contentEl.createEl("ol");
+    steps.createEl("li", {
+      text: "在这台 Mac 上打开 Speech Capture Worker Manager。"
+    });
+    steps.createEl("li", {
+      text: "按其中提示完成安装或启动，并处理模型、磁盘或内存提醒。"
+    });
+    steps.createEl("li", {
+      text: "回到 Obsidian 后点击“重新检测”；当前任务和草稿不会切换到其他设备。"
+    });
+    const close = modal.contentEl.createEl("button", {
+      cls: "mod-cta",
+      text: "知道了",
+      attr: { type: "button" }
+    });
+    close.addEventListener("click", () => modal.close());
+    modal.open();
+    close.focus();
+  }
+
   private openCancelConfirmation(): void {
     const job = this.selectedSnapshot?.job ?? this.selectedJob();
     if (!job || !canCancelJob(job.state)) {
@@ -3122,6 +3336,7 @@ export class SpeechWorkbenchView extends ItemView {
         message: "提交条件已变化，请重新检测 Worker 后再试"
       };
       this.render();
+      this.focusSubmissionError();
       return;
     }
     this.submissionState = {
@@ -3166,13 +3381,17 @@ export class SpeechWorkbenchView extends ItemView {
             : "提交未完成，已上传的分段仍保留在 Worker，请重试"
       };
       this.render();
+      this.focusSubmissionError();
     }
   }
 
   private renderSubmissionStatus(parent: HTMLElement): void {
     const status = parent.createDiv({
       cls: `speech-capture-submission is-${this.submissionState.state}`,
-      attr: { role: "status" }
+      attr: {
+        role: this.submissionState.state === "error" ? "alert" : "status",
+        ...(this.submissionState.state === "error" ? { tabindex: "-1" } : {})
+      }
     });
     if (this.submissionState.state === "running") {
       const progress = this.submissionState.progress;
@@ -3182,7 +3401,17 @@ export class SpeechWorkbenchView extends ItemView {
       const row = status.createDiv({ cls: "speech-capture-submission__row" });
       row.createEl("strong", { text: submissionPhaseLabel(progress.phase) });
       row.createSpan({ text: `${percent}%` });
-      const track = status.createDiv({ cls: "speech-capture-progress" });
+      const track = status.createDiv({
+        cls: "speech-capture-progress",
+        attr: {
+          role: "progressbar",
+          "aria-label": "音频提交进度",
+          "aria-valuemin": "0",
+          "aria-valuemax": "100",
+          "aria-valuenow": percent.toString(),
+          "aria-valuetext": `${percent.toString()}%`
+        }
+      });
       track.createDiv({
         cls: "speech-capture-progress__fill",
         attr: { style: `width: ${percent}%` }
@@ -3204,6 +3433,14 @@ export class SpeechWorkbenchView extends ItemView {
       status.createEl("strong", { text: "提交尚未完成" });
       status.createEl("p", { text: this.submissionState.message });
     }
+  }
+
+  private focusSubmissionError(): void {
+    this.contentEl
+      .querySelector<HTMLElement>(
+        ".speech-capture-submission.is-error[tabindex='-1']"
+      )
+      ?.focus();
   }
 
   private resetDraft(): void {
@@ -3262,7 +3499,7 @@ export class SpeechWorkbenchView extends ItemView {
       case "ready":
         return { text: `${workerName} · 已就绪`, className: "is-good" };
       case "warning":
-        return { text: `${workerName} · 已连接`, className: "is-warning" };
+        return { text: `${workerName} · 已连接 · 需注意`, className: "is-warning" };
       case "blocked":
         return { text: `${workerName} · 尚未准备好`, className: "is-warning" };
       case "pairing_required":

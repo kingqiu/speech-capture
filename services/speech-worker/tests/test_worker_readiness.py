@@ -42,6 +42,7 @@ def _snapshot(tmp_path, **overrides):
         "ffmpeg_available": True,
         "ffprobe_available": True,
         "ollama_reachable": True,
+        "diarization_model_available": True,
         "active_model_profile": "all",
         "inspect_activation": False,
     }
@@ -92,6 +93,15 @@ def test_warning_and_blocked_readiness_are_profile_specific(tmp_path) -> None:
     assert blocked.profiles[0].can_start is False
     assert "WORKER_DATABASE_UNAVAILABLE" in blocked.issue_codes
     assert "FFMPEG_UNAVAILABLE" in blocked.issue_codes
+
+
+def test_missing_optional_diarization_model_warns_without_blocking(tmp_path) -> None:
+    snapshot = _snapshot(tmp_path, diarization_model_available=False)
+
+    assert snapshot.state == "warning"
+    assert all(profile.can_start for profile in snapshot.profiles)
+    assert all(profile.state == "warning" for profile in snapshot.profiles)
+    assert "SPEAKER_DIARIZATION_MODEL_MISSING" in snapshot.issue_codes
 
 
 def test_readiness_api_is_authenticated_and_uses_injected_snapshot(tmp_path) -> None:

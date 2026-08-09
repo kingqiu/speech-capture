@@ -127,10 +127,10 @@
   box-shadow: none;
   color: var(--text-muted);
   display: inline-flex;
-  height: 32px;
+  height: 36px;
   justify-content: center;
   padding: 0;
-  width: 32px;
+  width: 36px;
 }
 
 .speech-capture-collapse-button:hover {
@@ -421,6 +421,7 @@
   color: inherit;
   font-size: inherit;
   margin-left: 8px;
+  min-height: 36px;
   padding: 2px 4px;
   text-decoration: underline;
 }
@@ -963,7 +964,7 @@
 .speech-capture-review-audio__source button,
 .speech-capture-review-audio__nav button {
   font-size: 12px;
-  min-height: 32px;
+  min-height: 36px;
 }
 
 .speech-capture-review-audio__nav {
@@ -992,6 +993,7 @@
   background: transparent;
   border-color: var(--speech-border);
   font-size: 12px;
+  min-height: 36px;
 }
 
 .speech-capture-review-filters button.is-selected {
@@ -1783,6 +1785,18 @@
   right: 0;
 }
 
+.speech-capture-restore-handle.has-unsaved-review::after {
+  background: var(--speech-warning);
+  border: 2px solid var(--background-primary);
+  border-radius: 50%;
+  content: "";
+  height: 8px;
+  position: absolute;
+  right: 2px;
+  top: 2px;
+  width: 8px;
+}
+
 .speech-capture-layout.is-pairing {
   grid-template-columns:
     minmax(240px, 0.82fr)
@@ -1799,6 +1813,7 @@
   display: inline-flex;
   font-size: 12px;
   gap: 6px;
+  min-height: 36px;
   padding: 5px;
 }
 
@@ -2111,7 +2126,14 @@
 .speech-capture-workbench.is-narrow .speech-capture-header {
     align-items: flex-start;
     flex-direction: column;
+    gap: 16px;
+    height: auto;
     min-height: auto;
+}
+
+.speech-capture-workbench.is-narrow {
+    height: auto;
+    min-height: 100%;
 }
 
 .speech-capture-workbench.is-narrow .speech-capture-layout,
@@ -2122,9 +2144,24 @@
 .speech-capture-workbench.is-narrow
   .speech-capture-layout.is-left-collapsed.is-right-collapsed {
     display: flex;
+    flex: 0 0 auto;
     flex-direction: column;
+    min-height: auto;
+    overflow: visible;
     padding-left: 0;
     padding-right: 0;
+}
+
+.speech-capture-workbench.is-narrow .speech-capture-panel,
+.speech-capture-workbench.is-narrow .speech-capture-intake,
+.speech-capture-workbench.is-narrow .speech-capture-confirmation,
+.speech-capture-workbench.is-narrow .speech-capture-active-task,
+.speech-capture-workbench.is-narrow .speech-capture-current-task,
+.speech-capture-workbench.is-narrow .speech-capture-review,
+.speech-capture-workbench.is-narrow .speech-capture-summary-diff,
+.speech-capture-workbench.is-narrow .speech-capture-summary-history,
+.speech-capture-workbench.is-narrow .speech-capture-publication {
+    overflow: visible;
 }
 
 .speech-capture-workbench.is-narrow .speech-capture-task-panel {
@@ -2263,6 +2300,8 @@
   .speech-capture-workbench *::before,
   .speech-capture-workbench *::after {
     scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
   }
 }

@@ -11,6 +11,7 @@ from enum import StrEnum
 from pathlib import Path
 
 from speech_capture_worker import __version__
+from speech_capture_worker.diarization_execution import DIARIZATION_MODEL_ID
 from speech_capture_worker.domain import ModelProfile, ResourceStatus
 from speech_capture_worker.errors import ModelActivationFailed
 from speech_capture_worker.protocol_contract import PROTOCOL_VERSION
@@ -87,6 +88,7 @@ def collect_worker_readiness(
     ffmpeg_available: bool | None = None,
     ffprobe_available: bool | None = None,
     ollama_reachable: bool | None = None,
+    diarization_model_available: bool | None = None,
     active_model_profile: str | None = None,
     inspect_activation: bool = True,
 ) -> WorkerReadinessSnapshot:
@@ -107,6 +109,11 @@ def collect_worker_readiness(
         else ffprobe_available
     )
     ollama_ready = _ollama_reachable() if ollama_reachable is None else ollama_reachable
+    diarization_ready = (
+        _model_snapshot_available(root / "models" / "pyannote", DIARIZATION_MODEL_ID)
+        if diarization_model_available is None
+        else diarization_model_available
+    )
     activation_issue: str | None = None
     selected_profile = active_model_profile
     if inspect_activation and selected_profile is None:
@@ -139,6 +146,9 @@ def collect_worker_readiness(
         general_issues.append(activation_issue)
     elif selected_profile is None:
         general_issues.append("MODEL_PROFILE_NOT_ACTIVE")
+    warning_issues: list[str] = []
+    if not diarization_ready:
+        warning_issues.append("SPEAKER_DIARIZATION_MODEL_MISSING")
 
     policy = ResourcePolicy()
     profiles = tuple(
@@ -149,6 +159,7 @@ def collect_worker_readiness(
             memory=memory_snapshot,
             active_model_profile=selected_profile,
             general_issues=tuple(general_issues),
+            warning_issues=tuple(warning_issues),
         )
         for profile in ModelProfile
     )
@@ -161,7 +172,11 @@ def collect_worker_readiness(
         state = ReadinessState.READY
     issue_codes = tuple(
         dict.fromkeys(
-            (*general_issues, *(code for profile in profiles for code in profile.issue_codes))
+            (
+                *general_issues,
+                *warning_issues,
+                *(code for profile in profiles for code in profile.issue_codes),
+            )
         )
     )
     reserve = max(
@@ -203,6 +218,7 @@ def _profile_readiness(
     memory: MemorySnapshot,
     active_model_profile: str | None,
     general_issues: tuple[str, ...],
+    warning_issues: tuple[str, ...],
 ) -> ProfileReadiness:
     report = policy.evaluate(
         disk=disk,
@@ -210,7 +226,7 @@ def _profile_readiness(
         estimated_required_bytes=0,
         model_profile=profile,
     )
-    issues = list(general_issues)
+    issues = [*general_issues, *warning_issues]
     if active_model_profile not in {profile.value, "all"}:
         issues.append(f"{profile.value.upper()}_PROFILE_NOT_ACTIVE")
     issues.extend(issue.code for issue in report.issues)
@@ -218,7 +234,7 @@ def _profile_readiness(
     blocked = blocked or report.status is ResourceStatus.BLOCKED
     if blocked:
         state = ReadinessState.BLOCKED
-    elif report.status is ResourceStatus.WARNING:
+    elif warning_issues or report.status is ResourceStatus.WARNING:
         state = ReadinessState.WARNING
     else:
         state = ReadinessState.READY
@@ -246,5 +262,15 @@ def _ollama_reachable() -> bool:
     try:
         with socket.create_connection(("127.0.0.1", 11434), timeout=0.25):
             return True
+    except OSError:
+        return False
+
+
+def _model_snapshot_available(cache: Path, model_id: str) -> bool:
+    snapshots = cache / f"models--{model_id.replace('/', '--')}" / "snapshots"
+    try:
+        return snapshots.is_dir() and any(
+            child.is_dir() for child in snapshots.iterdir()
+        )
     except OSError:
         return False

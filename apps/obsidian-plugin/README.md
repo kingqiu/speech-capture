@@ -1,8 +1,10 @@
 # Speech Capture Obsidian Plugin
 
-Status: Stage I implementation has started. The plugin now has a versioned manifest, reproducible TypeScript/
-esbuild toolchain, system-secret credential boundary, persistent non-secret settings, and the first approved
-workbench shell. It is not yet ready for real task submission.
+Status: the main Stage I local workflow is implemented: resumable submission, job recovery, transcript/evidence
+review, protected Note regeneration, and verified atomic Vault publication. Automated tests and synthetic-data
+Obsidian host validation are complete for these paths. It is not yet approved for daily real recordings: the
+packaged local Worker is installed, its pairing/restart boundary is validated, and the final keyboard/200% zoom
+check has passed. One separately authorized local real-recording acceptance still remains.
 
 The plugin is the client and Vault publisher for Speech Capture. It will:
 
