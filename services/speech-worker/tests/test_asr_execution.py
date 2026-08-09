@@ -431,6 +431,60 @@ def test_zero_duration_timestamp_segments_are_merged_without_losing_text() -> No
     assert (segments[1]["start_ms"], segments[1]["end_ms"]) == (4000, 5000)
 
 
+def test_timestamp_tokens_restore_punctuation_and_split_readable_sentences() -> None:
+    chunk = AudioChunkPlan(
+        chunk_index=0,
+        start_frame=0,
+        end_frame=64_000,
+        start_ms=0,
+        end_ms=4000,
+    )
+    payload = {
+        "text": "甲乙。丙丁！",
+        "language": "Chinese",
+        "segments": [
+            {"text": "甲", "start": 0.0, "end": 1.0},
+            {"text": "乙", "start": 1.0, "end": 2.0},
+            {"text": "丙", "start": 2.0, "end": 3.0},
+            {"text": "丁", "start": 3.0, "end": 4.0},
+        ],
+    }
+
+    segments = _result_segments(payload, chunk=chunk, source_duration_ms=4000)
+
+    assert [item["text"] for item in segments] == ["甲乙。", "丙丁！"]
+    assert [(item["start_ms"], item["end_ms"]) for item in segments] == [
+        (0, 2000),
+        (2000, 4000),
+    ]
+
+
+def test_short_pause_between_sentences_is_accounted_without_merging_text() -> None:
+    chunk = AudioChunkPlan(
+        chunk_index=0,
+        start_frame=0,
+        end_frame=48_000,
+        start_ms=0,
+        end_ms=3000,
+    )
+    payload = {
+        "text": "甲。乙。",
+        "language": "Chinese",
+        "segments": [
+            {"text": "甲", "start": 0.0, "end": 1.0},
+            {"text": "乙", "start": 1.4, "end": 2.4},
+        ],
+    }
+
+    segments = _result_segments(payload, chunk=chunk, source_duration_ms=3000)
+
+    assert [item["text"] for item in segments] == ["甲。", "乙。"]
+    assert [(item["start_ms"], item["end_ms"]) for item in segments] == [
+        (0, 1400),
+        (1400, 2400),
+    ]
+
+
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")
 def test_executor_materializes_zero_duration_timestamp_segments(tmp_path) -> None:
     class ZeroDurationEngine(FakeEngine):

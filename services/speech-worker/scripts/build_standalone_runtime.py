@@ -18,6 +18,13 @@ from pathlib import Path, PurePosixPath
 
 RUNTIME_NAME = "SpeechCaptureWorker"
 RUNTIME_SCHEMA_VERSION = "1.0.0"
+DYNAMIC_SUBMODULE_PACKAGES = (
+    "uvicorn",
+    "mlx",
+    "mlx_qwen3_asr",
+    "pyannote.audio",
+)
+DATA_PACKAGES = ("pyannote.audio",)
 
 
 def main() -> int:
@@ -76,8 +83,6 @@ def main() -> int:
         str(build_root / "spec"),
         "--paths",
         str(project / "src"),
-        "--collect-submodules",
-        "uvicorn",
         "--copy-metadata",
         "speech-capture-worker",
         "--copy-metadata",
@@ -95,8 +100,15 @@ def main() -> int:
         "--hidden-import",
         "uvicorn.lifespan.on",
     ]
-    mlx_package = Path(sysconfig.get_paths()["purelib"]) / "mlx_qwen3_asr"
-    arguments.extend(("--add-data", f"{mlx_package / 'assets'}:mlx_qwen3_asr/assets"))
+    for package in DYNAMIC_SUBMODULE_PACKAGES:
+        arguments.extend(("--collect-submodules", package))
+    for package in DATA_PACKAGES:
+        arguments.extend(("--collect-data", package))
+    purelib = Path(sysconfig.get_paths()["purelib"])
+    qwen_package = purelib / "mlx_qwen3_asr"
+    mlx_package = purelib / "mlx"
+    arguments.extend(("--add-data", f"{qwen_package / 'assets'}:mlx_qwen3_asr/assets"))
+    arguments.extend(("--add-data", f"{mlx_package / 'lib' / 'mlx.metallib'}:mlx/lib"))
     for binary in ("ffmpeg", "ffprobe"):
         arguments.extend(("--add-binary", f"{shutil.which(binary)}:."))
     run_pyinstaller(arguments)
@@ -227,21 +239,25 @@ def _verify_runtime(root: Path, project: Path) -> None:
         "LC_ALL": "C.UTF-8",
     }
     commands = (
-        (root / "bin" / "speech-capture-worker", "--help"),
-        (root / "bin" / "speech-capture-manager", "--help"),
+        ((root / "bin" / "speech-capture-worker", "--help"), 60),
+        ((root / "bin" / "speech-capture-manager", "--help"), 60),
+        (
+            (root / "bin" / "speech-capture-worker", "verify-model-runtime"),
+            180,
+        ),
     )
-    for command in commands:
+    for command, timeout_seconds in commands:
         completed = subprocess.run(
             command,
             cwd="/private/tmp",
             env=environment,
             capture_output=True,
             text=True,
-            timeout=60,
+            timeout=timeout_seconds,
             check=False,
         )
         if completed.returncode != 0:
-            raise SystemExit("A frozen runtime entrypoint failed its isolated help check.")
+            raise SystemExit("A frozen runtime entrypoint failed its isolated import check.")
     with tempfile.TemporaryDirectory(
         prefix="speech-capture-runtime-smoke-",
         dir="/private/tmp",

@@ -131,6 +131,18 @@ def test_build_output_cannot_escape_project_dist(tmp_path) -> None:
         build._safe_output(project, tmp_path / "outside")
 
 
+def test_standalone_build_collects_dynamic_model_backends() -> None:
+    build = _load_build_module()
+
+    assert build.DYNAMIC_SUBMODULE_PACKAGES == (
+        "uvicorn",
+        "mlx",
+        "mlx_qwen3_asr",
+        "pyannote.audio",
+    )
+    assert build.DATA_PACKAGES == ("pyannote.audio",)
+
+
 def _load_build_module():
     path = Path(__file__).parents[1] / "scripts" / "build_standalone_runtime.py"
     specification = importlib.util.spec_from_file_location(

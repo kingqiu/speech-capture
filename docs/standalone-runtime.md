@@ -50,12 +50,16 @@ The build does not stop after PyInstaller reports success. It also:
 - validates manifest paths, permissions, file hashes and internal symlinks;
 - removes temporary smoke-test data automatically.
 
-The current local build produced 3,392 packaged entries, occupies about 703 MiB on disk, and has runtime manifest
-SHA-256 `498885ca71ef2c5db003ede0c32aae4db5c9142263cee547253cf0e14dbcba9d`. Additional real checks confirmed:
+The current local build produced 3,405 packaged entries, contains 1,298,274,521 bytes of regular-file payload, and has
+runtime manifest SHA-256 `e8a1b606175ddc5eaa27c3101d93cd7b014b2e62953b07adb17bfa38ebc8e07e`.
+Additional real checks confirmed:
 
 - bundled FFmpeg 8.0.1 and FFprobe run with the minimal system `PATH`;
 - FFmpeg/FFprobe link only to package-relative `@rpath` libraries or macOS system frameworks/libraries;
-- the frozen archive includes MLX ASR/aligner modules and pyannote audio pipelines;
+- the frozen archive includes dynamically imported MLX ASR/aligner modules, the MLX Metal library, pyannote audio
+  pipelines, and the pyannote pipeline configuration data;
+- the frozen Worker passes the fail-closed `verify-model-runtime` import check for ASR, forced alignment, VAD and
+  speaker diarization when run in a normal local macOS session with Metal access;
 - the packaged Manager fully hash-validates all five installed model identities;
 - the packaged Worker starts on loopback and `/v1/health` reports Worker `0.1.0a0`, protocol `1.0.0`;
 - its capability negotiation includes the complete Stage I set, including `review_audio_ranges` and
@@ -71,10 +75,12 @@ revoked and removed from Obsidian after validation; the installed service remain
 local-alpha check and contains no jobs, uploads, corrections, publication leases, or receipts.
 
 The final Stage I audit also corrected a readiness ambiguity: the speaker-diarization model remains an optional,
-non-blocking capability, but its absence is now reported as `SPEAKER_DIARIZATION_MODEL_MISSING`. Obsidian can still
-start transcription while clearly warning that multi-speaker attribution may require manual review. The rebuilt
-package containing this behavior replaced the prior installed copy and recovered health on the same launchd service;
-the replaced runtime was moved to Trash after verification.
+non-blocking capability, but its absence is reported as `SPEAKER_DIARIZATION_MODEL_MISSING`. Obsidian can still start
+transcription while clearly warning that multi-speaker attribution may require manual review. The accepted
+`pyannote/speaker-diarization-3.1` and `pyannote/segmentation` revisions are now installed in the external Worker model
+store, so the currently installed runtime reports all five model caches ready. A complete offline packaged-runtime
+run over a 120.468-second synthetic two-voice recording produced two anonymous speakers, 14 diarization turns, 25
+speaker-attributed transcript segments, and zero unavailable transcribed segments.
 
 ## 4. Distribution boundary
 

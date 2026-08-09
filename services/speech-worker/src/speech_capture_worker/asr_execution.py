@@ -36,6 +36,7 @@ from speech_capture_worker.transcript import (
 
 DEFAULT_MAX_ATTEMPTS = 3
 BOUNDARY_HEADROOM_BYTES = 256 * 1024 * 1024
+MAX_SENTENCE_PAUSE_BRIDGE_MS = 1000
 
 
 class AsrEngine(Protocol):
@@ -791,6 +792,10 @@ def _result_segments(
                 "timing_status": TranscriptTimingStatus.ESTIMATED,
             }
         ]
+    normalized_raw = _restore_full_text_separators(
+        normalized_raw,
+        transcript_text=str(payload.get("text", "")),
+    )
 
     merged: list[dict[str, Any]] = []
     buffer_text: list[str] = []
@@ -815,9 +820,9 @@ def _result_segments(
         buffer_chars = sum(len(value) for value in buffer_text)
         should_close = (
             index + 1 == len(normalized_raw)
-            or buffer_chars >= 160
+            or buffer_chars >= 80
             or next_gap_ms > 1500
-            or text.endswith(("。", "！", "？", "…", "；", ";"))
+            or text.endswith(("。", "！", "？", "…", "；", ";", ".", "!", "?"))
         )
         if should_close:
             merged.append(
@@ -845,11 +850,49 @@ def _result_segments(
                     "timing_status": TranscriptTimingStatus.ESTIMATED,
                 }
             ]
+    for current, following in zip(merged, merged[1:], strict=False):
+        gap_ms = following["start_ms"] - current["end_ms"]
+        if 0 < gap_ms <= MAX_SENTENCE_PAUSE_BRIDGE_MS:
+            current["end_ms"] = following["start_ms"]
     for item in merged:
         item["start_ms"] = min(item["start_ms"], source_duration_ms - 1)
         item["end_ms"] = max(item["end_ms"], item["start_ms"] + 1)
         item["end_ms"] = min(item["end_ms"], source_duration_ms)
     return merged
+
+
+def _restore_full_text_separators(
+    timestamp_segments: list[tuple[float, float, str]],
+    *,
+    transcript_text: str,
+) -> list[tuple[float, float, str]]:
+    """Restore punctuation omitted by timestamp tokens without changing ASR words."""
+    if not transcript_text or not timestamp_segments:
+        return timestamp_segments
+    restored: list[list[Any]] = []
+    cursor = 0
+    for start_seconds, end_seconds, token in timestamp_segments:
+        original_token = token
+        location = transcript_text.find(original_token, cursor)
+        if location < 0:
+            return timestamp_segments
+        separator = transcript_text[cursor:location]
+        if separator:
+            if restored:
+                restored[-1][2] += separator
+            else:
+                token = separator + token
+        restored.append([start_seconds, end_seconds, token])
+        cursor = location + len(original_token)
+    if cursor < len(transcript_text):
+        restored[-1][2] += transcript_text[cursor:]
+    rebuilt = "".join(str(item[2]) for item in restored)
+    if rebuilt != transcript_text:
+        return timestamp_segments
+    return [
+        (float(start_seconds), float(end_seconds), str(text))
+        for start_seconds, end_seconds, text in restored
+    ]
 
 
 def _attempt_key(chunk_index: int, attempt_number: int) -> str:

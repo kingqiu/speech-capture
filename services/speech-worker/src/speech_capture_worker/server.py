@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ipaddress
+import os
 import stat
 from dataclasses import dataclass
 from pathlib import Path
@@ -72,6 +73,11 @@ def serve(config: ServerConfig, *, runner: Any | None = None) -> None:
     validated.data_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     jobs = JobStore(validated.data_dir / "worker.sqlite3")
     security = DeviceSecurityStore(validated.data_dir / "security.sqlite3")
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    from speech_capture_worker.background_processing import BackgroundProcessingService
+
+    background = BackgroundProcessingService(validated.data_dir)
+    background.start()
     try:
 
         def regenerate_summary(job_id: str) -> None:
@@ -123,6 +129,7 @@ def serve(config: ServerConfig, *, runner: Any | None = None) -> None:
             access_log=False,
         )
     finally:
+        background.stop()
         security.close()
         jobs.close()
 

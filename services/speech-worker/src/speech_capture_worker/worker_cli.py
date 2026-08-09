@@ -68,6 +68,9 @@ from speech_capture_worker.resources import (
     check_resource_preflight,
     estimate_job_disk_bytes,
 )
+from speech_capture_worker.runtime_model_dependencies import (
+    verify_runtime_model_dependencies,
+)
 from speech_capture_worker.scheduler import JobScheduler, SchedulerOutcome
 from speech_capture_worker.structuring_execution import (
     SUMMARY_REVISION_STAGE,
@@ -106,6 +109,11 @@ def _build_parser() -> argparse.ArgumentParser:
         description="Exercise Speech Capture's persistent Worker core.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    subparsers.add_parser(
+        "verify-model-runtime",
+        help="Verify packaged ASR, alignment, VAD, and diarization imports.",
+    )
 
     initialize = subparsers.add_parser("init", help="Create or migrate the Worker database.")
     _add_data_dir(initialize)
@@ -694,6 +702,10 @@ def _add_data_dir(parser: argparse.ArgumentParser) -> None:
 
 
 def _dispatch(args: argparse.Namespace) -> int:
+    if args.command == "verify-model-runtime":
+        _write_json(verify_runtime_model_dependencies())
+        return 0
+
     if args.command == "serve":
         from speech_capture_worker.server import ServerConfig, serve
 

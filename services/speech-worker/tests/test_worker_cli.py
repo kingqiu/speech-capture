@@ -13,6 +13,22 @@ from speech_capture_worker.media_probe import MediaProbeResult
 from speech_capture_worker.worker_cli import main
 
 
+def test_cli_verifies_packaged_model_runtime(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        "speech_capture_worker.worker_cli.verify_runtime_model_dependencies",
+        lambda: {
+            "model_runtime_ready": True,
+            "components": {"speaker_diarization": "SpeakerDiarization"},
+        },
+    )
+
+    assert main(["verify-model-runtime"]) == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "model_runtime_ready": True,
+        "components": {"speaker_diarization": "SpeakerDiarization"},
+    }
+
+
 def test_cli_initializes_database_without_exposing_path(tmp_path, capsys) -> None:
     result = main(["init", "--data-dir", str(tmp_path / "runtime")])
     payload = json.loads(capsys.readouterr().out)
