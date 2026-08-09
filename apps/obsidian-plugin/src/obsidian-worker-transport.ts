@@ -52,6 +52,7 @@ export class ObsidianWorkerTransport implements WorkerTransport {
     path: string,
     options: {
       readonly bearerToken: string;
+      readonly accept?: string;
       readonly headers?: Readonly<Record<string, string>>;
     }
   ): Promise<{
@@ -64,7 +65,7 @@ export class ObsidianWorkerTransport implements WorkerTransport {
         url: `${worker.endpoint}${path}`,
         method: "GET",
         headers: {
-          Accept: "audio/wav",
+          Accept: options.accept ?? "audio/wav",
           Authorization: `Bearer ${options.bearerToken}`,
           ...options.headers
         },

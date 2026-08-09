@@ -14,6 +14,7 @@ from enum import StrEnum
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from speech_capture_worker.artifact_access import load_artifact_package
 from speech_capture_worker.artifact_generation import (
     ARTIFACT_CHECKPOINT_KEY,
     ARTIFACT_FILES,
@@ -73,6 +74,52 @@ class VerifiedArtifactPackage:
     speech_id: str
     title: str
     recording_date: str | None
+
+
+@dataclass(frozen=True)
+class VaultPublicationPlan:
+    target_relative_path: str
+    manifest_sha256: str
+    artifact_count: int
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "target_relative_path": self.target_relative_path,
+            "manifest_sha256": self.manifest_sha256,
+            "artifact_count": self.artifact_count,
+        }
+
+
+def plan_vault_publication(
+    store: JobStore,
+    job_id: str,
+    *,
+    output_root: str = DEFAULT_VAULT_OUTPUT_ROOT,
+) -> VaultPublicationPlan:
+    """Build a verified, path-only publication plan for an authorized client."""
+
+    normalized_output_root = validate_vault_relative_path(output_root)
+    package = load_artifact_package(store, job_id)
+    try:
+        speech_record = json.loads(_read_regular_file(package.path_for(SPEECH_RECORD)))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise PublicationVerificationFailed("speech-record.json is invalid.") from exc
+    if (
+        not isinstance(speech_record, dict)
+        or speech_record.get("job_id") != job_id
+        or speech_record.get("speech_id") != package.speech_id
+    ):
+        raise PublicationVerificationFailed("speech-record.json does not match the manifest.")
+    return VaultPublicationPlan(
+        target_relative_path=_target_relative_path(
+            output_root=normalized_output_root,
+            speech_id=package.speech_id,
+            title=_package_title(speech_record),
+            recording_date=_recording_date(speech_record),
+        ),
+        manifest_sha256=package.manifest_sha256,
+        artifact_count=len(PUBLISHED_PACKAGE_FILES),
+    )
 
 
 class VaultPublisher:

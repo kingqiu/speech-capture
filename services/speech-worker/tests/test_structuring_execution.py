@@ -836,6 +836,13 @@ def test_summary_only_regeneration_reads_text_corrections_and_records_diff(tmp_p
     assert engine.polish_calls == 0
     assert engine.synthesize_inputs[0][0]["text"] == corrected_text
     assert revisions[0].payload["changed"] is True
+    assert revisions[0].payload["text_correction_count"] == 1
+    assert revisions[0].payload["speaker_rename_count"] == 0
+    assert revisions[0].payload["before_document"] != revisions[0].payload["after_document"]
+    assert (
+        revisions[0].payload["before_checkpoint"]["raw_sha256"]
+        != (revisions[0].payload["after_checkpoint"]["raw_sha256"])
+    )
     assert corrected_text in revisions[0].payload["diff"]
     assert revisions[0].payload["diff_truncated"] is False
     assert stable_after.text == segment.text

@@ -17,6 +17,7 @@ from speech_capture_worker.protocol_contract import (
 )
 from speech_capture_worker.recording_context import MAX_RECORDING_CONTEXT_CHARACTERS
 from speech_capture_worker.recording_metadata import normalize_recording_date
+from speech_capture_worker.summary_revisions import SummaryRevisionStatus
 from speech_capture_worker.transcript import (
     DiarizationStatus,
     SpeakerLabelStatus,
@@ -135,9 +136,7 @@ class PairingConfirmRequestSchema(PublicSchema):
         has_legacy = self.session_id is not None or self.pairing_code is not None
         legacy_complete = self.session_id is not None and self.pairing_code is not None
         if has_ticket == has_legacy or (has_legacy and not legacy_complete):
-            raise ValueError(
-                "Provide one pairing ticket or the complete legacy session and code."
-            )
+            raise ValueError("Provide one pairing ticket or the complete legacy session and code.")
         return self
 
 
@@ -439,6 +438,50 @@ class SpeakerDisplayNameEnvelope(PublicSchema):
     created: bool
 
 
+class SummaryRevisionSchema(PublicSchema):
+    revision_key: SafeIdentifier
+    base_version: int = Field(gt=0)
+    candidate_version: int = Field(gt=0)
+    status: SummaryRevisionStatus
+    changed: bool
+    text_correction_count: int = Field(ge=0)
+    speaker_rename_count: int = Field(ge=0)
+    before_document: dict[str, object] | None
+    after_document: dict[str, object] | None
+    diff_truncated: bool
+    created_at: str
+    decided_at: str | None
+    artifact_manifest_sha256: Sha256String | None
+
+
+class SummaryRevisionListResponse(PublicSchema):
+    revisions: tuple[SummaryRevisionSchema, ...]
+    current_version: int = Field(gt=0)
+    manual_section_markdown: str
+    can_regenerate: bool
+
+
+class SummaryRevisionRegenerationRequestSchema(PublicSchema):
+    expected_revision: int = Field(ge=0)
+
+
+class SummaryRevisionRegenerationEnvelope(PublicSchema):
+    job: JobSchema
+    revision: SummaryRevisionSchema
+    applied: bool
+
+
+class SummaryRevisionDecisionRequestSchema(PublicSchema):
+    expected_revision: int = Field(ge=0)
+    decision: Literal["accepted", "rejected"]
+
+
+class SummaryRevisionDecisionEnvelope(PublicSchema):
+    job: JobSchema
+    revision: SummaryRevisionSchema
+    applied: bool
+
+
 class JobUpdateSchema(PublicSchema):
     sequence: int
     job_id: JobIdentifier
@@ -467,6 +510,63 @@ class ArtifactListResponse(PublicSchema):
     speech_id: str
     manifest_sha256: Sha256String
     artifacts: tuple[ArtifactSchema, ...]
+
+
+class PublicationLeaseSchema(PublicSchema):
+    lease_id: str = Field(pattern=r"^lease_[0-9a-f]{32}$")
+    generation: int = Field(gt=0)
+    target_relative_path: str = Field(min_length=1, max_length=1024)
+    manifest_sha256: Sha256String
+    expires_at: str
+    owned_by_caller: bool
+
+
+class PublicationReceiptSchema(PublicSchema):
+    target_relative_path: str = Field(min_length=1, max_length=1024)
+    manifest_sha256: Sha256String
+    published_at: str
+
+
+class PublicationStatusResponse(PublicSchema):
+    job: JobSchema
+    suggested_target_relative_path: str = Field(min_length=1, max_length=1024)
+    manifest_sha256: Sha256String
+    artifact_count: int = Field(gt=0)
+    active_lease: PublicationLeaseSchema | None
+    receipt: PublicationReceiptSchema | None
+
+
+class PublicationClaimRequestSchema(PublicSchema):
+    expected_revision: int = Field(ge=0)
+    target_relative_path: str = Field(min_length=1, max_length=1024)
+    manifest_sha256: Sha256String
+    lease_seconds: int = Field(default=120, ge=30, le=900)
+
+
+class PublicationClaimEnvelope(PublicSchema):
+    job: JobSchema
+    lease: PublicationLeaseSchema
+    created: bool
+
+
+class PublicationReleaseRequestSchema(PublicSchema):
+    lease_id: str = Field(pattern=r"^lease_[0-9a-f]{32}$")
+
+
+class PublicationReleaseEnvelope(PublicSchema):
+    job: JobSchema
+    released: bool
+
+
+class PublicationAcknowledgementRequestSchema(PublicSchema):
+    lease_id: str = Field(pattern=r"^lease_[0-9a-f]{32}$")
+    manifest_sha256: Sha256String
+
+
+class PublicationAcknowledgementEnvelope(PublicSchema):
+    job: JobSchema
+    receipt: PublicationReceiptSchema
+    created: bool
 
 
 class ReviewAudioResponse(PublicSchema):

@@ -56,7 +56,8 @@ LEGACY_STRUCTURING_SCHEMA_VERSIONS = {
 STRUCTURING_STAGE = "structuring"
 STRUCTURING_CHECKPOINT_KEY = "structuring_result"
 SUMMARY_REVISION_STAGE = "summary_revisions"
-SUMMARY_REVISION_SCHEMA_VERSION = "1.0.0"
+SUMMARY_REVISION_DECISION_STAGE = "summary_revision_decisions"
+SUMMARY_REVISION_SCHEMA_VERSION = "1.1.0"
 STRUCTURING_HEADROOM_BYTES = GIB
 DEFAULT_BATCH_MAX_CHARS = 4000
 DEFAULT_EDITOR_BATCH_MAX_CHARS = 4800
@@ -2143,6 +2144,8 @@ class StructuringExecutor:
             corrections_digest=corrections_digest,
             before_json=prior_document_json,
             after_document=document,
+            before_checkpoint_payload=payload,
+            after_checkpoint_payload=checkpoint_payload,
         )
         return StructuringResult(
             outcome=StructuringOutcome.REGENERATED,
@@ -2166,6 +2169,8 @@ class StructuringExecutor:
         corrections_digest: str,
         before_json: str,
         after_document: Any,
+        before_checkpoint_payload: dict[str, Any],
+        after_checkpoint_payload: dict[str, Any],
     ) -> tuple[str, bool]:
         """Persist a private, checksummed before/after comparison for user review."""
 
@@ -2185,6 +2190,11 @@ class StructuringExecutor:
         if truncated:
             diff_text = diff_text[:200_000]
         checkpoint_key = f"revision_{structuring_generation:08d}"
+        existing_revisions = self.store.list_checkpoints(
+            job_id,
+            stage=SUMMARY_REVISION_STAGE,
+        )
+        corrections = self.store.list_corrections(job_id)
         self.store.put_checkpoint(
             job_id,
             stage=SUMMARY_REVISION_STAGE,
@@ -2192,9 +2202,23 @@ class StructuringExecutor:
             payload={
                 "schema_version": SUMMARY_REVISION_SCHEMA_VERSION,
                 "structuring_generation": structuring_generation,
+                "candidate_version": len(existing_revisions) + 2,
                 "corrections_sha256": corrections_digest,
+                "text_correction_count": sum(
+                    correction.field
+                    in {CorrectionField.TRANSCRIPT_TEXT, CorrectionField.SEGMENT_REVIEW}
+                    for correction in corrections
+                ),
+                "speaker_rename_count": sum(
+                    correction.field is CorrectionField.SPEAKER_DISPLAY_NAME
+                    for correction in corrections
+                ),
                 "before_sha256": hashlib.sha256(before_json.encode("utf-8")).hexdigest(),
                 "after_sha256": hashlib.sha256(after_json.encode("utf-8")).hexdigest(),
+                "before_document": json.loads(before_json),
+                "after_document": json.loads(after_json),
+                "before_checkpoint": before_checkpoint_payload,
+                "after_checkpoint": after_checkpoint_payload,
                 "changed": changed,
                 "diff": diff_text,
                 "diff_truncated": truncated,
@@ -3623,9 +3647,7 @@ def _validate_document(
             risks = [
                 item
                 for item in risks
-                if not _generic_risk_duplicates_open_question(
-                    item["text"], open_questions
-                )
+                if not _generic_risk_duplicates_open_question(item["text"], open_questions)
             ]
             context = [
                 item
@@ -4102,7 +4124,8 @@ def _voice_memo_ordered_method_section(
         evidence = [
             segment_id
             for start, span_end, segment_id in spans
-            if start < end and span_end > marker.start()
+            if start < end
+            and span_end > marker.start()
             and _voice_memo_has_substantive_text(segment_texts[segment_id])
         ][:3]
         best_index, polished = _voice_memo_matching_section_summary(
@@ -4178,8 +4201,7 @@ def _voice_memo_matching_section_summary(
             candidate = f"{section.get('title', '')}{candidate_text}"
             semantic_markers = ("战略", "场景", "底座", "MVP", "灰度", "长期运营")
             extra_markers = sum(
-                marker in candidate_text and marker not in step_text
-                for marker in semantic_markers
+                marker in candidate_text and marker not in step_text for marker in semantic_markers
             )
             score = len(step_pairs & _document_bigrams(candidate)) - (extra_markers * 10)
             if score > best_score:
@@ -4351,10 +4373,7 @@ def _normalize_generic_scene_sections(
 
 def _generic_text_duplicates_any(text: str, signatures: set[str]) -> bool:
     normalized = _normalized_document_item(text)
-    return any(
-        signature in normalized or normalized in signature
-        for signature in signatures
-    )
+    return any(signature in normalized or normalized in signature for signature in signatures)
 
 
 def _generic_risk_duplicates_open_question(
@@ -4517,9 +4536,7 @@ def _normalize_generic_summary(
 ) -> dict[str, Any]:
     evidence = list(
         dict.fromkeys(
-            segment_id
-            for section in scene_sections
-            for segment_id in section["evidence"]
+            segment_id for section in scene_sections for segment_id in section["evidence"]
         )
     )
     if len(evidence) > MAX_DOCUMENT_EVIDENCE_ITEMS:
@@ -4531,10 +4548,7 @@ def _normalize_generic_summary(
     text = text.replace("案例方案图", "初步方案图")
     if any(
         section["kind"] == "open_question"
-        or any(
-            marker in section["summary"]
-            for marker in ("尚未明确", "仍待", "待确定", "不确定")
-        )
+        or any(marker in section["summary"] for marker in ("尚未明确", "仍待", "待确定", "不确定"))
         for section in scene_sections
     ):
         text = re.sub(r"[，,；;]后续(?:将|拟)[^。！？!?]*", "", text)

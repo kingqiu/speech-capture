@@ -10,6 +10,10 @@ import type {
   JobSnapshotResponse,
   SegmentReviewEnvelope,
   SpeakerDisplayNameEnvelope,
+  SummaryRevisionDecisionEnvelope,
+  SummaryRevisionListResponse,
+  SummaryRevisionRegenerationEnvelope,
+  SummaryRevisionSchema,
   TranscriptSegmentSchema
 } from "../../../packages/protocol/generated/typescript/speech-capture-protocol";
 
@@ -100,6 +104,110 @@ export async function listJobCorrections(
     throw new JobClientError("invalid", "Worker 返回了无法识别的修订记录。");
   }
   return (value as unknown as CorrectionListResponse).corrections;
+}
+
+export async function listJobSummaryRevisions(
+  transport: WorkerTransport,
+  worker: WorkerConnectionSettings,
+  bearerToken: string,
+  jobId: string
+): Promise<SummaryRevisionListResponse> {
+  const response = await transport.request(
+    worker,
+    `/v1/jobs/${encodeURIComponent(jobId)}/summary-revisions`,
+    { bearerToken }
+  );
+  const value = parseSuccess(response);
+  if (
+    !Array.isArray(value.revisions) ||
+    !value.revisions.every(isSummaryRevision) ||
+    typeof value.current_version !== "number" ||
+    typeof value.manual_section_markdown !== "string" ||
+    typeof value.can_regenerate !== "boolean"
+  ) {
+    throw new JobClientError("invalid", "Worker 返回了无法识别的笔记版本记录。");
+  }
+  return value as unknown as SummaryRevisionListResponse;
+}
+
+export async function regenerateJobSummary(
+  transport: WorkerTransport,
+  worker: WorkerConnectionSettings,
+  bearerToken: string,
+  job: Pick<JobSchema, "job_id" | "revision">
+): Promise<SummaryRevisionRegenerationEnvelope> {
+  const body = { expected_revision: job.revision };
+  const idempotency = bytesToHex(
+    sha256(
+      new TextEncoder().encode(
+        `regenerate-summary\n${job.job_id}\n${job.revision.toString()}`
+      )
+    )
+  );
+  const response = await transport.request(
+    worker,
+    `/v1/jobs/${encodeURIComponent(job.job_id)}/summary-revisions`,
+    {
+      method: "POST",
+      body,
+      bearerToken,
+      headers: { "Idempotency-Key": `obsidian-${idempotency}` }
+    }
+  );
+  const value = parseSuccess(response);
+  if (
+    !isJobSummary(value.job) ||
+    !isSummaryRevision(value.revision) ||
+    typeof value.applied !== "boolean"
+  ) {
+    throw new JobClientError("invalid", "Worker 返回了无法识别的笔记重新生成结果。");
+  }
+  return value as unknown as SummaryRevisionRegenerationEnvelope;
+}
+
+export async function decideJobSummaryRevision(
+  transport: WorkerTransport,
+  worker: WorkerConnectionSettings,
+  bearerToken: string,
+  request: {
+    readonly job: Pick<JobSchema, "job_id" | "revision">;
+    readonly revisionKey: string;
+    readonly decision: "accepted" | "rejected";
+  }
+): Promise<SummaryRevisionDecisionEnvelope> {
+  const body = {
+    expected_revision: request.job.revision,
+    decision: request.decision
+  };
+  const idempotency = bytesToHex(
+    sha256(
+      new TextEncoder().encode(
+        JSON.stringify({
+          ...body,
+          revision_key: request.revisionKey
+        })
+      )
+    )
+  );
+  const response = await transport.request(
+    worker,
+    `/v1/jobs/${encodeURIComponent(request.job.job_id)}/summary-revisions/${encodeURIComponent(request.revisionKey)}/decision`,
+    {
+      method: "POST",
+      body,
+      bearerToken,
+      headers: { "Idempotency-Key": `obsidian-${idempotency}` }
+    }
+  );
+  const value = parseSuccess(response);
+  if (
+    !isJobSummary(value.job) ||
+    !isSummaryRevision(value.revision) ||
+    typeof value.applied !== "boolean"
+  ) {
+    throw new JobClientError("invalid", "Worker 返回了无法识别的笔记版本操作结果。");
+  }
+  return value as unknown as SummaryRevisionDecisionEnvelope;
 }
 
 export async function reviewTranscriptSegment(
@@ -303,6 +411,26 @@ function isCorrection(value: unknown): value is Record<string, unknown> {
     (value.target_id === null || typeof value.target_id === "string") &&
     typeof value.after === "string" &&
     typeof value.job_revision === "number"
+  );
+}
+
+function isSummaryRevision(value: unknown): value is SummaryRevisionSchema {
+  return (
+    isRecord(value) &&
+    typeof value.revision_key === "string" &&
+    typeof value.base_version === "number" &&
+    typeof value.candidate_version === "number" &&
+    ["pending", "accepted", "rejected"].includes(String(value.status)) &&
+    typeof value.changed === "boolean" &&
+    typeof value.text_correction_count === "number" &&
+    typeof value.speaker_rename_count === "number" &&
+    (value.before_document === null || isRecord(value.before_document)) &&
+    (value.after_document === null || isRecord(value.after_document)) &&
+    typeof value.diff_truncated === "boolean" &&
+    typeof value.created_at === "string" &&
+    (value.decided_at === null || typeof value.decided_at === "string") &&
+    (value.artifact_manifest_sha256 === null ||
+      typeof value.artifact_manifest_sha256 === "string")
   );
 }
 

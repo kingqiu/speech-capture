@@ -16,10 +16,18 @@ from speech_capture_worker.artifact_generation import (
     ARTIFACT_MANIFEST,
     ARTIFACT_SCHEMA_VERSION,
     ARTIFACT_STAGE,
+    NOTE_MARKDOWN,
 )
+from speech_capture_worker.corrections import corrections_sha256
 from speech_capture_worker.domain import JobState
 from speech_capture_worker.job_store import MAX_UPLOAD_CHUNK_SIZE_BYTES, JobStore
 from speech_capture_worker.media_probe import MediaProbeResult
+from speech_capture_worker.structuring_execution import (
+    STRUCTURING_CHECKPOINT_KEY,
+    STRUCTURING_STAGE,
+    SUMMARY_REVISION_SCHEMA_VERSION,
+    SUMMARY_REVISION_STAGE,
+)
 from speech_capture_worker.transcript import (
     SpeakerLabelStatus,
     TranscriptOutcome,
@@ -140,15 +148,66 @@ def _advance_to_processed_review_job(store: JobStore, job_id: str) -> None:
         )
 
 
+def _install_publication_package(store: JobStore, job_id: str) -> str:
+    package_dir = store.get_job_stage_directory(job_id, stage=ARTIFACT_STAGE)
+    speech_id = "sp_api_publication"
+    contents = {
+        name: (f"# {name}\n" if name.endswith(".md") else "{}\n").encode()
+        for name in ARTIFACT_FILES
+    }
+    contents["speech-record.json"] = (
+        json.dumps(
+            {
+                "job_id": job_id,
+                "speech_id": speech_id,
+                "document": {"title": "合成 发布 记录"},
+                "dates": {"recording_date": "2026-08-03"},
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode()
+    hashes: dict[str, str] = {}
+    for name, content in contents.items():
+        (package_dir / name).write_bytes(content)
+        hashes[name] = hashlib.sha256(content).hexdigest()
+    manifest = {
+        "schema_version": ARTIFACT_SCHEMA_VERSION,
+        "speech_id": speech_id,
+        "job_id": job_id,
+        "artifact_count": len(ARTIFACT_FILES),
+        "files": hashes,
+    }
+    manifest_bytes = (
+        json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode()
+    (package_dir / ARTIFACT_MANIFEST).write_bytes(manifest_bytes)
+    manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
+    store.put_checkpoint(
+        job_id,
+        stage=ARTIFACT_STAGE,
+        checkpoint_key=ARTIFACT_CHECKPOINT_KEY,
+        payload={
+            "schema_version": ARTIFACT_SCHEMA_VERSION,
+            "speech_id": speech_id,
+            "artifact_count": len(ARTIFACT_FILES),
+            "manifest_sha256": manifest_sha256,
+            "package_relative_path": package_dir.relative_to(store.data_directory).as_posix(),
+            "files": hashes,
+        },
+    )
+    return manifest_sha256
+
+
 def test_segment_review_is_atomic_revision_guarded_and_listable(tmp_path) -> None:
     with JobStore(
         tmp_path / "worker.sqlite3",
         upload_chunk_size_bytes=4,
         source_probe=_probe,
     ) as store:
-        client = TestClient(
-            create_app(store=store, credential_verifier=_verifier("vault_primary"))
-        )
+        client = TestClient(create_app(store=store, credential_verifier=_verifier("vault_primary")))
         upload = _create_upload(client)
         _complete_upload(client, upload)
         created = _create_job(client, upload["upload"]["upload_id"])
@@ -215,6 +274,233 @@ def test_segment_review_is_atomic_revision_guarded_and_listable(tmp_path) -> Non
     assert raw_segment.speaker_id == "speaker_0"
 
 
+def test_summary_revision_is_private_listable_and_rejectable(tmp_path) -> None:
+    with JobStore(
+        tmp_path / "worker.sqlite3",
+        upload_chunk_size_bytes=4,
+        source_probe=_probe,
+    ) as store:
+        client = TestClient(create_app(store=store, credential_verifier=_verifier("vault_primary")))
+        upload = _create_upload(client)
+        _complete_upload(client, upload)
+        created = _create_job(client, upload["upload"]["upload_id"])
+        job_id = created["job"]["job_id"]
+        _advance_to_processed_review_job(store, job_id)
+        current = store.get_job(job_id)
+        raw_segment = store.get_job_snapshot(job_id).stable_segments[0]
+        before_document = {
+            "summary": {"text": "旧的一分钟总览。", "evidence": ["seg_00000001"]},
+            "actions": [],
+        }
+        after_document = {
+            "summary": {"text": "新的一分钟总览。", "evidence": ["seg_00000001"]},
+            "actions": [{"task": "跟进合成事项", "evidence": ["seg_00000001"]}],
+        }
+        before_checkpoint = {
+            "schema_version": "test",
+            "raw_sha256": "1" * 64,
+            "document": before_document,
+        }
+        after_checkpoint = {
+            "schema_version": "test",
+            "raw_sha256": "2" * 64,
+            "document": after_document,
+        }
+        revision_key = "summary_revision_api_test"
+        store.put_checkpoint(
+            job_id,
+            stage=STRUCTURING_STAGE,
+            checkpoint_key=STRUCTURING_CHECKPOINT_KEY,
+            payload=after_checkpoint,
+        )
+        store.put_checkpoint(
+            job_id,
+            stage=SUMMARY_REVISION_STAGE,
+            checkpoint_key=revision_key,
+            payload={
+                "schema_version": SUMMARY_REVISION_SCHEMA_VERSION,
+                "candidate_version": 2,
+                "changed": True,
+                "text_correction_count": 1,
+                "speaker_rename_count": 0,
+                "before_document": before_document,
+                "after_document": after_document,
+                "before_checkpoint": before_checkpoint,
+                "after_checkpoint": after_checkpoint,
+                "diff_truncated": False,
+            },
+        )
+        artifact_directory = store.get_job_stage_directory(job_id, stage=ARTIFACT_STAGE)
+        artifact_directory.mkdir(parents=True, exist_ok=True)
+        (artifact_directory / NOTE_MARKDOWN).write_text(
+            "# 合成笔记\n\n## 我的补充\n\n人工保留内容。\n",
+            encoding="utf-8",
+        )
+
+        listed = client.get(
+            f"/v1/jobs/{job_id}/summary-revisions",
+            headers=AUTHORIZATION,
+        )
+        rejected = client.post(
+            f"/v1/jobs/{job_id}/summary-revisions/{revision_key}/decision",
+            headers={**AUTHORIZATION, "Idempotency-Key": "reject-api-summary"},
+            json={
+                "expected_revision": current.revision,
+                "decision": "rejected",
+            },
+        )
+        replayed = client.post(
+            f"/v1/jobs/{job_id}/summary-revisions/{revision_key}/decision",
+            headers={**AUTHORIZATION, "Idempotency-Key": "reject-api-summary"},
+            json={
+                "expected_revision": current.revision,
+                "decision": "rejected",
+            },
+        )
+        listed_after = client.get(
+            f"/v1/jobs/{job_id}/summary-revisions",
+            headers=AUTHORIZATION,
+        )
+        raw_segment_after = store.get_job_snapshot(job_id).stable_segments[0]
+        restored = next(
+            item
+            for item in store.list_checkpoints(job_id, stage=STRUCTURING_STAGE)
+            if item.checkpoint_key == STRUCTURING_CHECKPOINT_KEY
+        )
+
+    assert listed.status_code == 200, listed.text
+    assert listed.json()["current_version"] == 1
+    assert listed.json()["manual_section_markdown"] == ("## 我的补充\n\n人工保留内容。\n")
+    assert listed.json()["revisions"] == [
+        {
+            "revision_key": revision_key,
+            "base_version": 1,
+            "candidate_version": 2,
+            "status": "pending",
+            "changed": True,
+            "text_correction_count": 1,
+            "speaker_rename_count": 0,
+            "before_document": before_document,
+            "after_document": after_document,
+            "diff_truncated": False,
+            "created_at": listed.json()["revisions"][0]["created_at"],
+            "decided_at": None,
+            "artifact_manifest_sha256": None,
+        }
+    ]
+    assert rejected.status_code == 200, rejected.text
+    assert rejected.json()["applied"] is True
+    assert rejected.json()["revision"]["status"] == "rejected"
+    assert replayed.status_code == 200, replayed.text
+    assert replayed.json()["applied"] is False
+    assert listed_after.json()["current_version"] == 1
+    assert listed_after.json()["revisions"][0]["status"] == "rejected"
+    assert restored.payload == before_checkpoint
+    assert raw_segment_after == raw_segment
+
+
+def test_summary_regeneration_api_uses_new_corrections_once(tmp_path) -> None:
+    calls: list[str] = []
+    with JobStore(
+        tmp_path / "worker.sqlite3",
+        upload_chunk_size_bytes=4,
+        source_probe=_probe,
+    ) as store:
+
+        def regenerate(job_id: str) -> None:
+            calls.append(job_id)
+            before_document = {"summary": {"text": "旧总览", "evidence": []}}
+            after_document = {"summary": {"text": "新总览", "evidence": []}}
+            before_checkpoint = {
+                "raw_sha256": "3" * 64,
+                "document": before_document,
+            }
+            after_checkpoint = {
+                "raw_sha256": "4" * 64,
+                "document": after_document,
+            }
+            store.put_checkpoint(
+                job_id,
+                stage=STRUCTURING_STAGE,
+                checkpoint_key=STRUCTURING_CHECKPOINT_KEY,
+                payload=after_checkpoint,
+            )
+            store.put_checkpoint(
+                job_id,
+                stage=SUMMARY_REVISION_STAGE,
+                checkpoint_key="summary_revision_regenerated",
+                payload={
+                    "schema_version": SUMMARY_REVISION_SCHEMA_VERSION,
+                    "candidate_version": 2,
+                    "corrections_sha256": corrections_sha256(store.list_corrections(job_id)),
+                    "changed": True,
+                    "text_correction_count": 1,
+                    "speaker_rename_count": 0,
+                    "before_document": before_document,
+                    "after_document": after_document,
+                    "before_checkpoint": before_checkpoint,
+                    "after_checkpoint": after_checkpoint,
+                    "diff_truncated": False,
+                },
+            )
+
+        client = TestClient(
+            create_app(
+                store=store,
+                credential_verifier=_verifier("vault_primary"),
+                summary_regenerator=regenerate,
+            )
+        )
+        upload = _create_upload(client)
+        _complete_upload(client, upload)
+        created = _create_job(client, upload["upload"]["upload_id"])
+        job_id = created["job"]["job_id"]
+        _advance_to_processed_review_job(store, job_id)
+        current = store.get_job(job_id)
+        corrected = client.post(
+            f"/v1/jobs/{job_id}/segment-review",
+            headers={**AUTHORIZATION, "Idempotency-Key": "regenerate-source-edit"},
+            json={
+                "expected_revision": current.revision,
+                "segment_id": "seg_00000001",
+                "before_text": "这是合成逐字稿。",
+                "after_text": "这是校订后的合成逐字稿。",
+                "before_speaker_id": "speaker_0",
+                "after_speaker_id": "speaker_0",
+                "author": "obsidian-user",
+            },
+        )
+        revised_job = corrected.json()["job"]
+        before = client.get(
+            f"/v1/jobs/{job_id}/summary-revisions",
+            headers=AUTHORIZATION,
+        )
+        generated = client.post(
+            f"/v1/jobs/{job_id}/summary-revisions",
+            headers={**AUTHORIZATION, "Idempotency-Key": "regenerate-summary-api"},
+            json={"expected_revision": revised_job["revision"]},
+        )
+        replayed = client.post(
+            f"/v1/jobs/{job_id}/summary-revisions",
+            headers={**AUTHORIZATION, "Idempotency-Key": "regenerate-summary-api-replay"},
+            json={"expected_revision": revised_job["revision"]},
+        )
+        after = client.get(
+            f"/v1/jobs/{job_id}/summary-revisions",
+            headers=AUTHORIZATION,
+        )
+
+    assert corrected.status_code == 200, corrected.text
+    assert before.json()["can_regenerate"] is True
+    assert generated.status_code == 200, generated.text
+    assert generated.json()["applied"] is True
+    assert generated.json()["revision"]["status"] == "pending"
+    assert replayed.status_code == 200, replayed.text
+    assert replayed.json()["applied"] is False
+    assert calls == [job_id]
+    assert after.json()["can_regenerate"] is False
+
+
 def test_private_routes_require_authentication_and_redact_validation_input(tmp_path) -> None:
     with JobStore(tmp_path / "worker.sqlite3") as store:
         client = TestClient(create_app(store=store, credential_verifier=_verifier("vault_primary")))
@@ -260,9 +546,7 @@ def test_unexpected_api_error_never_echoes_exception_content() -> None:
     def explode() -> None:
         raise RuntimeError(private_value)
 
-    response = TestClient(test_app, raise_server_exceptions=False).get(
-        "/test-unexpected-error"
-    )
+    response = TestClient(test_app, raise_server_exceptions=False).get("/test-unexpected-error")
 
     assert response.status_code == 500
     assert response.json()["error"]["code"] == "INTERNAL_WORKER_ERROR"
@@ -431,6 +715,102 @@ def test_existing_resource_in_another_vault_is_hidden(tmp_path) -> None:
     assert response.json()["error"]["code"] == "RESOURCE_NOT_FOUND"
 
 
+def test_publication_status_claim_release_and_acknowledgement(tmp_path) -> None:
+    with JobStore(
+        tmp_path / "worker.sqlite3",
+        upload_chunk_size_bytes=4,
+        source_probe=_probe,
+    ) as store:
+        client = TestClient(create_app(store=store, credential_verifier=_verifier("vault_primary")))
+        upload = _create_upload(client)
+        _complete_upload(client, upload)
+        created = _create_job(client, upload["upload"]["upload_id"])
+        job_id = created["job"]["job_id"]
+        _advance_to_processed_review_job(store, job_id)
+        manifest_sha256 = _install_publication_package(store, job_id)
+
+        status = client.get(
+            f"/v1/jobs/{job_id}/publication",
+            headers=AUTHORIZATION,
+            params={"output_root": "Work/Speech Notes"},
+        )
+        assert status.status_code == 200, status.text
+        status_json = status.json()
+        assert status_json["suggested_target_relative_path"] == (
+            "Work/Speech Notes/2026/08/2026-08-03-合成-发布-记录--sp_api_publication"
+        )
+        assert status_json["manifest_sha256"] == manifest_sha256
+        assert status_json["artifact_count"] == 7
+        assert status_json["active_lease"] is None
+        assert status_json["receipt"] is None
+
+        claim = client.post(
+            f"/v1/jobs/{job_id}/publication-claims",
+            headers=AUTHORIZATION,
+            json={
+                "expected_revision": status_json["job"]["revision"],
+                "target_relative_path": status_json["suggested_target_relative_path"],
+                "manifest_sha256": manifest_sha256,
+                "lease_seconds": 120,
+            },
+        )
+        assert claim.status_code == 200, claim.text
+        claim_json = claim.json()
+        assert claim_json["job"]["state"] == "publishing"
+        assert claim_json["lease"]["owned_by_caller"] is True
+
+        active = client.get(
+            f"/v1/jobs/{job_id}/publication",
+            headers=AUTHORIZATION,
+            params={"output_root": "Work/Speech Notes"},
+        )
+        assert active.status_code == 200
+        assert active.json()["active_lease"]["lease_id"] == claim_json["lease"]["lease_id"]
+
+        released = client.post(
+            f"/v1/jobs/{job_id}/publication-claims/release",
+            headers=AUTHORIZATION,
+            json={"lease_id": claim_json["lease"]["lease_id"]},
+        )
+        assert released.status_code == 200, released.text
+        assert released.json()["job"]["state"] == "processed"
+
+        second_claim = client.post(
+            f"/v1/jobs/{job_id}/publication-claims",
+            headers=AUTHORIZATION,
+            json={
+                "expected_revision": released.json()["job"]["revision"],
+                "target_relative_path": status_json["suggested_target_relative_path"],
+                "manifest_sha256": manifest_sha256,
+                "lease_seconds": 120,
+            },
+        )
+        assert second_claim.status_code == 200, second_claim.text
+        acknowledged = client.post(
+            f"/v1/jobs/{job_id}/publication-acknowledgements",
+            headers=AUTHORIZATION,
+            json={
+                "lease_id": second_claim.json()["lease"]["lease_id"],
+                "manifest_sha256": manifest_sha256,
+            },
+        )
+        assert acknowledged.status_code == 200, acknowledged.text
+        assert acknowledged.json()["job"]["state"] == "published"
+        assert acknowledged.json()["receipt"]["target_relative_path"] == (
+            status_json["suggested_target_relative_path"]
+        )
+
+        final_status = client.get(
+            f"/v1/jobs/{job_id}/publication",
+            headers=AUTHORIZATION,
+            params={"output_root": "Work/Speech Notes"},
+        )
+
+    assert final_status.status_code == 200
+    assert final_status.json()["active_lease"] is None
+    assert final_status.json()["receipt"]["manifest_sha256"] == manifest_sha256
+
+
 def test_artifact_listing_download_and_integrity_failure(tmp_path) -> None:
     with JobStore(
         tmp_path / "worker.sqlite3",
@@ -459,8 +839,7 @@ def test_artifact_listing_download_and_integrity_failure(tmp_path) -> None:
             "files": hashes,
         }
         manifest_bytes = (
-            json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-            + "\n"
+            json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
         ).encode()
         (package_dir / ARTIFACT_MANIFEST).write_bytes(manifest_bytes)
         manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
@@ -473,9 +852,7 @@ def test_artifact_listing_download_and_integrity_failure(tmp_path) -> None:
                 "speech_id": "sp_test",
                 "artifact_count": len(ARTIFACT_FILES),
                 "manifest_sha256": manifest_sha256,
-                "package_relative_path": package_dir.relative_to(
-                    store.data_directory
-                ).as_posix(),
+                "package_relative_path": package_dir.relative_to(store.data_directory).as_posix(),
                 "files": hashes,
             },
         )

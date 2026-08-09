@@ -2,7 +2,7 @@
 
 from typing import Final, Literal, NotRequired, TypeAlias, TypedDict
 
-OPENAPI_SHA256: Final = "c5a2bbe8b41715997dd1f99be4a60f89c09181c18c2eabaf8e69617b323d926c"
+OPENAPI_SHA256: Final = "041c30bf5f6b4b1edc3d6a0fbd53141cc86bb7c4ca7b1b803b2f45e9d09beb17"
 OPENAPI_VERSION: Final = "3.1.0"
 PROTOCOL_VERSION: Final = "1.0.0"
 
@@ -73,6 +73,12 @@ SpeakerLabelStatus: TypeAlias = Literal[
     'anonymous',
     'confirmed',
     'unavailable',
+]
+
+SummaryRevisionStatus: TypeAlias = Literal[
+    'pending',
+    'accepted',
+    'rejected',
 ]
 
 TranscriptOutcome: TypeAlias = Literal[
@@ -273,6 +279,32 @@ class ProvisionalTranscriptSchema(TypedDict):
     text: str
     updated_at: str
 
+class PublicationAcknowledgementRequestSchema(TypedDict):
+    lease_id: str
+    manifest_sha256: str
+
+class PublicationClaimRequestSchema(TypedDict):
+    expected_revision: int
+    lease_seconds: NotRequired[int]
+    manifest_sha256: str
+    target_relative_path: str
+
+class PublicationLeaseSchema(TypedDict):
+    expires_at: str
+    generation: int
+    lease_id: str
+    manifest_sha256: str
+    owned_by_caller: bool
+    target_relative_path: str
+
+class PublicationReceiptSchema(TypedDict):
+    manifest_sha256: str
+    published_at: str
+    target_relative_path: str
+
+class PublicationReleaseRequestSchema(TypedDict):
+    lease_id: str
+
 class ReviewAudioResponse(TypedDict):
     accept_ranges: Literal['bytes']
     bits_per_sample: int
@@ -302,6 +334,28 @@ class SpeakerDisplayNameRequestSchema(TypedDict):
     before: str
     expected_revision: int
     speaker_id: str
+
+class SummaryRevisionDecisionRequestSchema(TypedDict):
+    decision: Literal['accepted', 'rejected']
+    expected_revision: int
+
+class SummaryRevisionRegenerationRequestSchema(TypedDict):
+    expected_revision: int
+
+class SummaryRevisionSchema(TypedDict):
+    after_document: dict[str, object] | None
+    artifact_manifest_sha256: str | None
+    base_version: int
+    before_document: dict[str, object] | None
+    candidate_version: int
+    changed: bool
+    created_at: str
+    decided_at: str | None
+    diff_truncated: bool
+    revision_key: str
+    speaker_rename_count: int
+    status: SummaryRevisionStatus
+    text_correction_count: int
 
 class TranscriptSegmentSchema(TypedDict):
     confidence: float | None
@@ -416,6 +470,28 @@ class JobUpdatesResponse(TypedDict):
 class PairedDeviceListResponse(TypedDict):
     devices: list[PairedDeviceSchema]
 
+class PublicationAcknowledgementEnvelope(TypedDict):
+    created: bool
+    job: JobSchema
+    receipt: PublicationReceiptSchema
+
+class PublicationClaimEnvelope(TypedDict):
+    created: bool
+    job: JobSchema
+    lease: PublicationLeaseSchema
+
+class PublicationReleaseEnvelope(TypedDict):
+    job: JobSchema
+    released: bool
+
+class PublicationStatusResponse(TypedDict):
+    active_lease: PublicationLeaseSchema | None
+    artifact_count: int
+    job: JobSchema
+    manifest_sha256: str
+    receipt: PublicationReceiptSchema | None
+    suggested_target_relative_path: str
+
 class SegmentReviewEnvelope(TypedDict):
     correction: CorrectionSchema
     created: bool
@@ -425,6 +501,22 @@ class SpeakerDisplayNameEnvelope(TypedDict):
     correction: CorrectionSchema
     created: bool
     job: JobSchema
+
+class SummaryRevisionDecisionEnvelope(TypedDict):
+    applied: bool
+    job: JobSchema
+    revision: SummaryRevisionSchema
+
+class SummaryRevisionListResponse(TypedDict):
+    can_regenerate: bool
+    current_version: int
+    manual_section_markdown: str
+    revisions: list[SummaryRevisionSchema]
+
+class SummaryRevisionRegenerationEnvelope(TypedDict):
+    applied: bool
+    job: JobSchema
+    revision: SummaryRevisionSchema
 
 class UploadEnvelope(TypedDict):
     created: NotRequired[bool | None]
@@ -505,12 +597,28 @@ __all__ = [
     "ProtocolCapability",
     "ProtocolLimitsSchema",
     "ProvisionalTranscriptSchema",
+    "PublicationAcknowledgementEnvelope",
+    "PublicationAcknowledgementRequestSchema",
+    "PublicationClaimEnvelope",
+    "PublicationClaimRequestSchema",
+    "PublicationLeaseSchema",
+    "PublicationReceiptSchema",
+    "PublicationReleaseEnvelope",
+    "PublicationReleaseRequestSchema",
+    "PublicationStatusResponse",
     "ReviewAudioResponse",
     "SegmentReviewEnvelope",
     "SegmentReviewRequestSchema",
     "SpeakerDisplayNameEnvelope",
     "SpeakerDisplayNameRequestSchema",
     "SpeakerLabelStatus",
+    "SummaryRevisionDecisionEnvelope",
+    "SummaryRevisionDecisionRequestSchema",
+    "SummaryRevisionListResponse",
+    "SummaryRevisionRegenerationEnvelope",
+    "SummaryRevisionRegenerationRequestSchema",
+    "SummaryRevisionSchema",
+    "SummaryRevisionStatus",
     "TranscriptOutcome",
     "TranscriptSegmentSchema",
     "TranscriptTimingStatus",

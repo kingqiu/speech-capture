@@ -58,7 +58,9 @@ GET    /v1/jobs/{job_id}/artifacts
 GET    /v1/jobs/{job_id}/review-audio
 GET    /v1/jobs/{job_id}/review-audio/content
 
+GET    /v1/jobs/{job_id}/publication
 POST   /v1/jobs/{job_id}/publication-claims
+POST   /v1/jobs/{job_id}/publication-claims/release
 POST   /v1/jobs/{job_id}/publication-acknowledgements
 
 GET    /v1/models
@@ -76,8 +78,16 @@ uploads, jobs, lifecycle actions, bounded snapshots and updates, artifact listin
 download, time-aligned review audio with HTTP byte ranges, and an authenticated content-free readiness snapshot.
 Upload status includes exact missing part numbers; the update feed is bounded and deliberately excludes transcript
 text. Authenticated diagnostics expose only scoped counts, versions, health, resources, runtime availability, active
-model profile, and stable issue codes. Model management, diagnostic export, and publication lease HTTP routes remain
-reserved.
+model profile, and stable issue codes. Model management and diagnostic export remain reserved.
+
+The Stage I publication surface is now implemented. An authorized client can read the verified package plan, claim
+one durable publication lease using its authenticated device identity, release its own failed lease, and acknowledge
+the exact manifest after a complete Vault write. The status response exposes whether the active lease belongs to the
+caller without revealing another device identity. The Worker never accepts an absolute Vault path and does not write
+through the HTTP API: the current Obsidian client downloads and re-verifies the exact seven-file package, writes it to
+a sibling temporary directory in the current Vault, atomically renames it after verification, verifies the final
+directory, and only then sends the acknowledgement. Existing different content is treated as a conflict and is not
+claimed or overwritten; saving to a new location uses the same lease and verification rules.
 
 `POST /v1/jobs` also accepts an optional canonical `recording_date` (`YYYY-MM-DD`). It is validated as a real
 calendar date, returned on every job representation, and used only as initial metadata for derived artifacts. A later

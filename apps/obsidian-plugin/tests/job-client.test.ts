@@ -5,8 +5,11 @@ import {
   effectiveSpeakerDisplayName,
   effectiveTranscriptSegment,
   getJobSnapshot,
+  decideJobSummaryRevision,
   listJobCorrections,
+  listJobSummaryRevisions,
   listJobs,
+  regenerateJobSummary,
   renameJobSpeakerDisplayName,
   reviewTranscriptSegment
 } from "../src/job-client";
@@ -214,6 +217,104 @@ describe("job client", () => {
         after: "王总",
         author: "obsidian-user"
       }
+    });
+    expect(transport.requests[0]?.headers?.["Idempotency-Key"]).toMatch(
+      /^obsidian-[0-9a-f]{64}$/
+    );
+  });
+
+  it("lists candidate notes and sends a whole-version decision", async () => {
+    const revision = {
+      revision_key: "summary_revision_test",
+      base_version: 1,
+      candidate_version: 2,
+      status: "pending",
+      changed: true,
+      text_correction_count: 2,
+      speaker_rename_count: 1,
+      before_document: { summary: { text: "旧总览" } },
+      after_document: { summary: { text: "新总览" } },
+      diff_truncated: false,
+      created_at: "2026-08-08T00:00:00Z",
+      decided_at: null,
+      artifact_manifest_sha256: null
+    };
+    const transport = new QueueTransport([
+      response(200, {
+        revisions: [revision],
+        current_version: 1,
+        manual_section_markdown: "## 我的补充\n\n人工内容。\n",
+        can_regenerate: false
+      }),
+      response(200, {
+        applied: true,
+        job: JOB,
+        revision: { ...revision, status: "rejected" }
+      })
+    ]);
+
+    const listed = await listJobSummaryRevisions(
+      transport,
+      WORKER,
+      "secret",
+      JOB.job_id
+    );
+    const decided = await decideJobSummaryRevision(
+      transport,
+      WORKER,
+      "secret",
+      {
+        job: JOB,
+        revisionKey: revision.revision_key,
+        decision: "rejected"
+      }
+    );
+
+    expect(listed.revisions[0]?.after_document).toEqual({
+      summary: { text: "新总览" }
+    });
+    expect(listed.manual_section_markdown).toContain("人工内容");
+    expect(decided.revision.status).toBe("rejected");
+    expect(transport.requests[1]).toMatchObject({
+      path: `/v1/jobs/${JOB.job_id}/summary-revisions/${revision.revision_key}/decision`,
+      body: { expected_revision: 4, decision: "rejected" }
+    });
+    expect(transport.requests[1]?.headers?.["Idempotency-Key"]).toMatch(
+      /^obsidian-[0-9a-f]{64}$/
+    );
+  });
+
+  it("triggers one revision-bound note regeneration", async () => {
+    const revision = {
+      revision_key: "summary_revision_regenerated",
+      base_version: 1,
+      candidate_version: 2,
+      status: "pending",
+      changed: true,
+      text_correction_count: 1,
+      speaker_rename_count: 0,
+      before_document: { summary: { text: "旧总览" } },
+      after_document: { summary: { text: "新总览" } },
+      diff_truncated: false,
+      created_at: "2026-08-08T00:00:00Z",
+      decided_at: null,
+      artifact_manifest_sha256: null
+    };
+    const transport = new QueueTransport([
+      response(200, { applied: true, job: JOB, revision })
+    ]);
+
+    const result = await regenerateJobSummary(
+      transport,
+      WORKER,
+      "secret",
+      JOB
+    );
+
+    expect(result.revision.revision_key).toBe(revision.revision_key);
+    expect(transport.requests[0]).toMatchObject({
+      path: `/v1/jobs/${JOB.job_id}/summary-revisions`,
+      body: { expected_revision: 4 }
     });
     expect(transport.requests[0]?.headers?.["Idempotency-Key"]).toMatch(
       /^obsidian-[0-9a-f]{64}$/

@@ -4,6 +4,9 @@ import type {
   CorrectionSchema,
   JobSchema,
   JobSnapshotResponse,
+  PublicationStatusResponse,
+  SummaryRevisionListResponse,
+  SummaryRevisionSchema,
   TranscriptSegmentSchema
 } from "../../../packages/protocol/generated/typescript/speech-capture-protocol";
 
@@ -27,16 +30,28 @@ import {
 import type SpeechCapturePlugin from "./main";
 import {
   applyJobAction,
+  decideJobSummaryRevision,
   effectiveSpeakerDisplayName,
   effectiveTranscriptSegment,
   getJobSnapshot,
   JobClientError,
   listJobCorrections,
+  listJobSummaryRevisions,
   listJobs,
+  regenerateJobSummary,
   renameJobSpeakerDisplayName,
   reviewTranscriptSegment
 } from "./job-client";
 import { ObsidianWorkerTransport } from "./obsidian-worker-transport";
+import {
+  acknowledgePublication,
+  claimPublication,
+  downloadPublicationPackage,
+  getPublicationStatus,
+  PublicationClientError,
+  releasePublication,
+  type DownloadedPublicationPackage
+} from "./publication-client";
 import { loadReviewAudioSegment } from "./review-audio-client";
 import {
   SubmissionError,
@@ -56,6 +71,14 @@ import {
   type WorkerProbeResult
 } from "./worker-probe";
 import { workbenchLayoutSize } from "./workbench-layout";
+import { buildSummaryChanges, countSummaryChanges } from "./summary-diff";
+import {
+  chooseNewPublicationPath,
+  inspectPublicationTarget,
+  VaultPublicationError,
+  writePublicationPackage,
+  type PublicationConflictDiff
+} from "./vault-publication";
 
 export const WORKBENCH_VIEW_TYPE = "speech-capture-workbench";
 
@@ -94,8 +117,28 @@ type SubmissionState =
   | { readonly state: "complete"; readonly jobId: string }
   | { readonly state: "error"; readonly message: string };
 
+type PublicationViewState =
+  | { readonly state: "idle" }
+  | { readonly state: "loading" }
+  | { readonly state: "publishing"; readonly targetRelativePath: string }
+  | { readonly state: "waiting_other_client"; readonly targetRelativePath: string }
+  | {
+      readonly state: "conflict";
+      readonly status: PublicationStatusResponse;
+      readonly packageData: DownloadedPublicationPackage;
+      readonly diff: PublicationConflictDiff;
+      readonly viewed: boolean;
+    }
+  | { readonly state: "published"; readonly targetRelativePath: string }
+  | { readonly state: "error"; readonly message: string };
+
 export class SpeechWorkbenchView extends ItemView {
   private viewMode: "intake" | "pairing" | "task" = "intake";
+  private taskDetailMode:
+    | "review"
+    | "summary"
+    | "history"
+    | "publication" = "review";
   private workerProbe: WorkerProbeResult | null = null;
   private probingWorker = false;
   private pairingTicket = "";
@@ -112,6 +155,12 @@ export class SpeechWorkbenchView extends ItemView {
   private selectedJobId: string | null = null;
   private selectedSnapshot: JobSnapshotResponse | null = null;
   private corrections: readonly CorrectionSchema[] = [];
+  private summaryRevisions: SummaryRevisionListResponse | null = null;
+  private selectedSummaryRevisionKey: string | null = null;
+  private summaryDecisionSaving = false;
+  private summaryRegenerating = false;
+  private publicationState: PublicationViewState = { state: "idle" };
+  private publicationBusy = false;
   private selectedSegmentId: string | null = null;
   private speakerFilterId: string | null = null;
   private speakerSearch = "";
@@ -159,8 +208,16 @@ export class SpeechWorkbenchView extends ItemView {
       if (!entry) {
         return;
       }
+      const previousSize = workbenchLayoutSize(
+        this.workbenchWidth || this.contentEl.clientWidth
+      );
       this.workbenchWidth = entry.contentRect.width;
-      this.applyWorkbenchLayoutSize();
+      const nextSize = workbenchLayoutSize(this.workbenchWidth);
+      if (this.workbenchEl && previousSize !== nextSize) {
+        this.render();
+      } else {
+        this.applyWorkbenchLayoutSize();
+      }
     });
     this.resizeObserver.observe(this.contentEl);
     this.render();
@@ -207,9 +264,24 @@ export class SpeechWorkbenchView extends ItemView {
       this.renderPairingConfirmation(layout);
     } else if (this.viewMode === "task" && this.selectedJobId) {
       this.renderTaskSidebar(layout);
-      if (this.selectedSnapshot?.job.state === "processed") {
-        this.renderTranscriptReview(layout);
-        this.renderReviewSidebar(layout);
+      if (
+        this.taskDetailMode === "publication" ||
+        this.selectedSnapshot?.job.state === "publishing" ||
+        this.selectedSnapshot?.job.state === "published"
+      ) {
+        this.renderPublication(layout);
+        this.renderPublicationSidebar(layout);
+      } else if (this.selectedSnapshot?.job.state === "processed") {
+        if (this.taskDetailMode === "summary") {
+          this.renderSummaryDiff(layout);
+          this.renderSummaryDecisionSidebar(layout);
+        } else if (this.taskDetailMode === "history") {
+          this.renderSummaryHistory(layout);
+          this.renderSummaryHistorySidebar(layout);
+        } else {
+          this.renderTranscriptReview(layout);
+          this.renderReviewSidebar(layout);
+        }
       } else {
         this.renderActiveTask(layout);
         this.renderCurrentTask(layout);
@@ -289,7 +361,9 @@ export class SpeechWorkbenchView extends ItemView {
         const wave = row.createSpan({ cls: "speech-capture-task-card__icon" });
         setIcon(wave, "audio-lines");
         row.createEl("strong", { text: taskTitle(job.source_display_name) });
-        task.createEl("span", { text: jobStateLabel(job.state) });
+        task.createEl("span", {
+          text: this.taskCardStatus(job)
+        });
         if (job.recording_date) {
           task.createEl("small", { text: job.recording_date });
         }
@@ -365,7 +439,40 @@ export class SpeechWorkbenchView extends ItemView {
     copy.createEl("p", {
       text: "点击文字定位音频；修订只影响校订稿，不覆盖原始识别证据"
     });
-    heading.createEl("span", {
+    const headingActions = heading.createDiv({
+      cls: "speech-capture-review__heading-actions"
+    });
+    const pendingRevision = this.pendingSummaryRevision();
+    if (pendingRevision) {
+      const compare = headingActions.createEl("button", {
+        text: `查看候选笔记 v${pendingRevision.candidate_version.toString()}`,
+        attr: { type: "button" }
+      });
+      compare.addEventListener("click", () => {
+        this.selectedSummaryRevisionKey = pendingRevision.revision_key;
+        this.taskDetailMode = "summary";
+        this.render();
+      });
+    } else if (this.summaryRevisions?.can_regenerate) {
+      const regenerate = headingActions.createEl("button", {
+        cls: "mod-cta",
+        text: this.summaryRegenerating ? "正在重新生成…" : "重新生成笔记",
+        attr: { type: "button" }
+      });
+      regenerate.disabled = this.summaryRegenerating;
+      regenerate.addEventListener("click", () => void this.regenerateSummary());
+    }
+    if ((this.summaryRevisions?.revisions.length ?? 0) > 0) {
+      const history = headingActions.createEl("button", {
+        text: "版本记录",
+        attr: { type: "button" }
+      });
+      history.addEventListener("click", () => {
+        this.taskDetailMode = "history";
+        this.render();
+      });
+    }
+    headingActions.createEl("span", {
       cls: "speech-capture-job-state is-good",
       text: "处理完成 · 可复核"
     });
@@ -604,6 +711,532 @@ export class SpeechWorkbenchView extends ItemView {
     evidence.createEl("p", {
       text: "保存修订会新增一条记录，不会重写原始 ASR。"
     });
+  }
+
+  private renderSummaryDiff(layout: HTMLElement): void {
+    const main = layout.createEl("main", {
+      cls: "speech-capture-panel speech-capture-summary-diff"
+    });
+    const revision = this.selectedSummaryRevision();
+    if (!revision) {
+      main.createEl("p", {
+        cls: "speech-capture-empty-copy",
+        text: "当前没有可比较的笔记候选版本。"
+      });
+      return;
+    }
+    const heading = main.createDiv({ cls: "speech-capture-summary-heading" });
+    const copy = heading.createDiv();
+    copy.createEl("p", { cls: "speech-capture-eyebrow", text: "NOTE REVISION" });
+    copy.createEl("h2", { text: "比较重新生成的笔记" });
+    copy.createEl("p", {
+      text: "逐字稿修订已用于生成候选笔记；确认前不会替换当前 Note。"
+    });
+    const protectedBadge = heading.createEl("span", {
+      cls: "speech-capture-summary-protected",
+      text: "原始证据已保护"
+    });
+    protectedBadge.prepend(this.choiceMark("shield-check"));
+
+    const versions = main.createDiv({ cls: "speech-capture-summary-versions" });
+    const base = versions.createDiv();
+    base.createEl("span", { text: "当前版本" });
+    base.createEl("strong", { text: `v${revision.base_version.toString()}` });
+    versions.createSpan({ cls: "speech-capture-summary-versions__arrow", text: "→" });
+    const candidate = versions.createDiv({ cls: "is-candidate" });
+    candidate.createEl("span", { text: "候选版本" });
+    candidate.createEl("strong", { text: `v${revision.candidate_version.toString()}` });
+    candidate.createEl("small", {
+      text: summaryRevisionStatusLabel(revision.status)
+    });
+
+    const changes = buildSummaryChanges(
+      revision.before_document,
+      revision.after_document
+    );
+    const counts = countSummaryChanges(changes);
+    const overview = main.createDiv({ cls: "speech-capture-summary-overview" });
+    overview.createEl("h3", { text: "本次机器提炼变化" });
+    overview.createEl("p", {
+      text: `新增 ${counts.added.toString()} 处 · 修改 ${counts.modified.toString()} 处 · 移除 ${counts.removed.toString()} 处`
+    });
+    if (revision.text_correction_count || revision.speaker_rename_count) {
+      overview.createEl("small", {
+        text: `依据 ${revision.text_correction_count.toString()} 处文字修订、${revision.speaker_rename_count.toString()} 个说话人改名重新生成`
+      });
+    }
+
+    const list = main.createDiv({ cls: "speech-capture-summary-change-list" });
+    if (changes.length === 0) {
+      list.createEl("p", {
+        cls: "speech-capture-empty-copy",
+        text: "机器提炼内容没有产生可见变化。"
+      });
+    }
+    for (const change of changes) {
+      const card = list.createDiv({
+        cls: `speech-capture-summary-change is-${change.kind}`
+      });
+      const title = card.createDiv({ cls: "speech-capture-summary-change__title" });
+      title.createEl("h3", { text: change.label });
+      title.createEl("span", { text: summaryChangeKindLabel(change.kind) });
+      const columns = card.createDiv({ cls: "speech-capture-summary-change__columns" });
+      this.renderSummaryVersionText(columns, "修改前", change.beforeText, "before");
+      this.renderSummaryVersionText(columns, "修改后", change.afterText, "after");
+      if (change.evidenceIds.length > 0) {
+        const evidence = card.createEl("p", {
+          cls: "speech-capture-summary-change__evidence",
+          text: `关联原始证据 ${change.evidenceIds.length.toString()} 段`
+        });
+        evidence.prepend(this.choiceMark("link-2"));
+      }
+    }
+
+    const manual = main.createDiv({ cls: "speech-capture-summary-manual" });
+    const manualTitle = manual.createDiv();
+    manualTitle.createEl("h3", { text: "我的补充" });
+    manualTitle.createEl("span", { text: "受保护 · 不参与版本切换" });
+    manual.createEl("p", {
+      text: manualSectionBody(
+        this.summaryRevisions?.manual_section_markdown ?? ""
+      ) || "当前没有人工补充内容。"
+    });
+
+    const history = main.createEl("button", {
+      cls: "speech-capture-summary-history-link",
+      text: "查看版本记录",
+      attr: { type: "button" }
+    });
+    history.prepend(this.choiceMark("history"));
+    history.addEventListener("click", () => {
+      this.taskDetailMode = "history";
+      this.render();
+    });
+
+    if (this.isNarrowWorkbench()) {
+      this.renderSummaryDecisionPanel(main, revision, true);
+    }
+  }
+
+  private renderSummaryVersionText(
+    parent: HTMLElement,
+    label: string,
+    text: string,
+    tone: "before" | "after"
+  ): void {
+    const column = parent.createDiv({
+      cls: `speech-capture-summary-version-text is-${tone}`
+    });
+    column.createEl("span", { text: label });
+    column.createEl("p", { text: text || "（无）" });
+  }
+
+  private renderSummaryDecisionSidebar(layout: HTMLElement): void {
+    const aside = layout.createEl("aside", {
+      cls: "speech-capture-panel speech-capture-summary-sidebar",
+      attr: { "aria-label": "版本确认" }
+    });
+    const title = aside.createDiv({ cls: "speech-capture-panel__title" });
+    title.createEl("h2", { text: "版本确认" });
+    title.appendChild(
+      this.collapseButton("right", "收起版本确认栏", "panel-right-close")
+    );
+    const revision = this.selectedSummaryRevision();
+    if (revision) {
+      this.renderSummaryDecisionPanel(aside, revision, false);
+    }
+  }
+
+  private renderSummaryDecisionPanel(
+    parent: HTMLElement,
+    revision: SummaryRevisionSchema,
+    inline: boolean
+  ): void {
+    const panel = parent.createDiv({
+      cls: `speech-capture-summary-decision ${inline ? "is-inline" : ""}`
+    });
+    panel.createEl("h3", { text: "确认这份候选笔记" });
+    this.assurance(panel, "sparkles", "只切换机器提炼的 Note 正文");
+    this.assurance(panel, "shield-check", "原始 ASR 与证据不会变化");
+    this.assurance(panel, "notebook-pen", "“我的补充”保持当前内容");
+    if (this.taskError) {
+      panel.createEl("p", {
+        cls: "speech-capture-inline-warning",
+        text: this.taskError
+      });
+    }
+    if (revision.status !== "pending") {
+      const status = panel.createDiv({
+        cls: `speech-capture-summary-decision__status is-${revision.status}`
+      });
+      setIcon(status.createSpan(), revision.status === "accepted" ? "circle-check" : "circle-x");
+      status.createEl("strong", {
+        text:
+          revision.status === "accepted"
+            ? `v${revision.candidate_version.toString()} 已成为当前笔记`
+            : `已保留 v${revision.base_version.toString()} 作为当前笔记`
+      });
+      status.createEl("p", { text: "此记录只读，原始证据仍然保留。" });
+    } else {
+      const accept = panel.createEl("button", {
+        cls: "mod-cta speech-capture-summary-decision__accept",
+        text: this.summaryDecisionSaving ? "正在保存…" : "接受新版笔记",
+        attr: { type: "button" }
+      });
+      accept.disabled = this.summaryDecisionSaving;
+      accept.addEventListener("click", () =>
+        void this.saveSummaryDecision(revision, "accepted")
+      );
+      const continueReview = panel.createEl("button", {
+        text: "继续修改逐字稿",
+        attr: { type: "button" }
+      });
+      continueReview.disabled = this.summaryDecisionSaving;
+      continueReview.addEventListener("click", () => {
+        this.taskDetailMode = "review";
+        this.render();
+      });
+      const reject = panel.createEl("button", {
+        cls: "speech-capture-summary-decision__reject",
+        text: "不采用新版",
+        attr: { type: "button" }
+      });
+      reject.disabled = this.summaryDecisionSaving;
+      reject.addEventListener("click", () =>
+        void this.saveSummaryDecision(revision, "rejected")
+      );
+      panel.createEl("p", {
+        cls: "speech-capture-summary-decision__hint",
+        text: "接受新版笔记：新版将成为当前 Note，旧版和本次差异仍可查看。"
+      });
+      panel.createEl("p", {
+        cls: "speech-capture-summary-decision__hint",
+        text: "不采用新版：当前 Note 保持不变，候选版会以未采用状态保留。"
+      });
+    }
+  }
+
+  private renderSummaryHistory(layout: HTMLElement): void {
+    const main = layout.createEl("main", {
+      cls: "speech-capture-panel speech-capture-summary-history"
+    });
+    const heading = main.createDiv({ cls: "speech-capture-summary-heading" });
+    const copy = heading.createDiv();
+    copy.createEl("p", { cls: "speech-capture-eyebrow", text: "READ-ONLY HISTORY" });
+    copy.createEl("h2", { text: "版本记录" });
+    copy.createEl("p", { text: "这里仅用于查看生成与确认记录，不提供回滚、删除或逐项合并。" });
+    const back = heading.createEl("button", {
+      text: "返回逐字稿复核",
+      attr: { type: "button" }
+    });
+    back.addEventListener("click", () => {
+      this.taskDetailMode = "review";
+      this.render();
+    });
+
+    const current = main.createDiv({ cls: "speech-capture-summary-current-version" });
+    current.createEl("span", { text: "当前使用" });
+    current.createEl("strong", {
+      text: `v${(this.summaryRevisions?.current_version ?? 1).toString()}`
+    });
+    const list = main.createDiv({ cls: "speech-capture-summary-history-list" });
+    const revisions = [...(this.summaryRevisions?.revisions ?? [])].reverse();
+    if (revisions.length === 0) {
+      list.createEl("p", {
+        cls: "speech-capture-empty-copy",
+        text: "当前还没有重新生成记录。"
+      });
+    }
+    for (const revision of revisions) {
+      const row = list.createDiv({ cls: "speech-capture-summary-history-row" });
+      const versions = row.createDiv();
+      versions.createEl("strong", {
+        text: `v${revision.base_version.toString()} → v${revision.candidate_version.toString()}`
+      });
+      versions.createEl("small", {
+        text: `${formatSummaryTimestamp(revision.created_at)} · ${summaryRevisionStatusLabel(revision.status)}`
+      });
+      const inspect = row.createEl("button", {
+        text: "查看差异",
+        attr: { type: "button" }
+      });
+      inspect.addEventListener("click", () => {
+        this.selectedSummaryRevisionKey = revision.revision_key;
+        this.taskDetailMode = "summary";
+        this.render();
+      });
+    }
+    if (this.isNarrowWorkbench()) {
+      this.renderSummaryHistoryExplanation(main, true);
+    }
+  }
+
+  private renderSummaryHistorySidebar(layout: HTMLElement): void {
+    const aside = layout.createEl("aside", {
+      cls: "speech-capture-panel speech-capture-summary-sidebar",
+      attr: { "aria-label": "版本记录说明" }
+    });
+    const title = aside.createDiv({ cls: "speech-capture-panel__title" });
+    title.createEl("h2", { text: "记录说明" });
+    title.appendChild(
+      this.collapseButton("right", "收起记录说明栏", "panel-right-close")
+    );
+    this.renderSummaryHistoryExplanation(aside, false);
+  }
+
+  private renderSummaryHistoryExplanation(
+    parent: HTMLElement,
+    inline: boolean
+  ): void {
+    const panel = parent.createDiv({
+      cls: `speech-capture-summary-history-help ${inline ? "is-inline" : ""}`
+    });
+    panel.createEl("h3", { text: "第一版保持简单" });
+    this.assurance(panel, "eye", "可查看每次候选的前后差异");
+    this.assurance(panel, "lock-keyhole", "已确认记录保持只读");
+    this.assurance(panel, "shield-check", "原始 ASR 和人工补充不随版本切换");
+    panel.createEl("p", { text: "回滚、删除和复杂版本管理留到后续版本。" });
+  }
+
+  private renderPublication(layout: HTMLElement): void {
+    const main = layout.createEl("main", {
+      cls: "speech-capture-panel speech-capture-publication"
+    });
+    const job = this.selectedSnapshot?.job ?? this.selectedJob();
+    if (!job) {
+      main.createEl("p", { text: "正在读取发布状态…" });
+      return;
+    }
+    const heading = main.createDiv({ cls: "speech-capture-publication__heading" });
+    const copy = heading.createDiv();
+    copy.createEl("p", { cls: "speech-capture-eyebrow", text: "ACTIVE TASK" });
+    copy.createEl("h2", { text: taskTitle(job.source_display_name) });
+    heading.createEl("span", {
+      cls: "speech-capture-job-state is-good",
+      text: job.state === "published" ? "已发布" : "已处理"
+    });
+    this.renderPublicationRail(main);
+
+    const state = this.publicationState;
+    if (state.state === "conflict") {
+      if (state.viewed) {
+        this.renderPublicationConflictDiff(main, state);
+      } else {
+        this.renderPublicationConflictNotice(main, state);
+      }
+      return;
+    }
+    if (state.state === "published") {
+      const card = main.createDiv({ cls: "speech-capture-publication-result is-success" });
+      setIcon(card.createSpan(), "circle-check-big");
+      const result = card.createDiv();
+      result.createEl("h3", { text: "已发布到 Obsidian" });
+      result.createEl("p", { text: "完整产物包已经写入当前 Vault，并通过写入后校验。" });
+      const open = result.createEl("button", {
+        cls: "mod-cta",
+        text: "打开 Note",
+        attr: { type: "button" }
+      });
+      open.addEventListener("click", () => void this.openPublishedNote(state.targetRelativePath));
+      return;
+    }
+    if (state.state === "waiting_other_client") {
+      const card = main.createDiv({ cls: "speech-capture-publication-result is-waiting" });
+      setIcon(card.createSpan(), "clock-3");
+      const result = card.createDiv();
+      result.createEl("h3", { text: "另一台已授权设备正在发布" });
+      result.createEl("p", { text: "完成后会自动同步状态；当前 Worker 产物保持不变。" });
+      return;
+    }
+    if (state.state === "error") {
+      const card = main.createDiv({ cls: "speech-capture-publication-result is-error" });
+      setIcon(card.createSpan(), "shield-alert");
+      const result = card.createDiv();
+      result.createEl("h3", { text: "发布尚未完成" });
+      result.createEl("p", { text: state.message });
+      const retry = result.createEl("button", {
+        cls: "mod-cta",
+        text: "重新检测并发布",
+        attr: { type: "button" }
+      });
+      retry.addEventListener("click", () => void this.preparePublication(true));
+      return;
+    }
+
+    const card = main.createDiv({ cls: "speech-capture-publication-result is-waiting" });
+    setIcon(card.createSpan(), state.state === "publishing" ? "refresh-cw" : "circle-check-big");
+    const result = card.createDiv();
+    result.createEl("h3", {
+      text:
+        state.state === "publishing"
+          ? "正在写入 Obsidian"
+          : "处理完成，等待自动发布"
+    });
+    result.createEl("p", {
+      text:
+        state.state === "publishing"
+          ? "正在把完整产物写入同级临时目录，校验通过后一次性完成发布。"
+          : "完整产物已安全保存在 Worker；已授权客户端连接后会自动发布。"
+    });
+    const artifacts = main.createDiv({ cls: "speech-capture-publication-artifacts" });
+    artifacts.createEl("h3", { text: "已生成的产物（已校验通过）" });
+    for (const label of ["纯净 Note", "时间线", "完整校订逐字稿", "证据与记录"]) {
+      this.assurance(artifacts, "circle-check", label);
+    }
+    artifacts.createEl("p", {
+      cls: "speech-capture-field__hint",
+      text: "发布前，这些文件不会出现在当前 Vault。"
+    });
+  }
+
+  private renderPublicationConflictNotice(
+    main: HTMLElement,
+    state: Extract<PublicationViewState, { state: "conflict" }>
+  ): void {
+    const card = main.createDiv({ cls: "speech-capture-publication-conflict" });
+    setIcon(card.createSpan({ cls: "speech-capture-publication-conflict__icon" }), "triangle-alert");
+    const copy = card.createDiv();
+    copy.createEl("h3", { text: "目标位置已有修改" });
+    copy.createEl("p", { text: "检测到当前 Vault 的目标目录在任务处理后发生过变化。" });
+    this.assurance(copy, "shield-check", "当前 Vault 内容和 Worker 待发布版本都没有被覆盖");
+    const comparison = copy.createDiv({ cls: "speech-capture-publication-compare-cards" });
+    const current = comparison.createDiv();
+    current.createEl("strong", { text: "当前 Vault 内容" });
+    current.createEl("p", {
+      text: state.diff.changedFiles.length
+        ? `发现 ${state.diff.changedFiles.length.toString()} 个文件存在人工或同步变化`
+        : "目录结构或文件集合已经发生变化"
+    });
+    const worker = comparison.createDiv();
+    worker.createEl("strong", { text: "Worker 待发布版本" });
+    worker.createEl("p", { text: "完整产物已校验，尚未写入当前 Vault" });
+    const view = copy.createEl("button", {
+      cls: "mod-cta speech-capture-publication-primary",
+      text: "查看差异",
+      attr: { type: "button" }
+    });
+    view.addEventListener("click", () => {
+      this.publicationState = { ...state, viewed: true };
+      this.render();
+    });
+    copy.createEl("p", {
+      cls: "speech-capture-publication-hint",
+      text: "查看差异后，可以选择保存到新位置，不会覆盖当前内容。"
+    });
+  }
+
+  private renderPublicationConflictDiff(
+    main: HTMLElement,
+    state: Extract<PublicationViewState, { state: "conflict" }>
+  ): void {
+    const heading = main.createDiv({ cls: "speech-capture-publication-diff-heading" });
+    heading.createEl("h3", { text: "已查看发布差异" });
+    heading.createEl("p", { text: "当前 Vault 的修改与 Worker 待发布版本都已保留。" });
+    const diff = main.createDiv({ cls: "speech-capture-publication-diff" });
+    const current = diff.createDiv();
+    current.createEl("strong", { text: "当前 Vault 版本" });
+    this.renderPublicationHighlights(
+      current,
+      state.diff.currentNoteHighlights,
+      "当前 Note 与待发布版本不同；原位置保持不变。"
+    );
+    const worker = diff.createDiv({ cls: "is-worker" });
+    worker.createEl("strong", { text: "Worker 待发布版本" });
+    this.renderPublicationHighlights(
+      worker,
+      state.diff.workerNoteHighlights,
+      "Worker 的完整产物包已通过校验。"
+    );
+    const safeguards = main.createDiv({ cls: "speech-capture-publication-safeguards" });
+    this.assurance(safeguards, "shield-check", "当前位置不变：保留现有人工与同步修改");
+    this.assurance(safeguards, "shield-check", "Worker 版本不变：不做覆盖或逐条合并");
+    this.assurance(safeguards, "shield-check", "新位置写入后再次校验完整性");
+    const save = main.createEl("button", {
+      cls: "mod-cta speech-capture-publication-primary",
+      text: this.publicationBusy ? "正在保存…" : "保存到新位置",
+      attr: { type: "button" }
+    });
+    save.disabled = this.publicationBusy;
+    save.addEventListener("click", () => void this.savePublicationToNewLocation(state));
+    main.createEl("p", {
+      cls: "speech-capture-publication-hint",
+      text: "将创建一个新的任务目录并重新校验，不会覆盖当前内容。"
+    });
+    const back = main.createEl("button", {
+      cls: "speech-capture-publication-back",
+      text: "返回冲突说明",
+      attr: { type: "button" }
+    });
+    back.addEventListener("click", () => {
+      this.publicationState = { ...state, viewed: false };
+      this.render();
+    });
+  }
+
+  private renderPublicationHighlights(
+    parent: HTMLElement,
+    highlights: readonly string[],
+    fallback: string
+  ): void {
+    if (!highlights.length) {
+      parent.createEl("p", { text: fallback });
+      return;
+    }
+    const list = parent.createEl("ul");
+    for (const line of highlights) {
+      list.createEl("li", { text: line });
+    }
+  }
+
+  private renderPublicationSidebar(layout: HTMLElement): void {
+    const aside = layout.createEl("aside", {
+      cls: "speech-capture-panel speech-capture-publication-sidebar",
+      attr: { "aria-label": "发布目标" }
+    });
+    const title = aside.createDiv({ cls: "speech-capture-panel__title" });
+    title.createEl("h2", {
+      text: this.publicationState.state === "conflict" && this.publicationState.viewed
+        ? "解决方式"
+        : this.publicationState.state === "conflict"
+          ? "冲突位置"
+          : "发布目标"
+    });
+    title.appendChild(
+      this.collapseButton("right", "收起发布目标栏", "panel-right-close")
+    );
+    const target = publicationTargetPath(this.publicationState);
+    const facts = aside.createDiv({ cls: "speech-capture-publication-sidebar__facts" });
+    this.assurance(facts, "vault", "当前 Obsidian Vault");
+    this.assurance(facts, "folder", target ?? this.plugin.settings.outputFolder);
+    if (this.publicationState.state === "conflict") {
+      this.assurance(facts, "clock-3", "发现内容变化");
+    } else if (this.publicationState.state === "published") {
+      this.assurance(facts, "circle-check", "写入并校验成功");
+    } else {
+      this.assurance(facts, "refresh-cw", "发布方式 · 自动");
+    }
+    const safety = aside.createDiv({ cls: "speech-capture-publication-sidebar__safety" });
+    safety.createEl("h3", { text: "安全检查" });
+    this.assurance(safety, "circle-check", "产物校验通过");
+    this.assurance(safety, "circle-check", "原始 ASR 已保留");
+    this.assurance(safety, "circle-check", "“我的补充”不会被原位置覆盖");
+  }
+
+  private renderPublicationRail(parent: HTMLElement): void {
+    const labels = [...JOB_STAGES, "发布"];
+    const published = this.publicationState.state === "published";
+    const rail = parent.createDiv({ cls: "speech-capture-stage-rail" });
+    for (const [index, label] of labels.entries()) {
+      const final = index === labels.length - 1;
+      const item = rail.createDiv({
+        cls: `speech-capture-stage ${!final || published ? "is-complete" : "is-current"}`
+      });
+      const mark = item.createSpan({ cls: "speech-capture-stage__mark" });
+      if (!final || published) {
+        setIcon(mark, "check");
+      }
+      item.createSpan({ text: label });
+    }
   }
 
   private renderSegmentEditor(
@@ -1332,8 +1965,16 @@ export class SpeechWorkbenchView extends ItemView {
       attr: {
         type: "button",
         "aria-label":
-          this.selectedSnapshot?.job.state === "processed"
-            ? "展开当前片段栏"
+          this.taskDetailMode === "publication" ||
+          this.selectedSnapshot?.job.state === "publishing" ||
+          this.selectedSnapshot?.job.state === "published"
+            ? "展开发布目标栏"
+            : this.selectedSnapshot?.job.state === "processed"
+            ? this.taskDetailMode === "review"
+              ? "展开当前片段栏"
+              : this.taskDetailMode === "summary"
+                ? "展开版本确认栏"
+                : "展开记录说明栏"
             : this.viewMode === "task"
               ? "展开当前任务栏"
               : "展开提交确认栏"
@@ -1595,8 +2236,14 @@ export class SpeechWorkbenchView extends ItemView {
       : side === "left"
         ? ".speech-capture-task-panel .speech-capture-collapse-button"
         : this.viewMode === "task"
-          ? this.selectedSnapshot?.job.state === "processed"
-            ? ".speech-capture-review-sidebar .speech-capture-collapse-button"
+          ? this.taskDetailMode === "publication" ||
+            this.selectedSnapshot?.job.state === "publishing" ||
+            this.selectedSnapshot?.job.state === "published"
+            ? ".speech-capture-publication-sidebar .speech-capture-collapse-button"
+            : this.selectedSnapshot?.job.state === "processed"
+            ? this.taskDetailMode === "review"
+              ? ".speech-capture-review-sidebar .speech-capture-collapse-button"
+              : ".speech-capture-summary-sidebar .speech-capture-collapse-button"
             : ".speech-capture-current-task .speech-capture-collapse-button"
           : ".speech-capture-confirmation .speech-capture-collapse-button";
     this.contentEl.querySelector<HTMLButtonElement>(selector)?.focus();
@@ -1653,6 +2300,7 @@ export class SpeechWorkbenchView extends ItemView {
     const wasReviewingProcessed = this.selectedSnapshot?.job.state === "processed";
     const previousRevision = this.selectedSnapshot?.job.revision ?? null;
     const previousCorrectionSequence = this.corrections.at(-1)?.sequence ?? 0;
+    const previousSummarySignature = this.summaryRevisionSignature();
     try {
       this.jobs = await listJobs(
         new ObsidianWorkerTransport(),
@@ -1676,6 +2324,24 @@ export class SpeechWorkbenchView extends ItemView {
                 this.selectedJobId
               )
             : [];
+        this.summaryRevisions =
+          this.selectedSnapshot.job.state === "processed"
+            ? await listJobSummaryRevisions(
+                new ObsidianWorkerTransport(),
+                worker,
+                token,
+                this.selectedJobId
+              )
+            : null;
+        if (
+          this.selectedSummaryRevisionKey &&
+          !this.summaryRevisions?.revisions.some(
+            (revision) =>
+              revision.revision_key === this.selectedSummaryRevisionKey
+          )
+        ) {
+          this.selectedSummaryRevisionKey = null;
+        }
         if (
           !this.selectedSegmentId ||
           !this.selectedSnapshot.stable_segments.some(
@@ -1695,11 +2361,27 @@ export class SpeechWorkbenchView extends ItemView {
         wasReviewingProcessed &&
         this.selectedSnapshot?.job.state === "processed" &&
         this.selectedSnapshot.job.revision === previousRevision &&
-        (this.corrections.at(-1)?.sequence ?? 0) === previousCorrectionSequence
+        (this.corrections.at(-1)?.sequence ?? 0) === previousCorrectionSequence &&
+        this.summaryRevisionSignature() === previousSummarySignature
       ) {
         return;
       }
+      const selectedState = this.selectedSnapshot?.job.state;
+      const shouldPreparePublication =
+        (selectedState === "processed" && this.pendingSummaryRevision() === null) ||
+        selectedState === "publishing" ||
+        selectedState === "published";
+      if (shouldPreparePublication && this.publicationState.state === "idle") {
+        this.taskDetailMode = "publication";
+      }
       this.render();
+      if (
+        shouldPreparePublication &&
+        (this.publicationState.state === "idle" ||
+          this.publicationState.state === "waiting_other_client")
+      ) {
+        window.setTimeout(() => void this.preparePublication(false), 0);
+      }
     } catch (error) {
       if (error instanceof JobClientError && error.code === "unavailable") {
         this.connectionRecovery = recoveryAfterFailure(
@@ -1724,6 +2406,11 @@ export class SpeechWorkbenchView extends ItemView {
     this.selectedJobId = jobId;
     this.selectedSnapshot = null;
     this.corrections = [];
+    this.summaryRevisions = null;
+    this.selectedSummaryRevisionKey = null;
+    this.taskDetailMode = "review";
+    this.publicationState = { state: "idle" };
+    this.publicationBusy = false;
     this.selectedSegmentId = null;
     this.speakerFilterId = null;
     this.speakerSearch = "";
@@ -1740,6 +2427,11 @@ export class SpeechWorkbenchView extends ItemView {
     this.selectedJobId = null;
     this.selectedSnapshot = null;
     this.corrections = [];
+    this.summaryRevisions = null;
+    this.selectedSummaryRevisionKey = null;
+    this.taskDetailMode = "review";
+    this.publicationState = { state: "idle" };
+    this.publicationBusy = false;
     this.selectedSegmentId = null;
     this.speakerFilterId = null;
     this.taskError = null;
@@ -1753,6 +2445,39 @@ export class SpeechWorkbenchView extends ItemView {
       segments.find((segment) => segment.segment_id === this.selectedSegmentId) ??
       segments.find((segment) => segment.outcome === "transcribed") ??
       null
+    );
+  }
+
+  private pendingSummaryRevision(): SummaryRevisionSchema | null {
+    return (
+      [...(this.summaryRevisions?.revisions ?? [])]
+        .reverse()
+        .find((revision) => revision.status === "pending") ?? null
+    );
+  }
+
+  private selectedSummaryRevision(): SummaryRevisionSchema | null {
+    const revisions = this.summaryRevisions?.revisions ?? [];
+    return (
+      revisions.find(
+        (revision) => revision.revision_key === this.selectedSummaryRevisionKey
+      ) ??
+      this.pendingSummaryRevision() ??
+      revisions.at(-1) ??
+      null
+    );
+  }
+
+  private summaryRevisionSignature(): string {
+    return (this.summaryRevisions?.revisions ?? [])
+      .map((revision) => `${revision.revision_key}:${revision.status}`)
+      .join("|");
+  }
+
+  private isNarrowWorkbench(): boolean {
+    return (
+      workbenchLayoutSize(this.workbenchWidth || this.contentEl.clientWidth) ===
+      "narrow"
     );
   }
 
@@ -1889,6 +2614,307 @@ export class SpeechWorkbenchView extends ItemView {
         this.render();
       }
     }
+  }
+
+  private async saveSummaryDecision(
+    revision: SummaryRevisionSchema,
+    decision: "accepted" | "rejected"
+  ): Promise<void> {
+    const worker = this.plugin.preferredWorker();
+    const token = worker ? this.plugin.credentials.get(worker.id) : null;
+    const job = this.selectedSnapshot?.job;
+    if (!worker || !token || !job || this.summaryDecisionSaving) {
+      return;
+    }
+    this.summaryDecisionSaving = true;
+    this.taskError = null;
+    this.render();
+    try {
+      await decideJobSummaryRevision(
+        new ObsidianWorkerTransport(),
+        worker,
+        token,
+        {
+          job,
+          revisionKey: revision.revision_key,
+          decision
+        }
+      );
+      this.summaryDecisionSaving = false;
+      await this.refreshJobs();
+    } catch (error) {
+      this.summaryDecisionSaving = false;
+      this.taskError =
+        error instanceof JobClientError
+          ? error.message
+          : "笔记版本未能保存，请重新读取后再试。";
+      if (error instanceof JobClientError && error.code === "conflict") {
+        await this.refreshJobs();
+      } else {
+        this.render();
+      }
+    }
+  }
+
+  private async regenerateSummary(): Promise<void> {
+    const worker = this.plugin.preferredWorker();
+    const token = worker ? this.plugin.credentials.get(worker.id) : null;
+    const job = this.selectedSnapshot?.job;
+    if (!worker || !token || !job || this.summaryRegenerating) {
+      return;
+    }
+    this.summaryRegenerating = true;
+    this.taskError = null;
+    this.render();
+    try {
+      const result = await regenerateJobSummary(
+        new ObsidianWorkerTransport(),
+        worker,
+        token,
+        job
+      );
+      this.selectedSummaryRevisionKey = result.revision.revision_key;
+      this.taskDetailMode = "summary";
+      this.summaryRegenerating = false;
+      await this.refreshJobs();
+    } catch (error) {
+      this.summaryRegenerating = false;
+      this.taskError =
+        error instanceof JobClientError
+          ? error.message
+          : "笔记未能重新生成，当前 Note 保持不变。";
+      if (error instanceof JobClientError && error.code === "conflict") {
+        await this.refreshJobs();
+      } else {
+        this.render();
+      }
+    }
+  }
+
+  private async preparePublication(force: boolean): Promise<void> {
+    const worker = this.plugin.preferredWorker();
+    const token = worker ? this.plugin.credentials.get(worker.id) : null;
+    const job = this.selectedSnapshot?.job;
+    if (!worker || !token || !job || this.publicationBusy) {
+      return;
+    }
+    if (!force && this.publicationState.state === "conflict") {
+      return;
+    }
+    const keepWaitingView =
+      !force && this.publicationState.state === "waiting_other_client";
+    this.publicationBusy = true;
+    this.taskDetailMode = "publication";
+    if (!keepWaitingView) {
+      this.publicationState = { state: "loading" };
+      this.render();
+    }
+    const transport = new ObsidianWorkerTransport();
+    try {
+      const status = await getPublicationStatus(
+        transport,
+        worker,
+        token,
+        job.job_id,
+        this.plugin.settings.outputFolder
+      );
+      if (status.receipt || status.job.state === "published") {
+        const target = status.receipt?.target_relative_path ?? status.suggested_target_relative_path;
+        this.publicationState = { state: "published", targetRelativePath: target };
+        this.publicationBusy = false;
+        this.render();
+        return;
+      }
+      if (status.active_lease && !status.active_lease.owned_by_caller) {
+        this.publicationState = {
+          state: "waiting_other_client",
+          targetRelativePath: status.active_lease.target_relative_path
+        };
+        this.publicationBusy = false;
+        this.render();
+        return;
+      }
+      const packageData = await downloadPublicationPackage(
+        transport,
+        worker,
+        token,
+        job.job_id
+      );
+      if (packageData.manifestSha256 !== status.manifest_sha256) {
+        throw new VaultPublicationError("verification", "Worker 发布清单已发生变化。");
+      }
+      const target =
+        status.active_lease?.target_relative_path ?? status.suggested_target_relative_path;
+      const inspection = await inspectPublicationTarget(
+        this.app.vault.adapter,
+        target,
+        packageData
+      );
+      if (inspection.kind === "conflict") {
+        this.publicationState = {
+          state: "conflict",
+          status,
+          packageData,
+          diff: inspection.diff,
+          viewed: false
+        };
+        this.publicationBusy = false;
+        this.render();
+        return;
+      }
+      await this.publishPreparedPackage(
+        status,
+        packageData,
+        target,
+        status.active_lease?.lease_id ?? null
+      );
+    } catch (error) {
+      this.publicationBusy = false;
+      if (error instanceof PublicationClientError && error.kind === "lease") {
+        this.publicationState = {
+          state: "waiting_other_client",
+          targetRelativePath: this.plugin.settings.outputFolder
+        };
+      } else {
+        this.publicationState = {
+          state: "error",
+          message:
+            error instanceof PublicationClientError || error instanceof VaultPublicationError
+              ? error.message
+              : "写入后的完整性检查未通过，现有内容没有被覆盖。"
+        };
+      }
+      this.render();
+    }
+  }
+
+  private async publishPreparedPackage(
+    status: PublicationStatusResponse,
+    packageData: DownloadedPublicationPackage,
+    targetRelativePath: string,
+    existingLeaseId: string | null
+  ): Promise<void> {
+    const worker = this.plugin.preferredWorker();
+    const token = worker ? this.plugin.credentials.get(worker.id) : null;
+    if (!worker || !token) {
+      return;
+    }
+    const transport = new ObsidianWorkerTransport();
+    let leaseId = existingLeaseId;
+    try {
+      if (!leaseId) {
+        const claim = await claimPublication(transport, worker, token, {
+          job: status.job,
+          targetRelativePath,
+          manifestSha256: packageData.manifestSha256
+        });
+        leaseId = claim.lease.lease_id;
+      }
+      this.publicationState = { state: "publishing", targetRelativePath };
+      this.render();
+      await writePublicationPackage(this.app.vault.adapter, {
+        targetRelativePath,
+        leaseId,
+        packageData
+      });
+      const acknowledged = await acknowledgePublication(transport, worker, token, {
+        jobId: status.job.job_id,
+        leaseId,
+        manifestSha256: packageData.manifestSha256
+      });
+      if (this.selectedSnapshot) {
+        this.selectedSnapshot = { ...this.selectedSnapshot, job: acknowledged.job };
+      }
+      this.jobs = this.jobs.map((item) =>
+        item.job_id === acknowledged.job.job_id ? acknowledged.job : item
+      );
+      this.publicationState = { state: "published", targetRelativePath };
+      this.publicationBusy = false;
+      this.render();
+    } catch (error) {
+      if (leaseId) {
+        try {
+          await releasePublication(
+            transport,
+            worker,
+            token,
+            status.job.job_id,
+            leaseId
+          );
+        } catch {
+          // The lease expires safely if the release response cannot be completed.
+        }
+      }
+      if (error instanceof VaultPublicationError && error.kind === "conflict") {
+        const inspection = await inspectPublicationTarget(
+          this.app.vault.adapter,
+          targetRelativePath,
+          packageData
+        );
+        if (
+          targetRelativePath === status.suggested_target_relative_path &&
+          inspection.kind === "conflict"
+        ) {
+          this.publicationState = {
+            state: "conflict",
+            status,
+            packageData,
+            diff: inspection.diff,
+            viewed: false
+          };
+          this.publicationBusy = false;
+          this.render();
+          return;
+        }
+      }
+      throw error;
+    }
+  }
+
+  private async savePublicationToNewLocation(
+    conflict: Extract<PublicationViewState, { state: "conflict" }>
+  ): Promise<void> {
+    const worker = this.plugin.preferredWorker();
+    const token = worker ? this.plugin.credentials.get(worker.id) : null;
+    const job = this.selectedSnapshot?.job;
+    if (!worker || !token || !job || this.publicationBusy) {
+      return;
+    }
+    this.publicationBusy = true;
+    this.render();
+    try {
+      const transport = new ObsidianWorkerTransport();
+      const status = await getPublicationStatus(
+        transport,
+        worker,
+        token,
+        job.job_id,
+        this.plugin.settings.outputFolder
+      );
+      if (status.manifest_sha256 !== conflict.packageData.manifestSha256) {
+        throw new VaultPublicationError("verification", "Worker 发布清单已发生变化，请重新查看。");
+      }
+      const target = await chooseNewPublicationPath(
+        this.app.vault.adapter,
+        conflict.status.suggested_target_relative_path
+      );
+      await this.publishPreparedPackage(status, conflict.packageData, target, null);
+    } catch (error) {
+      this.publicationBusy = false;
+      this.publicationState = {
+        state: "error",
+        message:
+          error instanceof PublicationClientError || error instanceof VaultPublicationError
+            ? error.message
+            : "新位置未能完成写入，当前内容没有被覆盖。"
+      };
+      this.render();
+    }
+  }
+
+  private async openPublishedNote(targetRelativePath: string): Promise<void> {
+    const notePath = `${targetRelativePath}/note.md`;
+    await this.app.workspace.openLinkText(notePath, "", false);
   }
 
   private async playReviewSegment(
@@ -2212,6 +3238,20 @@ export class SpeechWorkbenchView extends ItemView {
     if (this.connectionRecovery) {
       return { text: `${workerName} · 连接中断`, className: "is-warning" };
     }
+    if (this.viewMode === "task" && this.taskDetailMode === "publication") {
+      switch (this.publicationState.state) {
+        case "conflict":
+          return { text: "发现发布冲突", className: "is-warning" };
+        case "publishing":
+          return { text: "正在写入 Obsidian", className: "is-active" };
+        case "waiting_other_client":
+          return { text: "等待另一台设备发布", className: "is-neutral" };
+        case "published":
+          return { text: "已发布到 Obsidian", className: "is-good" };
+        default:
+          break;
+      }
+    }
     if (this.viewMode === "task") {
       const job = this.selectedSnapshot?.job ?? this.selectedJob();
       if (job && isActiveJob(job.state)) {
@@ -2234,6 +3274,42 @@ export class SpeechWorkbenchView extends ItemView {
       default:
         return { text: `${workerName} · 等待检测`, className: "is-neutral" };
     }
+  }
+
+  private taskCardStatus(job: JobSchema): string {
+    if (job.job_id !== this.selectedJobId) {
+      return jobStateLabel(job.state);
+    }
+    if (this.pendingSummaryRevision()) {
+      return "等待确认";
+    }
+    switch (this.publicationState.state) {
+      case "conflict":
+        return "发布冲突";
+      case "loading":
+        return "等待发布";
+      case "publishing":
+        return "正在发布";
+      case "waiting_other_client":
+        return "等待发布";
+      case "published":
+        return "已发布";
+      default:
+        return jobStateLabel(job.state);
+    }
+  }
+}
+
+function publicationTargetPath(state: PublicationViewState): string | null {
+  switch (state.state) {
+    case "publishing":
+    case "waiting_other_client":
+    case "published":
+      return state.targetRelativePath;
+    case "conflict":
+      return state.status.suggested_target_relative_path;
+    default:
+      return null;
   }
 }
 
@@ -2297,6 +3373,45 @@ function submissionPhaseLabel(phase: SubmissionProgress["phase"]): string {
 
 function taskTitle(filename: string): string {
   return filename.replace(/\.[^.]+$/, "") || filename;
+}
+
+function summaryRevisionStatusLabel(
+  status: SummaryRevisionSchema["status"]
+): string {
+  return {
+    pending: "等待确认",
+    accepted: "已采用",
+    rejected: "未采用"
+  }[status];
+}
+
+function summaryChangeKindLabel(
+  kind: "added" | "modified" | "removed"
+): string {
+  return {
+    added: "新增",
+    modified: "已修改",
+    removed: "已移除"
+  }[kind];
+}
+
+function manualSectionBody(markdown: string): string {
+  return markdown
+    .replace(/^## 我的补充\s*/u, "")
+    .trim();
+}
+
+function formatSummaryTimestamp(value: string): string {
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    return value;
+  }
+  return new Intl.DateTimeFormat("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit"
+  }).format(parsed);
 }
 
 function jobStateLabel(state: JobSchema["state"]): string {

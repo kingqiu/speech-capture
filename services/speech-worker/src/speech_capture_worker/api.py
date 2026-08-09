@@ -47,6 +47,15 @@ from speech_capture_worker.api_schemas import (
     PairingSessionSecretSchema,
     PreparedCredentialRotationSchema,
     ProvisionalTranscriptSchema,
+    PublicationAcknowledgementEnvelope,
+    PublicationAcknowledgementRequestSchema,
+    PublicationClaimEnvelope,
+    PublicationClaimRequestSchema,
+    PublicationLeaseSchema,
+    PublicationReceiptSchema,
+    PublicationReleaseEnvelope,
+    PublicationReleaseRequestSchema,
+    PublicationStatusResponse,
     ReviewAudioResponse,
     SafeIdentifier,
     SegmentReviewEnvelope,
@@ -54,6 +63,12 @@ from speech_capture_worker.api_schemas import (
     Sha256String,
     SpeakerDisplayNameEnvelope,
     SpeakerDisplayNameRequestSchema,
+    SummaryRevisionDecisionEnvelope,
+    SummaryRevisionDecisionRequestSchema,
+    SummaryRevisionListResponse,
+    SummaryRevisionRegenerationEnvelope,
+    SummaryRevisionRegenerationRequestSchema,
+    SummaryRevisionSchema,
     TranscriptSegmentSchema,
     UploadCreateSchema,
     UploadEnvelope,
@@ -108,7 +123,14 @@ from speech_capture_worker.recording_metadata import (
 )
 from speech_capture_worker.redaction import public_error_message
 from speech_capture_worker.review_audio import REVIEW_AUDIO_FILENAME, ReviewAudioManager
+from speech_capture_worker.summary_revisions import (
+    SummaryRevisionStatus,
+    decide_summary_revision,
+    list_summary_revisions,
+    regenerate_summary_revision,
+)
 from speech_capture_worker.transcript import JobSnapshot, TranscriptSegment
+from speech_capture_worker.vault_publication import plan_vault_publication
 from speech_capture_worker.worker_readiness import (
     WorkerReadinessSnapshot,
     collect_worker_readiness,
@@ -149,6 +171,7 @@ def create_app(
     credential_verifier: CredentialAuthenticator | None = None,
     device_security_store: DeviceSecurityStore | None = None,
     readiness_provider: Callable[[], WorkerReadinessSnapshot] | None = None,
+    summary_regenerator: Callable[[str], None] | None = None,
     endpoint_mode: str = "local_only",
     tls_enabled: bool = False,
 ) -> FastAPI:
@@ -325,9 +348,7 @@ def create_app(
                 "Device pairing is not configured.",
             )
         if request.pairing_ticket is not None:
-            issued = device_security_store.confirm_pairing_ticket(
-                request.pairing_ticket
-            )
+            issued = device_security_store.confirm_pairing_ticket(request.pairing_ticket)
         else:
             assert request.session_id is not None
             assert request.pairing_code is not None
@@ -881,6 +902,94 @@ def create_app(
         )
 
     @app.get(
+        "/v1/jobs/{job_id}/summary-revisions",
+        response_model=SummaryRevisionListResponse,
+        operation_id="listJobSummaryRevisions",
+        tags=["summaries"],
+        responses=PRIVATE_ERROR_RESPONSES,
+    )
+    def list_job_summary_revisions(
+        job_id: str,
+        principal: Principal,
+        worker_store: Store,
+    ) -> SummaryRevisionListResponse:
+        _authorized_job(worker_store, principal, job_id)
+        collection = list_summary_revisions(worker_store, job_id)
+        return SummaryRevisionListResponse(
+            revisions=tuple(
+                SummaryRevisionSchema.model_validate(item.to_dict())
+                for item in collection.revisions
+            ),
+            current_version=collection.current_version,
+            manual_section_markdown=collection.manual_section_markdown,
+            can_regenerate=collection.can_regenerate,
+        )
+
+    @app.post(
+        "/v1/jobs/{job_id}/summary-revisions",
+        response_model=SummaryRevisionRegenerationEnvelope,
+        operation_id="regenerateJobSummary",
+        tags=["summaries"],
+        responses=PRIVATE_ERROR_RESPONSES,
+    )
+    def regenerate_job_summary(
+        job_id: str,
+        request: SummaryRevisionRegenerationRequestSchema,
+        principal: Principal,
+        worker_store: Store,
+        idempotency_key: Annotated[str, Header(alias="Idempotency-Key")],
+    ) -> SummaryRevisionRegenerationEnvelope:
+        _authorized_job(worker_store, principal, job_id)
+        if summary_regenerator is None:
+            raise ApiProblem(
+                503,
+                "SUMMARY_REGENERATION_UNAVAILABLE",
+                "Note regeneration is not configured for this Worker process.",
+            )
+        result = regenerate_summary_revision(
+            worker_store,
+            job_id,
+            expected_revision=request.expected_revision,
+            idempotency_key=idempotency_key,
+            regenerate=summary_regenerator,
+        )
+        return SummaryRevisionRegenerationEnvelope(
+            job=_job_schema(result.job),
+            revision=SummaryRevisionSchema.model_validate(result.revision.to_dict()),
+            applied=result.applied,
+        )
+
+    @app.post(
+        "/v1/jobs/{job_id}/summary-revisions/{revision_key}/decision",
+        response_model=SummaryRevisionDecisionEnvelope,
+        operation_id="decideJobSummaryRevision",
+        tags=["summaries"],
+        responses=PRIVATE_ERROR_RESPONSES,
+    )
+    def decide_job_summary_revision(
+        job_id: str,
+        revision_key: SafeIdentifier,
+        request: SummaryRevisionDecisionRequestSchema,
+        principal: Principal,
+        worker_store: Store,
+        idempotency_key: Annotated[str, Header(alias="Idempotency-Key")],
+    ) -> SummaryRevisionDecisionEnvelope:
+        _authorized_job(worker_store, principal, job_id)
+        result = decide_summary_revision(
+            worker_store,
+            job_id,
+            revision_key=revision_key,
+            decision=SummaryRevisionStatus(request.decision),
+            expected_revision=request.expected_revision,
+            idempotency_key=idempotency_key,
+        )
+        return SummaryRevisionDecisionEnvelope(
+            job=_job_schema(result.job),
+            revision=SummaryRevisionSchema.model_validate(result.revision.to_dict()),
+            applied=result.applied,
+        )
+
+    @app.get(
         "/v1/jobs/{job_id}/events",
         response_model=JobUpdatesResponse,
         operation_id="getJobUpdates",
@@ -901,9 +1010,7 @@ def create_app(
             limit=limit,
         )
         return JobUpdatesResponse(
-            updates=tuple(
-                JobUpdateSchema.model_validate(update.to_dict()) for update in updates
-            ),
+            updates=tuple(JobUpdateSchema.model_validate(update.to_dict()) for update in updates),
             has_more=has_more,
             next_after_sequence=(updates[-1].sequence if updates else after_sequence),
         )
@@ -977,6 +1084,148 @@ def create_app(
         )
 
     @app.get(
+        "/v1/jobs/{job_id}/publication",
+        response_model=PublicationStatusResponse,
+        operation_id="getJobPublicationStatus",
+        tags=["publication"],
+        responses=PRIVATE_ERROR_RESPONSES,
+    )
+    def get_job_publication_status(
+        job_id: str,
+        principal: Principal,
+        worker_store: Store,
+        output_root: Annotated[str, Query(min_length=1, max_length=1024)] = "Speech Notes",
+    ) -> PublicationStatusResponse:
+        job = _authorized_job(worker_store, principal, job_id)
+        plan = plan_vault_publication(worker_store, job_id, output_root=output_root)
+        active = next(
+            (
+                lease
+                for lease in reversed(worker_store.list_publication_leases(job_id))
+                if lease.state.value == "active"
+            ),
+            None,
+        )
+        receipt = worker_store.get_publication_receipt(job_id)
+        return PublicationStatusResponse(
+            job=_job_schema(job),
+            suggested_target_relative_path=plan.target_relative_path,
+            manifest_sha256=plan.manifest_sha256,
+            artifact_count=plan.artifact_count,
+            active_lease=(
+                PublicationLeaseSchema(
+                    lease_id=active.lease_id,
+                    generation=active.generation,
+                    target_relative_path=active.target_relative_path,
+                    manifest_sha256=active.manifest_sha256,
+                    expires_at=active.expires_at,
+                    owned_by_caller=active.publisher_id == principal.device_id,
+                )
+                if active is not None
+                else None
+            ),
+            receipt=(
+                PublicationReceiptSchema(
+                    target_relative_path=receipt.target_relative_path,
+                    manifest_sha256=receipt.manifest_sha256,
+                    published_at=receipt.published_at,
+                )
+                if receipt is not None
+                else None
+            ),
+        )
+
+    @app.post(
+        "/v1/jobs/{job_id}/publication-claims",
+        response_model=PublicationClaimEnvelope,
+        operation_id="claimJobPublication",
+        tags=["publication"],
+        responses=PRIVATE_ERROR_RESPONSES,
+    )
+    def claim_job_publication(
+        job_id: str,
+        request: PublicationClaimRequestSchema,
+        principal: Principal,
+        worker_store: Store,
+    ) -> PublicationClaimEnvelope:
+        _authorized_job(worker_store, principal, job_id)
+        package = load_artifact_package(worker_store, job_id)
+        if package.manifest_sha256 != request.manifest_sha256:
+            raise InvalidJobRequest("The publication manifest is no longer current.")
+        lease, job, created = worker_store.claim_publication(
+            job_id,
+            publisher_id=principal.device_id,
+            target_relative_path=request.target_relative_path,
+            manifest_sha256=request.manifest_sha256,
+            expected_revision=request.expected_revision,
+            lease_seconds=request.lease_seconds,
+        )
+        return PublicationClaimEnvelope(
+            job=_job_schema(job),
+            lease=PublicationLeaseSchema(
+                lease_id=lease.lease_id,
+                generation=lease.generation,
+                target_relative_path=lease.target_relative_path,
+                manifest_sha256=lease.manifest_sha256,
+                expires_at=lease.expires_at,
+                owned_by_caller=True,
+            ),
+            created=created,
+        )
+
+    @app.post(
+        "/v1/jobs/{job_id}/publication-claims/release",
+        response_model=PublicationReleaseEnvelope,
+        operation_id="releaseJobPublication",
+        tags=["publication"],
+        responses=PRIVATE_ERROR_RESPONSES,
+    )
+    def release_job_publication(
+        job_id: str,
+        request: PublicationReleaseRequestSchema,
+        principal: Principal,
+        worker_store: Store,
+    ) -> PublicationReleaseEnvelope:
+        _authorized_job(worker_store, principal, job_id)
+        job = worker_store.release_publication_lease(
+            job_id,
+            lease_id=request.lease_id,
+            publisher_id=principal.device_id,
+            reason_code="client_publication_failed",
+        )
+        return PublicationReleaseEnvelope(job=_job_schema(job), released=True)
+
+    @app.post(
+        "/v1/jobs/{job_id}/publication-acknowledgements",
+        response_model=PublicationAcknowledgementEnvelope,
+        operation_id="acknowledgeJobPublication",
+        tags=["publication"],
+        responses=PRIVATE_ERROR_RESPONSES,
+    )
+    def acknowledge_job_publication(
+        job_id: str,
+        request: PublicationAcknowledgementRequestSchema,
+        principal: Principal,
+        worker_store: Store,
+    ) -> PublicationAcknowledgementEnvelope:
+        _authorized_job(worker_store, principal, job_id)
+        receipt, job, created = worker_store.acknowledge_publication(
+            job_id,
+            lease_id=request.lease_id,
+            publisher_id=principal.device_id,
+            manifest_sha256=request.manifest_sha256,
+        )
+        return PublicationAcknowledgementEnvelope(
+            job=_job_schema(job),
+            receipt=PublicationReceiptSchema(
+                target_relative_path=receipt.target_relative_path,
+                manifest_sha256=receipt.manifest_sha256,
+                published_at=receipt.published_at,
+            ),
+            created=created,
+        )
+
+    @app.get(
         "/v1/jobs/{job_id}/artifacts",
         response_model=ArtifactListResponse,
         operation_id="listJobArtifacts",
@@ -995,8 +1244,7 @@ def create_app(
             speech_id=package.speech_id,
             manifest_sha256=package.manifest_sha256,
             artifacts=tuple(
-                ArtifactSchema.model_validate(asdict(artifact))
-                for artifact in package.artifacts
+                ArtifactSchema.model_validate(asdict(artifact)) for artifact in package.artifacts
             ),
         )
 

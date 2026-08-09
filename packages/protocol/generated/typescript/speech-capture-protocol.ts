@@ -1,5 +1,5 @@
 // Generated Worker protocol wire types. Do not edit manually.
-export const OPENAPI_SHA256 = "c5a2bbe8b41715997dd1f99be4a60f89c09181c18c2eabaf8e69617b323d926c" as const;
+export const OPENAPI_SHA256 = "041c30bf5f6b4b1edc3d6a0fbd53141cc86bb7c4ca7b1b803b2f45e9d09beb17" as const;
 export const OPENAPI_VERSION = "3.1.0" as const;
 export const PROTOCOL_VERSION = "1.0.0" as const;
 
@@ -328,6 +328,63 @@ export interface ProvisionalTranscriptSchema {
   readonly updated_at: string;
 }
 
+export interface PublicationAcknowledgementEnvelope {
+  readonly created: boolean;
+  readonly job: JobSchema;
+  readonly receipt: PublicationReceiptSchema;
+}
+
+export interface PublicationAcknowledgementRequestSchema {
+  readonly lease_id: string;
+  readonly manifest_sha256: string;
+}
+
+export interface PublicationClaimEnvelope {
+  readonly created: boolean;
+  readonly job: JobSchema;
+  readonly lease: PublicationLeaseSchema;
+}
+
+export interface PublicationClaimRequestSchema {
+  readonly expected_revision: number;
+  readonly lease_seconds?: number;
+  readonly manifest_sha256: string;
+  readonly target_relative_path: string;
+}
+
+export interface PublicationLeaseSchema {
+  readonly expires_at: string;
+  readonly generation: number;
+  readonly lease_id: string;
+  readonly manifest_sha256: string;
+  readonly owned_by_caller: boolean;
+  readonly target_relative_path: string;
+}
+
+export interface PublicationReceiptSchema {
+  readonly manifest_sha256: string;
+  readonly published_at: string;
+  readonly target_relative_path: string;
+}
+
+export interface PublicationReleaseEnvelope {
+  readonly job: JobSchema;
+  readonly released: boolean;
+}
+
+export interface PublicationReleaseRequestSchema {
+  readonly lease_id: string;
+}
+
+export interface PublicationStatusResponse {
+  readonly active_lease: PublicationLeaseSchema | null;
+  readonly artifact_count: number;
+  readonly job: JobSchema;
+  readonly manifest_sha256: string;
+  readonly receipt: PublicationReceiptSchema | null;
+  readonly suggested_target_relative_path: string;
+}
+
 export interface ReviewAudioResponse {
   readonly accept_ranges: "bytes";
   readonly bits_per_sample: number;
@@ -378,6 +435,55 @@ export type SpeakerLabelStatus =
   | "anonymous"
   | "confirmed"
   | "unavailable";
+
+export interface SummaryRevisionDecisionEnvelope {
+  readonly applied: boolean;
+  readonly job: JobSchema;
+  readonly revision: SummaryRevisionSchema;
+}
+
+export interface SummaryRevisionDecisionRequestSchema {
+  readonly decision: "accepted" | "rejected";
+  readonly expected_revision: number;
+}
+
+export interface SummaryRevisionListResponse {
+  readonly can_regenerate: boolean;
+  readonly current_version: number;
+  readonly manual_section_markdown: string;
+  readonly revisions: ReadonlyArray<SummaryRevisionSchema>;
+}
+
+export interface SummaryRevisionRegenerationEnvelope {
+  readonly applied: boolean;
+  readonly job: JobSchema;
+  readonly revision: SummaryRevisionSchema;
+}
+
+export interface SummaryRevisionRegenerationRequestSchema {
+  readonly expected_revision: number;
+}
+
+export interface SummaryRevisionSchema {
+  readonly after_document: Readonly<Record<string, unknown>> | null;
+  readonly artifact_manifest_sha256: string | null;
+  readonly base_version: number;
+  readonly before_document: Readonly<Record<string, unknown>> | null;
+  readonly candidate_version: number;
+  readonly changed: boolean;
+  readonly created_at: string;
+  readonly decided_at: string | null;
+  readonly diff_truncated: boolean;
+  readonly revision_key: string;
+  readonly speaker_rename_count: number;
+  readonly status: SummaryRevisionStatus;
+  readonly text_correction_count: number;
+}
+
+export type SummaryRevisionStatus =
+  | "pending"
+  | "accepted"
+  | "rejected";
 
 export type TranscriptOutcome =
   | "transcribed"

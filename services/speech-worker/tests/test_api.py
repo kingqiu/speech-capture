@@ -119,10 +119,16 @@ def test_openapi_is_versioned_strict_and_has_stable_operation_ids() -> None:
         "/v1/jobs/{job_id}/corrections",
         "/v1/jobs/{job_id}/events",
         "/v1/jobs/{job_id}/pause",
+        "/v1/jobs/{job_id}/publication",
+        "/v1/jobs/{job_id}/publication-acknowledgements",
+        "/v1/jobs/{job_id}/publication-claims",
+        "/v1/jobs/{job_id}/publication-claims/release",
         "/v1/jobs/{job_id}/resume",
         "/v1/jobs/{job_id}/retry",
         "/v1/jobs/{job_id}/segment-review",
         "/v1/jobs/{job_id}/speaker-display-name",
+        "/v1/jobs/{job_id}/summary-revisions",
+        "/v1/jobs/{job_id}/summary-revisions/{revision_key}/decision",
         "/v1/jobs/{job_id}/snapshot",
         "/v1/pairing/confirm",
         "/v1/pairing/sessions",
@@ -135,10 +141,7 @@ def test_openapi_is_versioned_strict_and_has_stable_operation_ids() -> None:
         "/v1/uploads/{upload_id}/parts/{part_number}",
     }
     assert schema["paths"]["/v1/health"]["get"]["operationId"] == "getHealth"
-    assert (
-        schema["paths"]["/v1/capabilities"]["get"]["operationId"]
-        == "getCapabilities"
-    )
+    assert schema["paths"]["/v1/capabilities"]["get"]["operationId"] == "getCapabilities"
     assert (
         schema["paths"]["/v1/capabilities/negotiate"]["post"]["operationId"]
         == "negotiateCapabilities"
@@ -158,26 +161,33 @@ def test_openapi_is_versioned_strict_and_has_stable_operation_ids() -> None:
     }
     assert private_operations == {
         "completeUpload",
+        "acknowledgeJobPublication",
         "activateDeviceCredentialRotation",
         "cancelJob",
         "createJob",
         "createPairingSession",
         "createUpload",
+        "claimJobPublication",
+        "decideJobSummaryRevision",
         "downloadJobArtifact",
         "getJob",
         "getDiagnosticsSummary",
         "getJobSnapshot",
         "getJobUpdates",
         "getJobReviewAudio",
+        "getJobPublicationStatus",
         "getUpload",
         "getWorkerReadiness",
         "listJobArtifacts",
         "listJobCorrections",
+        "listJobSummaryRevisions",
         "listJobs",
         "listDevices",
         "pauseJob",
         "prepareDeviceCredentialRotation",
         "putUploadPart",
+        "regenerateJobSummary",
+        "releaseJobPublication",
         "resumeJob",
         "revokeDevice",
         "retryJob",
