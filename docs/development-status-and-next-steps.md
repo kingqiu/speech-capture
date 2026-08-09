@@ -3232,3 +3232,23 @@ Range 实际播放、本地同源优先、多人搜索滚动和窄窗就地修�
 最终校验失败时现有内容不覆盖并在 Obsidian 内可明确重试。继续遵守 Stage H 已批准文案和 MVP 范围，
 不进入发布管理页、Stage J 或远程个人 Alpha，不运行真实音频，不启动第二个 Obsidian；未经明确要求
 不 commit/push。
+
+---
+
+## 69. 2026-08-09 Stage I Vault 发布恢复边界
+
+- 使用纯合成任务验证另一台已授权设备持有租约：当前 Obsidian 不争抢、不写入，只显示等待；模拟
+  他端完成七文件写入和 acknowledgement 后，当前页面在普通轮询中自动同步为已发布；
+- 使用另一条纯合成任务和同名路径文件制造发布写入失败。原文件未改，正式目标与隐藏临时目录均未
+  出现，Worker 保持可重试的 `processed`；页面只有 `重新检测并发布`，没有 `稍后处理`；
+- 移除阻挡后在 Obsidian 内点击重试成功，最终七文件与 Worker 包逐文件一致，租约已确认且有持久
+  回执；
+- 新增只含合成数据的宿主截图 `25-publication-other-client-waiting-host-v1.png` 至
+  `28-publication-retry-success-host-v1.png`，详细说明见 Stage I 宿主验证文档；
+- 本轮未修改产品代码，没有真实音频、正式 Vault、远程笔记本、第二个 Obsidian、发布管理页或
+  Stage J，也没有 commit/push；测试 Vault、数据库、凭据和夹具继续留在 Git 忽略的 `tmp/`。
+
+下一步仍属 Phase 4 / Stage I：先做本地个人 Alpha 收口审计，逐项核对同机提交、处理、复核、Note
+重新生成和发布的可达性，并补齐剩余无障碍与主题一致性检查。审计完成前不进入 Stage J/远程个人
+Alpha；真实音频本地 Alpha 需要项目所有者另行明确授权。未经明确要求不 commit/push，私有数据继续
+不得进入 Git。
