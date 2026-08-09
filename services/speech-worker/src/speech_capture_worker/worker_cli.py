@@ -32,6 +32,7 @@ from speech_capture_worker.domain import (
     ModelProfile,
     UploadCreateRequest,
 )
+from speech_capture_worker.downstream_revision import DownstreamRevisionCreator
 from speech_capture_worker.errors import InvalidJobRequest, UploadStorageError, WorkerCoreError
 from speech_capture_worker.forced_alignment import (
     ForcedAlignmentExecutor,
@@ -159,6 +160,17 @@ def _build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="Optional UTF-8 free-form context used only after raw ASR.",
     )
+
+    derive_downstream = subparsers.add_parser(
+        "derive-downstream-revision",
+        help=(
+            "Create a new downstream job from immutable raw ASR evidence; "
+            "run only while the background Worker service is stopped."
+        ),
+    )
+    _add_data_dir(derive_downstream)
+    derive_downstream.add_argument("source_job_id")
+    derive_downstream.add_argument("--idempotency-key", required=True)
 
     set_recording_context = subparsers.add_parser(
         "set-recording-context",
@@ -807,6 +819,25 @@ def _dispatch(args: argparse.Namespace) -> int:
                 ),
             )
             _write_json({"created": created, "job": job.to_dict()})
+            return 0
+        if args.command == "derive-downstream-revision":
+            result = DownstreamRevisionCreator(store).create(
+                args.source_job_id,
+                idempotency_key=args.idempotency_key,
+            )
+            _write_json(
+                {
+                    "created": result.created,
+                    "source_job_id": result.source_job.job_id,
+                    "revision_job": result.revision_job.to_dict(),
+                    "copied_asr_attempt_count": result.copied_asr_attempt_count,
+                    "rejected_boundary_fragment_count": (
+                        result.rejected_boundary_fragment_count
+                    ),
+                    "materialized_pause_count": result.materialized_pause_count,
+                    "fresh_asr_inference": False,
+                }
+            )
             return 0
         if args.command == "set-recording-context":
             context = None if args.clear else _read_recording_context_file(args.context_file)

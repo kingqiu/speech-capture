@@ -2240,6 +2240,155 @@ class JobStore:
             row = self._fetch_transcript_segment_row(job_id, segment_id)
             return self._row_to_transcript_segment(row), True
 
+    def commit_natural_pause_segment(
+        self,
+        job_id: str,
+        *,
+        commit_key: str,
+        start_ms: int,
+        end_ms: int,
+        evidence_checkpoint_generation: int,
+        evidence_checkpoint_sha256: str,
+    ) -> tuple[TranscriptSegment, bool]:
+        """Backfill one conservative natural pause from combined durable evidence."""
+
+        validate_commit_key(commit_key)
+        if not commit_key.startswith("natural_pause_"):
+            raise InvalidJobRequest("Natural-pause commit_key is invalid.")
+        if (
+            not isinstance(evidence_checkpoint_generation, int)
+            or isinstance(evidence_checkpoint_generation, bool)
+            or evidence_checkpoint_generation < 1
+            or not isinstance(evidence_checkpoint_sha256, str)
+            or not SHA256_PATTERN.fullmatch(evidence_checkpoint_sha256)
+        ):
+            raise InvalidJobRequest("Natural-pause checkpoint identity is invalid.")
+
+        request_payload = {
+            "commit_key": commit_key,
+            "start_ms": start_ms,
+            "end_ms": end_ms,
+            "outcome": TranscriptOutcome.NON_SPEECH.value,
+            "text": None,
+            "language": None,
+            "confidence": None,
+            "timing_status": TranscriptTimingStatus.ALIGNED.value,
+            "speaker_id": None,
+            "speaker_label_status": SpeakerLabelStatus.UNAVAILABLE.value,
+            "error_code": None,
+            "evidence_checkpoint_generation": evidence_checkpoint_generation,
+            "evidence_checkpoint_sha256": evidence_checkpoint_sha256,
+        }
+        fingerprint = hashlib.sha256(
+            _canonical_json(request_payload).encode("utf-8")
+        ).hexdigest()
+
+        with self._transaction():
+            job = self._row_to_job(self._fetch_job_row(job_id))
+            if job.state is not JobState.ALIGNING:
+                raise InvalidJobRequest(
+                    "Natural pauses can be committed only while aligning."
+                )
+            duration_ms = self._job_duration_ms(job)
+            validate_time_range(start_ms, end_ms, duration_ms=duration_ms)
+            self._require_current_natural_pause_evidence(
+                job_id,
+                commit_key=commit_key,
+                start_ms=start_ms,
+                end_ms=end_ms,
+                source_duration_ms=duration_ms,
+                evidence_checkpoint_generation=evidence_checkpoint_generation,
+                evidence_checkpoint_sha256=evidence_checkpoint_sha256,
+            )
+
+            prior = self._connection.execute(
+                """
+                SELECT *
+                FROM transcript_segments
+                WHERE job_id = ? AND commit_key = ?
+                """,
+                (job_id, commit_key),
+            ).fetchone()
+            if prior is not None:
+                if str(prior["request_fingerprint"]) != fingerprint:
+                    raise TranscriptConflict(
+                        "The commit key is already bound to different pause evidence.",
+                        details={"job_id": job_id, "commit_key": commit_key},
+                    )
+                return self._row_to_transcript_segment(prior), False
+
+            overlap = self._connection.execute(
+                """
+                SELECT segment_id
+                FROM transcript_segments
+                WHERE job_id = ? AND start_ms < ? AND end_ms > ?
+                LIMIT 1
+                """,
+                (job_id, end_ms, start_ms),
+            ).fetchone()
+            if overlap is not None:
+                raise TranscriptConflict(
+                    "A natural pause cannot overlap an existing segment.",
+                    details={"conflicting_segment_id": str(overlap["segment_id"])},
+                )
+
+            sequence = int(
+                self._connection.execute(
+                    """
+                    SELECT COALESCE(MAX(segment_sequence), 0) + 1
+                    FROM transcript_segments
+                    WHERE job_id = ?
+                    """,
+                    (job_id,),
+                ).fetchone()[0]
+            )
+            segment_id = f"seg_{sequence:08d}"
+            now = _utc_now()
+            self._connection.execute(
+                """
+                INSERT INTO transcript_segments (
+                    job_id, segment_sequence, segment_id, commit_key,
+                    request_fingerprint, revision, start_ms, end_ms, outcome,
+                    text, language, confidence, timing_status, speaker_id,
+                    speaker_label_status, error_code, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, NULL, NULL, NULL, ?, NULL, ?, NULL, ?, ?)
+                """,
+                (
+                    job_id,
+                    sequence,
+                    segment_id,
+                    commit_key,
+                    fingerprint,
+                    start_ms,
+                    end_ms,
+                    TranscriptOutcome.NON_SPEECH.value,
+                    TranscriptTimingStatus.ALIGNED.value,
+                    SpeakerLabelStatus.UNAVAILABLE.value,
+                    now,
+                    now,
+                ),
+            )
+            self._insert_update(
+                job_id=job_id,
+                job_revision=job.revision,
+                event_type="transcript.segment_committed",
+                payload={
+                    "segment_sequence": sequence,
+                    "segment_id": segment_id,
+                    "revision": 1,
+                    "start_ms": start_ms,
+                    "end_ms": end_ms,
+                    "outcome": TranscriptOutcome.NON_SPEECH.value,
+                    "text_length": 0,
+                    "speaker_label_status": SpeakerLabelStatus.UNAVAILABLE.value,
+                    "evidence_type": "combined_natural_pause",
+                },
+                created_at=now,
+            )
+            row = self._fetch_transcript_segment_row(job_id, segment_id)
+            return self._row_to_transcript_segment(row), True
+
     def commit_gap_retranscription_segment(
         self,
         job_id: str,
@@ -4460,6 +4609,198 @@ class JobStore:
         ]
         if len(matching) != 1:
             raise InvalidJobRequest("A review must match one complete current unresolved range.")
+
+    def _require_current_natural_pause_evidence(
+        self,
+        job_id: str,
+        *,
+        commit_key: str,
+        start_ms: int,
+        end_ms: int,
+        source_duration_ms: int,
+        evidence_checkpoint_generation: int,
+        evidence_checkpoint_sha256: str,
+    ) -> None:
+        evidence_row = self._connection.execute(
+            """
+            SELECT generation, payload_json, payload_sha256
+            FROM job_checkpoints
+            WHERE job_id = ? AND stage = ? AND checkpoint_key = ?
+            """,
+            (job_id, "aligning", f"{commit_key}_evidence"),
+        ).fetchone()
+        if (
+            evidence_row is None
+            or int(evidence_row["generation"]) != evidence_checkpoint_generation
+            or str(evidence_row["payload_sha256"]) != evidence_checkpoint_sha256
+        ):
+            raise InvalidJobRequest(
+                "Natural-pause materialization requires its current combined evidence."
+            )
+        payload = _json_object(evidence_row["payload_json"])
+        if (
+            payload.get("schema_version") != "1.0.0"
+            or payload.get("evidence_type") != "combined_natural_pause"
+            or payload.get("commit_key") != commit_key
+            or payload.get("start_ms") != start_ms
+            or payload.get("end_ms") != end_ms
+            or payload.get("outcome") != TranscriptOutcome.NON_SPEECH.value
+            or payload.get("source_duration_ms") != source_duration_ms
+            or payload.get("reason_code")
+            not in {
+                "VAD_CONFIRMED_NO_SPEECH",
+                "VAD_BOUNDARY_RESIDUAL_AND_ASR_REJECTED",
+            }
+            or not isinstance(payload.get("alignment_report_generation"), int)
+            or isinstance(payload["alignment_report_generation"], bool)
+            or payload["alignment_report_generation"] < 1
+            or not isinstance(payload.get("alignment_report_sha256"), str)
+            or not SHA256_PATTERN.fullmatch(payload["alignment_report_sha256"])
+            or not isinstance(payload.get("speech_activity_generation"), int)
+            or isinstance(payload["speech_activity_generation"], bool)
+            or payload["speech_activity_generation"] < 1
+            or not isinstance(payload.get("speech_activity_sha256"), str)
+            or not SHA256_PATTERN.fullmatch(payload["speech_activity_sha256"])
+            or not isinstance(payload.get("speech_evidence"), dict)
+        ):
+            raise InvalidJobRequest("The natural-pause evidence is invalid.")
+
+        alignment_row = self._connection.execute(
+            """
+            SELECT generation, payload_json, payload_sha256
+            FROM job_checkpoints
+            WHERE job_id = ? AND stage = ? AND checkpoint_key = ?
+            """,
+            (job_id, "aligning", "transcript_alignment_report"),
+        ).fetchone()
+        if (
+            alignment_row is None
+            or int(alignment_row["generation"])
+            != payload["alignment_report_generation"]
+            or str(alignment_row["payload_sha256"])
+            != payload["alignment_report_sha256"]
+        ):
+            raise InvalidJobRequest("The alignment changed after pause evidence was recorded.")
+        alignment_payload = _json_object(alignment_row["payload_json"])
+        unresolved_ranges = alignment_payload.get("unresolved_ranges")
+        if (
+            alignment_payload.get("schema_version") != "1.0.0"
+            or alignment_payload.get("source_duration_ms") != source_duration_ms
+            or not isinstance(unresolved_ranges, list)
+        ):
+            raise InvalidJobRequest("The pause no longer matches one current unresolved range.")
+        cursor = 0
+        unresolved_duration_ms = 0
+        matching_range_count = 0
+        for value in unresolved_ranges:
+            if (
+                not isinstance(value, dict)
+                or not isinstance(value.get("start_ms"), int)
+                or isinstance(value["start_ms"], bool)
+                or not isinstance(value.get("end_ms"), int)
+                or isinstance(value["end_ms"], bool)
+                or value["start_ms"] < cursor
+                or value["start_ms"] < 0
+                or value["end_ms"] <= value["start_ms"]
+                or value["end_ms"] > source_duration_ms
+            ):
+                raise InvalidJobRequest(
+                    "The pause no longer matches one current unresolved range."
+                )
+            unresolved_duration_ms += value["end_ms"] - value["start_ms"]
+            matching_range_count += int(
+                value["start_ms"] == start_ms and value["end_ms"] == end_ms
+            )
+            cursor = value["end_ms"]
+        if (
+            unresolved_duration_ms != alignment_payload.get("unresolved_duration_ms")
+            or matching_range_count != 1
+        ):
+            raise InvalidJobRequest(
+                "The pause no longer matches one current unresolved range."
+            )
+
+        speech_row = self._connection.execute(
+            """
+            SELECT generation, payload_json, payload_sha256
+            FROM job_checkpoints
+            WHERE job_id = ? AND stage = ? AND checkpoint_key = ?
+            """,
+            (job_id, "aligning", "gap_speech_activity_evidence"),
+        ).fetchone()
+        if (
+            speech_row is None
+            or int(speech_row["generation"]) != payload["speech_activity_generation"]
+            or str(speech_row["payload_sha256"]) != payload["speech_activity_sha256"]
+        ):
+            raise InvalidJobRequest("The speech-activity evidence changed.")
+        speech_payload = _json_object(speech_row["payload_json"])
+        speech_values = speech_payload.get("evidence")
+        if not isinstance(speech_values, list):
+            raise InvalidJobRequest("The speech-activity evidence is not current.")
+        matching_speech = [
+            value
+            for value in speech_values
+            if isinstance(value, dict)
+            and value.get("start_ms") == start_ms
+            and value.get("end_ms") == end_ms
+        ]
+        if (
+            speech_payload.get("alignment_report_generation")
+            != payload["alignment_report_generation"]
+            or speech_payload.get("alignment_report_sha256")
+            != payload["alignment_report_sha256"]
+            or len(matching_speech) != 1
+            or matching_speech[0] != payload["speech_evidence"]
+        ):
+            raise InvalidJobRequest("The speech-activity evidence is not current.")
+
+        retranscription_key = payload.get("retranscription_checkpoint_key")
+        if payload["reason_code"] == "VAD_CONFIRMED_NO_SPEECH":
+            if (
+                payload["speech_evidence"].get("observation") != "no_speech_detected"
+                or payload["speech_evidence"].get("speech_duration_ms") != 0
+                or payload["speech_evidence"].get("speech_regions") != []
+                or retranscription_key is not None
+            ):
+                raise InvalidJobRequest("The no-speech pause evidence is invalid.")
+            return
+
+        if (
+            payload["speech_evidence"].get("observation") != "speech_detected"
+            or not isinstance(retranscription_key, str)
+            or not (
+                retranscription_key.startswith("gap_retranscription_rejected_")
+                or retranscription_key.startswith("gap_retranscription_failed_")
+            )
+            or not isinstance(payload.get("retranscription_checkpoint_generation"), int)
+            or isinstance(payload["retranscription_checkpoint_generation"], bool)
+            or not isinstance(payload.get("retranscription_checkpoint_sha256"), str)
+            or not SHA256_PATTERN.fullmatch(payload["retranscription_checkpoint_sha256"])
+        ):
+            raise InvalidJobRequest("The boundary-residual pause evidence is invalid.")
+        retranscription_row = self._connection.execute(
+            """
+            SELECT generation, payload_json, payload_sha256
+            FROM job_checkpoints
+            WHERE job_id = ? AND stage = ? AND checkpoint_key = ?
+            """,
+            (job_id, "aligning", retranscription_key),
+        ).fetchone()
+        if (
+            retranscription_row is None
+            or int(retranscription_row["generation"])
+            != payload["retranscription_checkpoint_generation"]
+            or str(retranscription_row["payload_sha256"])
+            != payload["retranscription_checkpoint_sha256"]
+        ):
+            raise InvalidJobRequest("The gap retranscription evidence changed.")
+        retranscription_payload = _json_object(retranscription_row["payload_json"])
+        if (
+            retranscription_payload.get("start_ms") != start_ms
+            or retranscription_payload.get("end_ms") != end_ms
+        ):
+            raise InvalidJobRequest("The gap retranscription evidence range is invalid.")
 
     def _fetch_upload_row(self, upload_id: str) -> sqlite3.Row:
         _validate_upload_id(upload_id)

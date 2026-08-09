@@ -54,6 +54,11 @@ GAP_RETRANSCRIPTION_SCHEMA_VERSION = "1.0.0"
 GAP_RETRANSCRIPTION_RAW_SCHEMA_VERSION = "1.0.0"
 GAP_RETRANSCRIPTION_HEADROOM_BYTES = GIB
 GAP_RETRANSCRIPTION_PREFIX = "gap_retranscription_"
+BOUNDARY_FRAGMENT_REJECTION_PREFIX = "gap_retranscription_rejected_"
+MAX_BOUNDARY_FRAGMENT_DURATION_MS = 160
+MAX_BOUNDARY_FRAGMENT_TOTAL_MS = 350
+MAX_BOUNDARY_FRAGMENT_COVERAGE_RATIO = 0.10
+MIN_BOUNDARY_FRAGMENT_GAP_MS = 1000
 
 
 class GapRetranscriptionEngine(Protocol):
@@ -336,6 +341,34 @@ class GapRetranscriptionExecutor:
                         raw_sha256=raw_sha256,
                         raw_bytes=raw_bytes,
                     )
+                    if is_low_coverage_boundary_fragment(
+                        segments,
+                        gap_start_ms=start_ms,
+                        gap_end_ms=end_ms,
+                    ):
+                        self.store.put_checkpoint(
+                            job_id,
+                            stage=ALIGNMENT_STAGE,
+                            checkpoint_key=(
+                                f"{BOUNDARY_FRAGMENT_REJECTION_PREFIX}"
+                                f"{start_ms:010d}_{end_ms:010d}"
+                            ),
+                            payload={
+                                "schema_version": GAP_RETRANSCRIPTION_SCHEMA_VERSION,
+                                "start_ms": start_ms,
+                                "end_ms": end_ms,
+                                "reason_code": "LOW_COVERAGE_BOUNDARY_FRAGMENT",
+                                "raw_relative_path": raw_relative_path,
+                                "raw_sha256": raw_sha256,
+                                "segment_count": len(segments),
+                                "transcribed_duration_ms": sum(
+                                    item["end_ms"] - item["start_ms"]
+                                    for item in segments
+                                ),
+                            },
+                        )
+                        failed += 1
+                        break
                     try:
                         for segment_index, item in enumerate(segments):
                             segment, _ = self.store.commit_gap_retranscription_segment(
@@ -517,6 +550,44 @@ def _canonical_json(payload: dict[str, Any]) -> str:
         separators=(",", ":"),
         sort_keys=True,
     )
+
+
+def is_low_coverage_boundary_fragment(
+    segments: list[dict[str, Any]],
+    *,
+    gap_start_ms: int,
+    gap_end_ms: int,
+) -> bool:
+    """Reject tiny ASR fragments that only repeat an adjacent utterance boundary."""
+
+    gap_duration_ms = gap_end_ms - gap_start_ms
+    if not segments or gap_duration_ms < MIN_BOUNDARY_FRAGMENT_GAP_MS:
+        return False
+    durations = [item["end_ms"] - item["start_ms"] for item in segments]
+    total_duration_ms = sum(durations)
+    if (
+        any(duration <= 0 or duration > MAX_BOUNDARY_FRAGMENT_DURATION_MS for duration in durations)
+        or total_duration_ms > MAX_BOUNDARY_FRAGMENT_TOTAL_MS
+        or total_duration_ms / gap_duration_ms > MAX_BOUNDARY_FRAGMENT_COVERAGE_RATIO
+    ):
+        return False
+    compact_text = "".join(
+        str(item.get("text", "")).strip("，。！？、；：,.!?;: \t\r\n")
+        for item in segments
+    )
+    if not compact_text or len(compact_text) > 4:
+        return False
+    at_start = all(
+        item["start_ms"] >= gap_start_ms
+        and item["end_ms"] <= gap_start_ms + MAX_BOUNDARY_FRAGMENT_TOTAL_MS
+        for item in segments
+    )
+    at_end = all(
+        item["start_ms"] >= gap_end_ms - MAX_BOUNDARY_FRAGMENT_TOTAL_MS
+        and item["end_ms"] <= gap_end_ms
+        for item in segments
+    )
+    return at_start or at_end
 
 
 def _atomic_write_bytes(destination: Path, content: bytes) -> None:

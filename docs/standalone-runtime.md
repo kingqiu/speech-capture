@@ -50,8 +50,8 @@ The build does not stop after PyInstaller reports success. It also:
 - validates manifest paths, permissions, file hashes and internal symlinks;
 - removes temporary smoke-test data automatically.
 
-The current local build produced 3,405 packaged entries, contains 1,298,274,521 bytes of regular-file payload, and has
-runtime manifest SHA-256 `e8a1b606175ddc5eaa27c3101d93cd7b014b2e62953b07adb17bfa38ebc8e07e`.
+The current local build produced 3,405 packaged entries, contains 1,298,286,841 bytes of regular-file payload, and has
+runtime manifest SHA-256 `42b5da737a75a44675da6cc691c9a83ec43bdd9145b47dadfca3e687b502be1c`.
 Additional real checks confirmed:
 
 - bundled FFmpeg 8.0.1 and FFprobe run with the minimal system `PATH`;

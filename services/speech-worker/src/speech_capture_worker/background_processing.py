@@ -35,6 +35,7 @@ from speech_capture_worker.gap_speech_activity import (
 )
 from speech_capture_worker.job_store import JobStore
 from speech_capture_worker.model_activation import resolve_active_model_target
+from speech_capture_worker.natural_pause import NaturalPauseMaterializer
 from speech_capture_worker.scheduler import JobScheduler, SchedulerOutcome
 from speech_capture_worker.structuring_execution import (
     OllamaStructuringEngine,
@@ -169,6 +170,14 @@ class ContinuousJobExecutor:
             retranscribed.alignment is not None
             and retranscribed.alignment.job.state is JobState.DIARIZING
         ):
+            return BackgroundStepOutcome.ADVANCED
+        if retranscribed.added_segment_count:
+            return BackgroundStepOutcome.ADVANCED
+
+        pauses = NaturalPauseMaterializer(self.store).materialize(job.job_id)
+        if pauses.alignment.job.state is JobState.DIARIZING:
+            return BackgroundStepOutcome.ADVANCED
+        if pauses.created_segment_count:
             return BackgroundStepOutcome.ADVANCED
 
         current_alignment = self._alignment_checkpoint(job.job_id)
