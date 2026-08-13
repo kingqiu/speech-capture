@@ -135,12 +135,39 @@ class DownstreamRevisionCreator:
             aligned = TranscriptAlignmentFinalizer(self.store).finalize(revision.job_id)
             current = aligned.job
             if current.state is JobState.ALIGNING:
-                rejected_count = self._replay_gap_evidence(
+                replayed_rejections = self._replay_gap_evidence(
                     source,
                     current,
                     alignment_generation=aligned.checkpoint_generation,
                     alignment_sha256=_alignment_sha256(self.store, revision.job_id),
                 )
+                if replayed_rejections is None:
+                    self.store.put_checkpoint(
+                        revision.job_id,
+                        stage=DERIVED_REVISION_STAGE,
+                        checkpoint_key=DERIVED_REVISION_CHECKPOINT_KEY,
+                        payload={
+                            "schema_version": DERIVED_REVISION_SCHEMA_VERSION,
+                            "status": "awaiting_recomputed_gap_evidence",
+                            "source_job_id": source.job_id,
+                            "source_job_revision": source.revision,
+                            "source_state": source.state.value,
+                            "source_sha256": source.source_sha256,
+                            "source_upload_id": source.source_upload_id,
+                            "raw_asr_attempt_count": len(source_attempts),
+                            "fresh_asr_inference": False,
+                            "reason_code": "REPLAYED_TIMELINE_CHANGED",
+                        },
+                    )
+                    return DownstreamRevisionResult(
+                        source_job=source,
+                        revision_job=self.store.get_job(revision.job_id),
+                        created=created,
+                        copied_asr_attempt_count=len(source_attempts),
+                        rejected_boundary_fragment_count=0,
+                        materialized_pause_count=0,
+                    )
+                rejected_count = replayed_rejections
                 pauses = NaturalPauseMaterializer(self.store).materialize(revision.job_id)
                 pause_count = pauses.created_segment_count
                 current = pauses.job
@@ -211,7 +238,7 @@ class DownstreamRevisionCreator:
         revision: JobRecord,
         *,
         source_attempts: list[AsrAttemptRecord],
-    ) -> int:
+    ) -> int | None:
         current = self.store.get_job(revision.job_id)
         if current.state is JobState.QUEUED:
             current = self.store.claim_job_for_processing(
@@ -313,9 +340,12 @@ class DownstreamRevisionCreator:
             if isinstance(value, dict)
         }
         if set(evidence_by_range) != unresolved:
-            raise InvalidJobRequest(
-                "The source VAD ranges do not match the replayed immutable transcript."
-            )
+            # A newer deterministic materializer may derive a safer corrected
+            # timeline from the exact same immutable ASR payload. Source VAD is
+            # range-pinned and must not be stretched onto those changed gaps;
+            # leave the revision at ALIGNING so the normal background path can
+            # compute fresh downstream gap evidence without fresh primary ASR.
+            return None
         self.store.put_checkpoint(
             revision.job_id,
             stage="aligning",

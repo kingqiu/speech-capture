@@ -854,10 +854,18 @@ def _result_segments(
         gap_ms = following["start_ms"] - current["end_ms"]
         if 0 < gap_ms <= MAX_SENTENCE_PAUSE_BRIDGE_MS:
             current["end_ms"] = following["start_ms"]
+    previous_end_ms: int | None = None
     for item in merged:
         item["start_ms"] = min(item["start_ms"], source_duration_ms - 1)
+        if previous_end_ms is not None and item["start_ms"] < previous_end_ms:
+            # A zero-duration timestamp token may close one readable sentence at
+            # exactly the same instant the following sentence begins. Expanding
+            # the former to the required one-millisecond stable range must not
+            # make the latter overlap it.
+            item["start_ms"] = previous_end_ms
         item["end_ms"] = max(item["end_ms"], item["start_ms"] + 1)
         item["end_ms"] = min(item["end_ms"], source_duration_ms)
+        previous_end_ms = item["end_ms"]
     return merged
 
 

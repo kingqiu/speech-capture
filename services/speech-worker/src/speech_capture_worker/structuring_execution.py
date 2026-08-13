@@ -42,7 +42,7 @@ from speech_capture_worker.recording_context import (
     recording_context_sha256,
 )
 from speech_capture_worker.resources import GIB, ResourceReport, check_resource_preflight
-from speech_capture_worker.transcript import TranscriptSegment
+from speech_capture_worker.transcript import TranscriptSegment, chronological_segments
 
 STRUCTURING_SCHEMA_VERSION = "1.6.0"
 STRUCTURING_RAW_SCHEMA_VERSION = "1.6.0"
@@ -62,6 +62,8 @@ STRUCTURING_HEADROOM_BYTES = GIB
 DEFAULT_BATCH_MAX_CHARS = 4000
 DEFAULT_EDITOR_BATCH_MAX_CHARS = 4800
 SCENE_COVERAGE_REPAIR_VERSION = "2026-08-02.4"
+MEETING_QUALITY_REPAIR_VERSION = "2026-08-10.3"
+MEETING_OUTCOME_REPAIR_VERSION = "2026-08-10.3"
 INTERVIEW_QUALITY_REPAIR_VERSION = "2026-08-02.1"
 VOICE_MEMO_QUALITY_REPAIR_VERSION = "2026-08-02.2"
 MAX_FINDING_TEXT_CHARACTERS = 2000
@@ -270,6 +272,7 @@ DOCUMENT_JSON_SCHEMA = {
             },
             "maxItems": 10,
         },
+        "discussion_threads": DISCUSSION_THREADS_JSON_SCHEMA,
         "timeline_sections": {
             "type": "array",
             "items": {
@@ -344,6 +347,7 @@ DOCUMENT_JSON_SCHEMA = {
         "context",
         "highlights",
         "topics",
+        "discussion_threads",
         "timeline_sections",
         "speaker_summaries",
         "decisions",
@@ -513,6 +517,18 @@ class StructuringEngine(Protocol):
         segments: list[dict[str, Any]],
     ) -> dict[str, Any]: ...
 
+    def refine_meeting_document(
+        self,
+        document: dict[str, Any],
+        segments: list[dict[str, Any]],
+    ) -> dict[str, Any]: ...
+
+    def refine_meeting_outcomes(
+        self,
+        document: dict[str, Any],
+        segments: list[dict[str, Any]],
+    ) -> dict[str, Any]: ...
+
     def refine_voice_memo_document(
         self,
         document: dict[str, Any],
@@ -525,6 +541,11 @@ class StructuringEngine(Protocol):
         *,
         speaker_ids: list[str],
         content_type: ContentType,
+    ) -> list[dict[str, Any]]: ...
+
+    def synthesize_timeline_sections(
+        self,
+        segments: list[dict[str, Any]],
     ) -> list[dict[str, Any]]: ...
 
     def synthesize_discussion_threads(
@@ -689,14 +710,32 @@ class OllamaStructuringEngine:
             + "\n"
             "完整校订后逐字稿：\n" + json.dumps(segments, ensure_ascii=False)
         )
+        schema = _document_json_schema(content_type)
         response = self._generate(
             prompt,
-            format_schema=_document_json_schema(content_type),
+            format_schema=schema,
             num_predict=4608,
             num_ctx=24576,
             timeout_seconds=1200,
         )
-        return _parse_json_object(response)
+        try:
+            return _parse_json_object(response)
+        except StructuringFailed as exc:
+            if str(exc) not in {
+                "The Ollama engine did not return a JSON object.",
+                "The Ollama engine returned unparsable JSON.",
+            }:
+                raise
+        retry_response = self._generate(
+            prompt
+            + "\n上一次输出未形成完整 JSON。请重新生成完整对象，确保所有字符串、数组和对象都闭合，"
+            "不要输出 JSON 之外的文字。",
+            format_schema=schema,
+            num_predict=6144,
+            num_ctx=24576,
+            timeout_seconds=1200,
+        )
+        return _parse_json_object(retry_response)
 
     def synthesize_missing_scene_sections(
         self,
@@ -784,6 +823,115 @@ class OllamaStructuringEngine:
         )
         return _parse_json_object(response)
 
+    def refine_meeting_document(
+        self,
+        document: dict[str, Any],
+        segments: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        quality_segments = _meeting_quality_segments(segments)
+        core_fields = ("title", "summary", "context", "highlights", "topics")
+        core_schema = {
+            "type": "object",
+            "properties": {
+                key: json.loads(json.dumps(DOCUMENT_JSON_SCHEMA["properties"][key]))
+                for key in core_fields
+            },
+            "required": list(core_fields),
+            "additionalProperties": False,
+        }
+        core_prompt = (
+            "你是中文会议纪要主编。只返回 schema 要求的 JSON，不要解释。根据校订逐字稿重新组织"
+            "会议主线，不沿用旧笔记的空泛表述。title 必须点明具体项目和会议目的。summary 用一段"
+            "话交代参与方、讨论对象、范围、推进方式和会议实际落点。context 只写会议目的、项目"
+            "背景、参与方关系和明确约束，不按人复述观点。highlights 只保留最影响理解和后续工作的"
+            "具体结论。topics 按互不重复的具体议题组织，每项 summary 和 details 必须保留原文中的"
+            "系统数量、阶段、时间、指标、技术原则、交付物或范围边界；不要写‘深入讨论’‘确保顺利"
+            "推进’等套话，不得为了条数填充。每项 evidence 只使用下方 segment_id。\n"
+            + synthesis_guidance(ContentType.MEETING.value)
+            + _recording_context_prompt(self.recording_context)
+            + "\n已验证的顺序摘要仅用于检查覆盖：\n"
+            + json.dumps(document.get("timeline_sections", []), ensure_ascii=False)
+            + "\n校订逐字稿（已去除口头承接）：\n"
+            + json.dumps(quality_segments, ensure_ascii=False)
+        )
+        core = _parse_json_object(
+            self._generate(
+                core_prompt,
+                format_schema=core_schema,
+                model=self.editor_model,
+                num_predict=3072,
+                num_ctx=24576,
+                timeout_seconds=1200,
+            )
+        )
+
+        outcomes = self.refine_meeting_outcomes(document, quality_segments)
+
+        substantive_speakers = sorted(_substantive_speaker_ids_from_payload(segments))
+        speaker_summaries = (
+            self.synthesize_speaker_summaries(
+                quality_segments,
+                speaker_ids=substantive_speakers,
+                content_type=ContentType.MEETING,
+            )
+            if substantive_speakers
+            else []
+        )
+        return {
+            **document,
+            **core,
+            **outcomes,
+            "speaker_summaries": speaker_summaries,
+        }
+
+    def refine_meeting_outcomes(
+        self,
+        document: dict[str, Any],
+        segments: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        del document
+        outcome_fields = ("decisions", "actions", "risks", "open_questions")
+        outcome_schema = {
+            "type": "object",
+            "properties": {
+                key: json.loads(json.dumps(DOCUMENT_JSON_SCHEMA["properties"][key]))
+                for key in outcome_fields
+            },
+            "required": list(outcome_fields),
+            "additionalProperties": False,
+        }
+        outcome_prompt = (
+            "你是会议结果核对员。只返回 schema 要求的 JSON，不要解释。decisions 只写会上明确"
+            "确认的范围、机制、时间或取舍；需要同时引用提议和确认时可用 2-3 条 evidence。‘好’"
+            "‘可以’‘确定一下’和阶段介绍本身不是决定，但明确同意暂缓某范围、固定周期机制或确定"
+            "进场日期属于决定。优先检查：当前先做什么、哪些范围明确后置、复盘频率是否固定、进场"
+            "日期是否确认。计划开展访谈、准备资料、创建群组等是 actions，不是 decisions。actions "
+            "只写会后需要执行且可验收的具体动作，保留明确 owner 和"
+            "deadline；注意区分‘进场后的前两周’与‘进场前’，不得写反。阶段目标、愿景、能力内化"
+            "和普通介绍不是待办。已明确会后确认、发送、创建、拉人、准备或提供的事项应写 actions，"
+            "不再保留为 open_questions。risks 只写原文明确指出的风险、依赖或能力边界，说明它影响"
+            "哪个指标或结果，禁止自行补充常见风险。open_questions 只写会议结束仍未回答、也没有"
+            "安排责任动作的问题。没有事实就返回空数组，不得凑数量。纠正明显口误时用事实含义表达，"
+            "不要把错误词原样写进待办。时间只能照录证据中的明确说法；不得给不同事项统一添加"
+            "‘进场前两周’等原文未说明的期限。每项 evidence 只使用下方 segment_id。\n"
+            + _recording_context_prompt(self.recording_context)
+            + "\n与会议结果相关的校订逐字稿：\n"
+            + json.dumps(
+                _meeting_outcome_segments(_meeting_quality_segments(segments)),
+                ensure_ascii=False,
+            )
+        )
+        return _parse_json_object(
+            self._generate(
+                outcome_prompt,
+                format_schema=outcome_schema,
+                model=self.editor_model,
+                num_predict=2048,
+                num_ctx=16384,
+                timeout_seconds=1200,
+            )
+        )
+
     def refine_voice_memo_document(
         self,
         document: dict[str, Any],
@@ -850,6 +998,52 @@ class OllamaStructuringEngine:
             num_ctx=12288,
         )
         return _parse_json_list(response)
+
+    def synthesize_timeline_sections(
+        self,
+        segments: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        windows = _timeline_window_boundaries(segments)
+        positions = {
+            segment["segment_id"]: index
+            for index, segment in enumerate(segments)
+            if isinstance(segment.get("segment_id"), str)
+        }
+        item_schema = _document_json_schema(ContentType.MEETING)["properties"][
+            "timeline_sections"
+        ]["items"]
+        result: list[dict[str, Any]] = []
+        for window in windows:
+            start_index = positions[window["start_segment_id"]]
+            end_index = positions[window["end_segment_id"]]
+            window_segments = segments[start_index : end_index + 1]
+            prompt = (
+                "你是中文录音时间线编辑。只返回一个 JSON 对象，不要解释。请概括下方这个固定连续"
+                "时间窗口，包含具体 title、连贯 summary、0-5 条 details、start_segment_id 和 "
+                "end_segment_id。不得写 Meta 描述或补充原文没有的信息。固定窗口边界：\n"
+                + json.dumps(window, ensure_ascii=False)
+                + "\n本窗口校订逐字稿：\n"
+                + _recording_context_prompt(self.recording_context)
+                + json.dumps(window_segments, ensure_ascii=False)
+            )
+            item = _parse_json_object(
+                self._generate(
+                    prompt,
+                    format_schema=item_schema,
+                    model=self.editor_model,
+                    num_predict=1024,
+                    num_ctx=8192,
+                    timeout_seconds=1200,
+                )
+            )
+            result.append(
+                {
+                    **item,
+                    "start_segment_id": window["start_segment_id"],
+                    "end_segment_id": window["end_segment_id"],
+                }
+            )
+        return result
 
     def synthesize_discussion_threads(
         self,
@@ -1191,6 +1385,79 @@ class StructuringExecutor:
         repaired["discussion_threads"] = []
         return _remap_document_evidence(repaired, aliases=aliases)
 
+    def _repair_meeting_quality(
+        self,
+        document: dict[str, Any],
+        segments: list[dict[str, Any]],
+        *,
+        aliases: dict[str, str],
+    ) -> dict[str, Any] | None:
+        reverse_aliases = {stable: alias for alias, stable in aliases.items()}
+        prompt_document = _remap_document_evidence(
+            {key: value for key, value in document.items() if key != "chapters"},
+            aliases=reverse_aliases,
+        )
+        repaired = self.engine.refine_meeting_document(prompt_document, segments)
+        if not isinstance(repaired, dict):
+            raise StructuringFailed("The meeting quality editor did not return a document.")
+        repaired = _sanitize_quality_evidence_references(
+            repaired,
+            fallback=prompt_document,
+            segment_ids={
+                segment["segment_id"]
+                for segment in segments
+                if isinstance(segment.get("segment_id"), str)
+            },
+        )
+        repaired = _dedupe_document_categories(repaired)
+        repaired = self._repair_speaker_summary_coverage(
+            repaired,
+            segments,
+            content_type=ContentType.MEETING,
+        )
+        # The quality editor may be upgraded independently from an already
+        # accepted document. Keep the chronological digest and discussion
+        # evolution owned by their dedicated synthesis passes instead of
+        # allowing a formatting omission in the editor response to discard
+        # either section.
+        repaired["timeline_sections"] = prompt_document.get("timeline_sections", [])
+        repaired["discussion_threads"] = prompt_document.get("discussion_threads", [])
+        return _remap_document_evidence(repaired, aliases=aliases)
+
+    def _repair_meeting_outcomes(
+        self,
+        document: dict[str, Any],
+        segments: list[dict[str, Any]],
+        *,
+        aliases: dict[str, str],
+    ) -> dict[str, Any]:
+        reverse_aliases = {stable: alias for alias, stable in aliases.items()}
+        prompt_document = _remap_document_evidence(
+            {key: value for key, value in document.items() if key != "chapters"},
+            aliases=reverse_aliases,
+        )
+        outcomes = self.engine.refine_meeting_outcomes(prompt_document, segments)
+        if not isinstance(outcomes, dict):
+            raise StructuringFailed("The meeting outcome editor did not return a document.")
+        repaired = {
+            **prompt_document,
+            **{
+                key: outcomes.get(key, [])
+                for key in ("decisions", "actions", "risks", "open_questions")
+            },
+        }
+        repaired = _sanitize_quality_evidence_references(
+            repaired,
+            fallback=prompt_document,
+            segment_ids={
+                segment["segment_id"]
+                for segment in segments
+                if isinstance(segment.get("segment_id"), str)
+            },
+        )
+        repaired = _dedupe_document_categories(repaired)
+        return _remap_document_evidence(repaired, aliases=aliases)
+
     def _repair_voice_memo_quality(
         self,
         document: dict[str, Any],
@@ -1230,16 +1497,49 @@ class StructuringExecutor:
         )
         if not isinstance(document, dict):
             return document
-        result = dict(document)
+        result = self._repair_timeline_coverage(dict(document), segments)
         if content_type not in {ContentType.INTERVIEW, ContentType.MEETING}:
             result["discussion_threads"] = []
             return result
-        raw_summaries = document.get("speaker_summaries")
+        result = self._repair_speaker_summary_coverage(
+            result,
+            segments,
+            content_type=content_type,
+        )
+        if content_type is ContentType.INTERVIEW:
+            result["discussion_threads"] = []
+            return result
+        result["discussion_threads"] = self.engine.synthesize_discussion_threads(
+            segments,
+            content_type=content_type,
+        )
+        result["decisions"] = self.engine.reconcile_decisions(
+            result,
+            segments,
+            content_type=content_type,
+        )
+        return result
+
+    def _repair_speaker_summary_coverage(
+        self,
+        document: dict[str, Any],
+        segments: list[dict[str, Any]],
+        *,
+        content_type: ContentType,
+    ) -> dict[str, Any]:
+        result = dict(document)
+        raw_summaries = result.get("speaker_summaries")
         if not isinstance(raw_summaries, list):
-            return document
+            return result
         segment_speakers = {
             segment.get("segment_id"): segment.get("speaker_id") for segment in segments
         }
+        substantive = _substantive_speaker_ids_from_payload(segments)
+        raw_summaries = _repair_speaker_supplement_evidence(
+            raw_summaries,
+            expected_speaker_ids=substantive,
+            segments=segments,
+        )
         grounded_summaries = [
             item
             for item in raw_summaries
@@ -1256,7 +1556,6 @@ class StructuringExecutor:
             for item in grounded_summaries
             if isinstance(item, dict) and isinstance(item.get("speaker_id"), str)
         }
-        substantive = _substantive_speaker_ids_from_payload(segments)
         missing = sorted(substantive - present)
         if missing:
             relevant = [
@@ -1269,29 +1568,79 @@ class StructuringExecutor:
                 speaker_ids=missing,
                 content_type=content_type,
             )
-            supplemented_ids = [
-                item.get("speaker_id") for item in supplements if isinstance(item, dict)
-            ]
-            if len(supplements) != len(missing) or set(supplemented_ids) != set(missing):
+            supplements = _repair_speaker_supplement_evidence(
+                supplements,
+                expected_speaker_ids=set(missing),
+                segments=segments,
+            )
+            supplements_by_id = _grounded_speaker_summaries(
+                supplements,
+                expected_speaker_ids=set(missing),
+                segment_speakers=segment_speakers,
+            )
+            for speaker_id in missing:
+                if speaker_id in supplements_by_id:
+                    continue
+                speaker_segments = [
+                    segment
+                    for index, segment in enumerate(segments)
+                    if index < 8 or segment.get("speaker_id") == speaker_id
+                ]
+                individual = self.engine.synthesize_speaker_summaries(
+                    speaker_segments,
+                    speaker_ids=[speaker_id],
+                    content_type=content_type,
+                )
+                individual = _repair_speaker_supplement_evidence(
+                    individual,
+                    expected_speaker_ids={speaker_id},
+                    segments=speaker_segments,
+                )
+                supplements_by_id.update(
+                    _grounded_speaker_summaries(
+                        individual,
+                        expected_speaker_ids={speaker_id},
+                        segment_speakers=segment_speakers,
+                    )
+                )
+            if set(supplements_by_id) != set(missing):
                 raise StructuringFailed(
                     "The speaker supplement did not cover the requested speakers."
                 )
-            result["speaker_summaries"] = [*grounded_summaries, *supplements]
+            result["speaker_summaries"] = [
+                *grounded_summaries,
+                *(supplements_by_id[speaker_id] for speaker_id in missing),
+            ]
         else:
             result["speaker_summaries"] = grounded_summaries
-        if content_type is ContentType.INTERVIEW:
-            result["discussion_threads"] = []
-            return result
-        result["discussion_threads"] = self.engine.synthesize_discussion_threads(
-            segments,
-            content_type=content_type,
-        )
-        result["decisions"] = self.engine.reconcile_decisions(
-            result,
-            segments,
-            content_type=content_type,
-        )
         return result
+
+    def _repair_timeline_coverage(
+        self,
+        document: dict[str, Any],
+        segments: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        ordered_segment_ids = [
+            segment_id
+            for segment in segments
+            if isinstance((segment_id := segment.get("segment_id")), str)
+        ]
+        if _timeline_starts_cover_recording(
+            document.get("timeline_sections"),
+            ordered_segment_ids=ordered_segment_ids,
+            segments=segments,
+        ):
+            return document
+        repaired = self.engine.synthesize_timeline_sections(segments)
+        if not _timeline_starts_cover_recording(
+            repaired,
+            ordered_segment_ids=ordered_segment_ids,
+            segments=segments,
+        ):
+            raise StructuringFailed(
+                "The timeline repair did not cover the complete recording."
+            )
+        return {**document, "timeline_sections": repaired}
 
     def _upgrade_document_discussion_threads(
         self,
@@ -1527,7 +1876,10 @@ class StructuringExecutor:
                 batch_results.append(batch_result)
             findings = _merge_findings(batch_results)
             document: dict[str, Any] | None = None
+            document_candidate: dict[str, Any] | None = None
             document_error: str | None = None
+            document_validation_error: str | None = None
+            meeting_quality_repaired = False
             interview_quality_repaired = False
             voice_memo_quality_repaired = False
             if transcribed:
@@ -1537,12 +1889,15 @@ class StructuringExecutor:
                         transcribed,
                         transcript_edits=transcript_edit_map,
                     )
+                    candidate = self._synthesize_document_with_speaker_coverage(
+                        finding_payload,
+                        synthesis_payload,
+                        content_type=classification.type,
+                    )
+                    if isinstance(candidate, dict):
+                        document_candidate = candidate
                     base_document = _remap_document_evidence(
-                        self._synthesize_document_with_speaker_coverage(
-                            finding_payload,
-                            synthesis_payload,
-                            content_type=classification.type,
-                        ),
+                        candidate,
                         aliases=evidence_aliases,
                     )
                     repaired_document = self._repair_scene_coverage(
@@ -1554,7 +1909,13 @@ class StructuringExecutor:
                         segment_starts=segment_starts,
                     )
                     quality_document = (
-                        self._repair_interview_quality(
+                        self._repair_meeting_quality(
+                            repaired_document,
+                            synthesis_payload,
+                            aliases=evidence_aliases,
+                        )
+                        if classification.type is ContentType.MEETING
+                        else self._repair_interview_quality(
                             repaired_document,
                             synthesis_payload,
                             aliases=evidence_aliases,
@@ -1580,6 +1941,10 @@ class StructuringExecutor:
                             segment_speakers=segment_speakers,
                             segment_starts=segment_starts,
                         )
+                        meeting_quality_repaired = (
+                            quality_document is not None
+                            and classification.type is ContentType.MEETING
+                        )
                         interview_quality_repaired = (
                             quality_document is not None
                             and classification.type is ContentType.INTERVIEW
@@ -1589,8 +1954,14 @@ class StructuringExecutor:
                             and classification.type is ContentType.VOICE_MEMO
                         )
                     except StructuringFailed:
+                        meeting_quality_repaired = False
                         interview_quality_repaired = False
                         voice_memo_quality_repaired = False
+                        if (
+                            classification.type is ContentType.MEETING
+                            and quality_document is not None
+                        ):
+                            raise
                         try:
                             document = _validate_document(
                                 repaired_document,
@@ -1615,6 +1986,9 @@ class StructuringExecutor:
                             )
                 except Exception as exc:
                     document_error = type(exc).__name__
+                    document_validation_error = (
+                        str(exc)[:500] if isinstance(exc, StructuringFailed) else None
+                    )
                     unavailable_reasons.append(document_error)
             unavailable_reason = (
                 ",".join(dict.fromkeys(unavailable_reasons)) if unavailable_reasons else None
@@ -1644,6 +2018,9 @@ class StructuringExecutor:
                     if classification.type is not ContentType.MEETING
                     else None
                 ),
+                "meeting_quality_repair_version": (
+                    MEETING_QUALITY_REPAIR_VERSION if meeting_quality_repaired else None
+                ),
                 "interview_quality_repair_version": (
                     INTERVIEW_QUALITY_REPAIR_VERSION if interview_quality_repaired else None
                 ),
@@ -1652,6 +2029,10 @@ class StructuringExecutor:
                 ),
                 "batch_results": batch_results,
                 "document": document,
+                "document_candidate": (
+                    document_candidate if document_error is not None else None
+                ),
+                "document_validation_error": document_validation_error,
                 "document_unavailable_reason_code": document_error,
                 "transcript_edit_results": transcript_edit_results,
             }
@@ -1686,6 +2067,9 @@ class StructuringExecutor:
                     "content_traits": list(classification.traits),
                     "content_confidence": classification.confidence,
                     "scene_coverage_repair_version": raw_payload["scene_coverage_repair_version"],
+                    "meeting_quality_repair_version": raw_payload[
+                        "meeting_quality_repair_version"
+                    ],
                     "interview_quality_repair_version": raw_payload[
                         "interview_quality_repair_version"
                     ],
@@ -1821,6 +2205,13 @@ class StructuringExecutor:
         recording_context_changed = raw_payload.get(
             "recording_context_sha256"
         ) != recording_context_sha256(recording_context)
+        if (
+            raw_payload.get("document_candidate_stage") == "quality_editor"
+            and not isinstance(raw_payload.get("document_candidate"), dict)
+        ):
+            recovered_candidate = self._load_latest_quality_candidate(job_id)
+            if recovered_candidate is not None:
+                raw_payload["document_candidate"] = recovered_candidate
         if not isinstance(raw_payload.get("document"), dict) and isinstance(
             raw_payload.get("document_candidate"), dict
         ):
@@ -1915,16 +2306,72 @@ class StructuringExecutor:
         document_candidate: dict[str, Any] | None = None
         document_error: str | None = None
         document_validation_error: str | None = None
+        document_candidate_stage = raw_payload.get("document_candidate_stage")
+        meeting_quality_repair_version = raw_payload.get("meeting_quality_repair_version")
+        meeting_outcome_repair_version = raw_payload.get("meeting_outcome_repair_version")
         interview_quality_repair_version = raw_payload.get("interview_quality_repair_version")
         voice_memo_quality_repair_version = raw_payload.get("voice_memo_quality_repair_version")
         try:
             if (
+                document_candidate_stage == "quality_editor"
+                and isinstance(raw_payload.get("document_candidate"), dict)
+                and not (
+                    recording_context_changed
+                    or content_type_changed
+                    or extraction_type_changed
+                    or manual_corrections_changed
+                )
+            ):
+                candidate = _remap_document_evidence(
+                    raw_payload["document_candidate"],
+                    aliases={stable: alias for alias, stable in evidence_aliases.items()},
+                )
+                candidate = _sanitize_quality_evidence_references(
+                    candidate,
+                    fallback=candidate,
+                    segment_ids={segment["segment_id"] for segment in synthesis_payload},
+                )
+                candidate = _dedupe_document_categories(candidate)
+                document_candidate = candidate
+                candidate = self._repair_speaker_summary_coverage(
+                    candidate,
+                    synthesis_payload,
+                    content_type=classification.type,
+                )
+                if classification.type is ContentType.MEETING:
+                    meeting_quality_repair_version = MEETING_QUALITY_REPAIR_VERSION
+            elif (
                 recording_context_changed
                 or content_type_changed
                 or extraction_type_changed
                 or manual_corrections_changed
             ):
                 candidate = None
+            elif raw_payload.get("document_recovery_source") == (
+                "structuring_document_candidate"
+            ) and isinstance(raw_payload.get("document"), dict):
+                candidate = {
+                    key: value
+                    for key, value in raw_payload["document"].items()
+                    if key != "chapters"
+                }
+            elif isinstance(raw_payload.get("document"), dict) and not (
+                _timeline_starts_cover_recording(
+                    raw_payload["document"].get("timeline_sections"),
+                    ordered_segment_ids=[
+                        segment["segment_id"] for segment in synthesis_payload
+                    ],
+                    segments=synthesis_payload,
+                )
+            ):
+                candidate = _remap_document_evidence(
+                    {
+                        key: value
+                        for key, value in raw_payload["document"].items()
+                        if key != "chapters"
+                    },
+                    aliases={stable: alias for alias, stable in evidence_aliases.items()},
+                )
             elif raw_payload.get("prompt_version") in {
                 "2026-08-01.13",
                 "2026-08-01.14",
@@ -1961,6 +2408,8 @@ class StructuringExecutor:
                     synthesis_payload,
                     content_type=classification.type,
                 )
+            elif isinstance(candidate, dict):
+                candidate = self._repair_timeline_coverage(candidate, synthesis_payload)
             if isinstance(candidate, dict):
                 document_candidate = candidate
             base_document = _remap_document_evidence(
@@ -1980,6 +2429,10 @@ class StructuringExecutor:
                 or raw_payload.get("scene_coverage_repair_version") != SCENE_COVERAGE_REPAIR_VERSION
                 else base_document
             )
+            should_repair_meeting = classification.type is ContentType.MEETING and (
+                document_was_resynthesized
+                or meeting_quality_repair_version != MEETING_QUALITY_REPAIR_VERSION
+            )
             should_repair_interview = classification.type is ContentType.INTERVIEW and (
                 document_was_resynthesized
                 or interview_quality_repair_version != INTERVIEW_QUALITY_REPAIR_VERSION
@@ -1989,7 +2442,13 @@ class StructuringExecutor:
                 or voice_memo_quality_repair_version != VOICE_MEMO_QUALITY_REPAIR_VERSION
             )
             quality_document = (
-                self._repair_interview_quality(
+                self._repair_meeting_quality(
+                    repaired_document,
+                    synthesis_payload,
+                    aliases=evidence_aliases,
+                )
+                if should_repair_meeting
+                else self._repair_interview_quality(
                     repaired_document,
                     synthesis_payload,
                     aliases=evidence_aliases,
@@ -2005,6 +2464,24 @@ class StructuringExecutor:
                     else None
                 )
             )
+            outcome_document = (
+                self._repair_meeting_outcomes(
+                    repaired_document,
+                    synthesis_payload,
+                    aliases=evidence_aliases,
+                )
+                if classification.type is ContentType.MEETING
+                and not should_repair_meeting
+                and meeting_outcome_repair_version != MEETING_OUTCOME_REPAIR_VERSION
+                else None
+            )
+            edited_document = quality_document or outcome_document
+            if isinstance(edited_document, dict):
+                # Retain the exact editor candidate when validation fails so a
+                # downstream-only retry can diagnose or deterministically
+                # repair it without touching immutable ASR evidence.
+                document_candidate = edited_document
+                document_candidate_stage = "quality_editor"
             validation_kwargs = {
                 "segment_ids": {segment.segment_id for segment in segments},
                 "speaker_ids": speaker_ids,
@@ -2015,17 +2492,24 @@ class StructuringExecutor:
             }
             try:
                 document = _validate_document(
-                    quality_document or repaired_document,
+                    edited_document or repaired_document,
                     **validation_kwargs,
                 )
                 if quality_document is not None:
-                    if classification.type is ContentType.INTERVIEW:
+                    if classification.type is ContentType.MEETING:
+                        meeting_quality_repair_version = MEETING_QUALITY_REPAIR_VERSION
+                        meeting_outcome_repair_version = MEETING_OUTCOME_REPAIR_VERSION
+                    elif classification.type is ContentType.INTERVIEW:
                         interview_quality_repair_version = INTERVIEW_QUALITY_REPAIR_VERSION
                     elif classification.type is ContentType.VOICE_MEMO:
                         voice_memo_quality_repair_version = VOICE_MEMO_QUALITY_REPAIR_VERSION
+                elif outcome_document is not None:
+                    meeting_outcome_repair_version = MEETING_OUTCOME_REPAIR_VERSION
             except StructuringFailed:
-                if quality_document is not None:
-                    if classification.type is ContentType.INTERVIEW:
+                if edited_document is not None:
+                    if classification.type is ContentType.MEETING:
+                        raise
+                    elif classification.type is ContentType.INTERVIEW:
                         interview_quality_repair_version = None
                     elif classification.type is ContentType.VOICE_MEMO:
                         voice_memo_quality_repair_version = None
@@ -2054,6 +2538,9 @@ class StructuringExecutor:
         raw_payload["document_candidate"] = (
             document_candidate if document_error is not None else None
         )
+        raw_payload["document_candidate_stage"] = (
+            document_candidate_stage if document_error is not None else None
+        )
         raw_payload["document_validation_error"] = document_validation_error
         raw_payload["schema_version"] = STRUCTURING_RAW_SCHEMA_VERSION
         raw_payload["prompt_version"] = NOTE_PROMPT_VERSION
@@ -2066,6 +2553,16 @@ class StructuringExecutor:
         raw_payload["scene_coverage_repair_version"] = (
             SCENE_COVERAGE_REPAIR_VERSION
             if classification.type is not ContentType.MEETING
+            else None
+        )
+        raw_payload["meeting_quality_repair_version"] = (
+            meeting_quality_repair_version
+            if classification.type is ContentType.MEETING
+            else None
+        )
+        raw_payload["meeting_outcome_repair_version"] = (
+            meeting_outcome_repair_version
+            if classification.type is ContentType.MEETING
             else None
         )
         raw_payload["interview_quality_repair_version"] = (
@@ -2109,6 +2606,9 @@ class StructuringExecutor:
                 "content_traits": list(classification.traits),
                 "content_confidence": classification.confidence,
                 "scene_coverage_repair_version": raw_payload["scene_coverage_repair_version"],
+                "meeting_quality_repair_version": raw_payload[
+                    "meeting_quality_repair_version"
+                ],
                 "interview_quality_repair_version": raw_payload["interview_quality_repair_version"],
                 "voice_memo_quality_repair_version": raw_payload[
                     "voice_memo_quality_repair_version"
@@ -2614,7 +3114,7 @@ class StructuringExecutor:
             )
             segments.extend(snapshot.stable_segments)
             if not snapshot.has_more_segments:
-                return segments
+                return chronological_segments(segments)
             if snapshot.next_after_segment_sequence <= after_sequence:
                 raise StructuringFailed("Transcript pagination did not advance during structuring.")
             after_sequence = snapshot.next_after_segment_sequence
@@ -2673,6 +3173,37 @@ class StructuringExecutor:
         if not isinstance(payload, dict):
             raise UploadStorageError("Private structuring evidence is not an object.")
         return payload
+
+    def _load_latest_quality_candidate(self, job_id: str) -> dict[str, Any] | None:
+        """Recover the newest durable editor candidate after a failed local repair."""
+
+        root = self.store.get_job_stage_directory(
+            job_id,
+            stage="structuring_raw",
+        ).resolve()
+        paths = sorted(
+            root.glob("structuring-*.json"),
+            key=lambda path: path.stat().st_mtime_ns,
+            reverse=True,
+        )
+        for path in paths:
+            if path.is_symlink() or not path.is_file():
+                continue
+            try:
+                content = path.read_bytes()
+                expected_prefix = path.stem.removeprefix("structuring-")
+                if hashlib.sha256(content).hexdigest()[:16] != expected_prefix:
+                    continue
+                payload = json.loads(content)
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if (
+                isinstance(payload, dict)
+                and payload.get("document_candidate_stage") == "quality_editor"
+                and isinstance(payload.get("document_candidate"), dict)
+            ):
+                return payload["document_candidate"]
+        return None
 
 
 def _segment_payload(
@@ -2752,6 +3283,97 @@ def _synthesis_segment_payload(
     return payload, aliases
 
 
+def _meeting_quality_segments(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Remove oral hand-offs while retaining concrete short confirmations."""
+
+    filler = {
+        "好",
+        "好的",
+        "可以",
+        "可以的",
+        "对",
+        "对的",
+        "嗯",
+        "嗯嗯",
+        "没问题",
+        "继续",
+        "谢谢",
+    }
+    retained: list[dict[str, Any]] = []
+    for segment in segments:
+        text = str(segment.get("text") or "").strip(" ，。！？!?\t\n")
+        if not text or text in filler:
+            continue
+        if len(text) < 6 and not any(character.isdigit() for character in text):
+            continue
+        retained.append(
+            {
+                "segment_id": segment.get("segment_id"),
+                "start_ms": segment.get("start_ms"),
+                "speaker_id": segment.get("speaker_id"),
+                "text": text,
+            }
+        )
+    return retained
+
+
+def _meeting_outcome_segments(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Select the discussion and explicit commitment evidence for outcome review."""
+
+    if not segments:
+        return []
+    markers = (
+        "决定",
+        "确认",
+        "确定",
+        "共识",
+        "同意",
+        "下周",
+        "周一",
+        "每周",
+        "会后",
+        "准备",
+        "需要",
+        "必须",
+        "安排",
+        "负责",
+        "风险",
+        "依赖",
+        "问题",
+        "以后再说",
+        "后面阶段",
+        "第一阶段",
+        "第二阶段",
+        "验收",
+        "提前",
+        "发给",
+        "沟通群",
+        "工作组",
+        "组织架构",
+        "账号",
+        "权限",
+        "资源",
+        "草稿",
+        "外协试点",
+        "工作台",
+        "周报",
+        "进度表",
+    )
+    selected: set[int] = set()
+    for index, segment in enumerate(segments):
+        if any(marker in segment["text"] for marker in markers):
+            selected.update(
+                neighbor
+                for neighbor in (index - 1, index, index + 1)
+                if 0 <= neighbor < len(segments)
+            )
+    return [
+        segment
+        for index, segment in enumerate(segments)
+        if index in selected
+    ]
+
+
 def _substantive_speaker_ids_from_payload(
     segments: list[dict[str, Any]],
 ) -> set[str]:
@@ -2768,6 +3390,188 @@ def _substantive_speaker_ids_from_payload(
         for speaker_id, character_count in character_counts.items()
         if character_count >= 500
     }
+
+
+def _grounded_speaker_summaries(
+    items: Any,
+    *,
+    expected_speaker_ids: set[str],
+    segment_speakers: dict[Any, Any],
+) -> dict[str, dict[str, Any]]:
+    """Keep one structurally complete, self-grounded summary per requested speaker."""
+
+    summaries: dict[str, dict[str, Any]] = {}
+    if not isinstance(items, list):
+        return summaries
+    required_fields = {
+        "speaker_id",
+        "display_name",
+        "affiliation",
+        "role",
+        "summary",
+        "evidence",
+    }
+    for item in items:
+        if not isinstance(item, dict) or set(item) != required_fields:
+            continue
+        speaker_id = item.get("speaker_id")
+        evidence = item.get("evidence")
+        if (
+            not isinstance(speaker_id, str)
+            or speaker_id not in expected_speaker_ids
+            or speaker_id in summaries
+            or not isinstance(evidence, list)
+            or not any(segment_speakers.get(segment_id) == speaker_id for segment_id in evidence)
+        ):
+            continue
+        summaries[speaker_id] = dict(item)
+    return summaries
+
+
+def _repair_speaker_supplement_evidence(
+    items: Any,
+    *,
+    expected_speaker_ids: set[str],
+    segments: list[dict[str, Any]],
+) -> Any:
+    """Attach a requested participant's own statement to model supplements."""
+
+    if not isinstance(items, list):
+        return items
+    segment_speakers = {
+        segment.get("segment_id"): segment.get("speaker_id") for segment in segments
+    }
+    own_segments: dict[str, list[dict[str, Any]]] = {}
+    for segment in segments:
+        speaker_id = segment.get("speaker_id")
+        segment_id = segment.get("segment_id")
+        if speaker_id in expected_speaker_ids and isinstance(segment_id, str):
+            own_segments.setdefault(speaker_id, []).append(segment)
+    repaired: list[Any] = []
+    for item in items:
+        if not isinstance(item, dict):
+            repaired.append(item)
+            continue
+        speaker_id = item.get("speaker_id")
+        if speaker_id not in expected_speaker_ids:
+            repaired.append(item)
+            continue
+        evidence = item.get("evidence") if isinstance(item.get("evidence"), list) else []
+        grounded = [
+            segment_id
+            for segment_id in evidence
+            if segment_speakers.get(segment_id) == speaker_id
+        ]
+        if not grounded:
+            summary_characters = set(str(item.get("summary") or ""))
+            ranked = sorted(
+                own_segments.get(speaker_id, []),
+                key=lambda segment: (
+                    len(summary_characters & set(str(segment.get("text") or ""))),
+                    len(str(segment.get("text") or "")),
+                ),
+                reverse=True,
+            )
+            grounded = [
+                segment["segment_id"]
+                for segment in ranked[:1]
+                if isinstance(segment.get("segment_id"), str)
+            ]
+        repaired.append({**item, "evidence": grounded[:MAX_DOCUMENT_EVIDENCE_ITEMS]})
+    return repaired
+
+
+def _timeline_starts_cover_recording(
+    value: Any,
+    *,
+    ordered_segment_ids: list[str],
+    segments: list[dict[str, Any]],
+) -> bool:
+    if not ordered_segment_ids or not isinstance(value, list) or not value:
+        return False
+    order = {segment_id: index for index, segment_id in enumerate(ordered_segment_ids)}
+    starts: list[int] = []
+    for item in value:
+        if not isinstance(item, dict):
+            return False
+        start_index = order.get(item.get("start_segment_id"))
+        if start_index is None:
+            return False
+        starts.append(start_index)
+    if not (
+        starts[0] == 0
+        and all(current > previous for previous, current in zip(starts, starts[1:], strict=False))
+    ):
+        return False
+    windows = _timeline_window_boundaries(segments)
+    if not windows:
+        return True
+    expected_starts = [order[window["start_segment_id"]] for window in windows]
+    return starts == expected_starts
+
+
+def _timeline_window_boundaries(
+    segments: list[dict[str, Any]],
+) -> list[dict[str, str]]:
+    timed = [
+        segment
+        for segment in segments
+        if isinstance(segment.get("segment_id"), str)
+        and isinstance(segment.get("start_ms"), int)
+    ]
+    if not timed:
+        return []
+    minimum_ms = 3 * 60 * 1000
+    target_ms = 5 * 60 * 1000
+    maximum_ms = 8 * 60 * 1000
+    windows: list[dict[str, str]] = []
+    start_index = 0
+    recording_end_ms = (
+        timed[-1]["end_ms"]
+        if isinstance(timed[-1].get("end_ms"), int)
+        else timed[-1]["start_ms"]
+    )
+    while start_index < len(timed):
+        start_ms = timed[start_index]["start_ms"]
+        if recording_end_ms - start_ms <= maximum_ms:
+            end_index = len(timed) - 1
+        else:
+            candidates = [
+                index
+                for index in range(start_index + 1, len(timed))
+                if minimum_ms <= timed[index]["start_ms"] - start_ms <= maximum_ms
+            ]
+            if candidates:
+                cut_index = max(
+                    candidates,
+                    key=lambda index: (
+                        timed[index]["start_ms"]
+                        - (
+                            timed[index - 1]["end_ms"]
+                            if isinstance(timed[index - 1].get("end_ms"), int)
+                            else timed[index - 1]["start_ms"]
+                        ),
+                        -abs((timed[index]["start_ms"] - start_ms) - target_ms),
+                    ),
+                )
+            else:
+                cut_index = next(
+                    (
+                        index
+                        for index in range(start_index + 1, len(timed))
+                        if timed[index]["start_ms"] - start_ms >= maximum_ms
+                    ),
+                    len(timed),
+                )
+            end_index = max(start_index, cut_index - 1)
+        windows.append(
+            {
+                "start_segment_id": timed[start_index]["segment_id"],
+                "end_segment_id": timed[end_index]["segment_id"],
+            }
+        )
+        start_index = end_index + 1
+    return windows
 
 
 def _remap_document_evidence(value: Any, *, aliases: dict[str, str]) -> Any:
@@ -3099,6 +3903,12 @@ def _validate_document(
         segment_ids=segment_ids,
         field="summary",
     )
+    if content_type is ContentType.MEETING:
+        summary["text"] = _remove_unsupported_meeting_host_claim(
+            summary["text"],
+            summary["evidence"],
+            segment_texts,
+        )
     if content_type is ContentType.INTERVIEW:
         summary["text"] = _remove_unsupported_interview_inferences(
             summary["text"],
@@ -3176,6 +3986,10 @@ def _validate_document(
         decision
         for decision in decisions
         if _decision_has_confirmation_evidence(decision["evidence"], segment_texts)
+        and not (
+            content_type is ContentType.MEETING
+            and _meeting_decision_is_operational_action(decision["text"])
+        )
     ]
     if not decisions:
         summary["text"] = _remove_unsupported_decision_claims(summary["text"])
@@ -3253,13 +4067,16 @@ def _validate_document(
     raw_scene_sections = raw.get("scene_sections")
     scene_sections: list[dict[str, Any]] = []
     if raw_scene_sections is not None:
-        if (
+        if not allowed_scene_kinds and raw_scene_sections == []:
+            raw_scene_sections = None
+        elif (
             not allowed_scene_kinds
             or not isinstance(raw_scene_sections, list)
             or not raw_scene_sections
             or len(raw_scene_sections) > 12
         ):
             raise StructuringFailed("The structured document has invalid scene sections.")
+    if raw_scene_sections is not None:
         for index, item in enumerate(raw_scene_sections):
             if not isinstance(item, dict) or set(item) != {
                 "kind",
@@ -3400,22 +4217,23 @@ def _validate_document(
         initial_latest = max(
             segment_starts[segment_id] for segment_id in initial_position["evidence"]
         )
+        developments.sort(
+            key=lambda development: max(
+                segment_starts[segment_id] for segment_id in development["evidence"]
+            )
+        )
         prior_latest = initial_latest
+        developments_are_chronological = True
         for development in developments:
             development_latest = max(
                 segment_starts[segment_id] for segment_id in development["evidence"]
             )
             if development_latest <= prior_latest:
-                raise StructuringFailed(
-                    "The discussion developments are not in transcript order.",
-                    details={
-                        "thread_index": index,
-                        "prior_latest_ms": prior_latest,
-                        "development_latest_ms": development_latest,
-                        "development_evidence": development["evidence"],
-                    },
-                )
+                developments_are_chronological = False
+                break
             prior_latest = development_latest
+        if not developments_are_chronological:
+            continue
         current_direction["evidence"] = _extend_with_latest_topic_evidence(
             title=thread_title,
             initial_position=initial_position,
@@ -3511,13 +4329,21 @@ def _validate_document(
             field=f"speaker_summaries[{index}].role",
             maximum=300,
         )
+        summary_text = _validate_document_text(
+            item.get("summary"),
+            field=f"speaker_summaries[{index}].summary",
+            maximum=MAX_DOCUMENT_TEXT_CHARACTERS,
+        )
+        grounded_display_name = bool(
+            not display_name
+            or _literal_is_grounded(display_name, speaker_evidence, segment_texts)
+        )
         speaker_summaries.append(
             {
                 "speaker_id": speaker_id,
                 "display_name": (
                     display_name
-                    if not display_name
-                    or _literal_is_grounded(display_name, speaker_evidence, segment_texts)
+                    if grounded_display_name
                     else ""
                 ),
                 "affiliation": (
@@ -3531,10 +4357,10 @@ def _validate_document(
                     if not role or _literal_is_grounded(role, speaker_evidence, segment_texts)
                     else ""
                 ),
-                "summary": _validate_document_text(
-                    item.get("summary"),
-                    field=f"speaker_summaries[{index}].summary",
-                    maximum=MAX_DOCUMENT_TEXT_CHARACTERS,
+                "summary": (
+                    summary_text
+                    if grounded_display_name and display_name
+                    else _remove_ungrounded_speaker_name(summary_text)
                 ),
                 "evidence": speaker_evidence,
             }
@@ -3609,6 +4435,9 @@ def _validate_document(
         if content_type is ContentType.GENERIC:
             if not _generic_action_is_explicit(task, action_evidence, segment_texts):
                 continue
+        elif content_type is ContentType.MEETING:
+            if not _meeting_action_is_concrete(task):
+                continue
         elif content_type in {
             ContentType.INTERVIEW,
             ContentType.SPEECH,
@@ -3632,6 +4461,12 @@ def _validate_document(
             segment_texts=segment_texts,
             segment_starts=segment_starts,
         )
+    if content_type is ContentType.MEETING:
+        open_questions = [
+            question
+            for question in open_questions
+            if not _meeting_question_is_covered_by_action(question["text"], actions)
+        ]
 
     if content_type is ContentType.GENERIC:
         title = _normalize_generic_title(title)
@@ -3831,6 +4666,61 @@ def _normalized_document_item(value: str) -> str:
     return "".join(value.strip().rstrip("。；;！？!?").split()).casefold()
 
 
+def _remove_ungrounded_speaker_name(summary: str) -> str:
+    """Avoid asserting a name that was not grounded for an anonymous speaker."""
+
+    result = re.sub(
+        r"^[\u4e00-\u9fff]{2,4}(?:老师|总)?(?=(?:介绍|强调|提到|指出|询问|认为|表示))",
+        "该发言人",
+        summary,
+        count=1,
+    )
+    return re.sub(
+        r"项目实施的[一二三四五六七八九十]+个阶段",
+        "项目实施的阶段安排",
+        result,
+    )
+
+
+def _remove_unsupported_meeting_host_claim(
+    summary: str,
+    evidence: list[str],
+    segment_texts: dict[str, str],
+) -> str:
+    evidence_text = "".join(segment_texts.get(segment_id, "") for segment_id in evidence)
+    if "主持" in evidence_text:
+        return summary
+    return re.sub(r"^本次会议由[^，。]+主持[，。]", "本次会议", summary, count=1)
+
+
+def _dedupe_document_categories(document: dict[str, Any]) -> dict[str, Any]:
+    """Keep one copy when the editor repeats an item across Note categories."""
+
+    result = dict(document)
+    seen: set[str] = set()
+    for category, text_key in (
+        ("decisions", "text"),
+        ("actions", "task"),
+        ("risks", "text"),
+        ("open_questions", "text"),
+    ):
+        items = result.get(category)
+        if not isinstance(items, list):
+            continue
+        retained: list[Any] = []
+        for item in items:
+            if not isinstance(item, dict) or not isinstance(item.get(text_key), str):
+                retained.append(item)
+                continue
+            signature = _normalized_document_item(item[text_key])
+            if signature in seen:
+                continue
+            seen.add(signature)
+            retained.append(item)
+        result[category] = retained
+    return result
+
+
 def _decision_has_confirmation_evidence(
     evidence: list[str],
     segment_texts: dict[str, str],
@@ -3846,10 +4736,80 @@ def _decision_has_confirmation_evidence(
         "定下来",
         "就按",
         "先从",
+        "先做",
+        "先冲",
+        "以后再说",
+        "后面阶段",
+        "每周一次",
+        "进场时间",
+        "周一",
         "好，就",
         "没问题",
     )
     return any(marker in transcript for marker in markers)
+
+
+def _meeting_decision_is_operational_action(text: str) -> bool:
+    return any(
+        marker in text
+        for marker in (
+            "开展访谈",
+            "进行访谈",
+            "准备资料",
+            "准备数据",
+            "创建群",
+            "建立群",
+            "发送",
+            "提供",
+            "整理",
+            "注册账号",
+            "配置权限",
+        )
+    )
+
+
+def _meeting_question_is_covered_by_action(
+    question: str,
+    actions: list[dict[str, Any]],
+) -> bool:
+    core = _normalized_document_item(question)
+    for marker in ("关于", "是否已经", "是否", "已经", "准备好", "明确"):
+        core = core.replace(marker, "")
+    if len(core) < 4:
+        return False
+    return any(
+        core in _normalized_document_item(action["task"])
+        or _normalized_document_item(action["task"]) in core
+        for action in actions
+    )
+
+
+def _meeting_action_is_concrete(task: str) -> bool:
+    return any(
+        marker in task
+        for marker in (
+            "准备",
+            "提供",
+            "发送",
+            "确认",
+            "创建",
+            "建立",
+            "拉入",
+            "加入",
+            "细化",
+            "安排",
+            "选择",
+            "确定",
+            "组织",
+            "注册",
+            "部署",
+            "提交",
+            "整理",
+            "邀请",
+            "召开",
+            "复盘",
+        )
+    )
 
 
 def _action_has_future_evidence(
@@ -5126,6 +6086,72 @@ def _validate_evidence(
     ):
         raise StructuringFailed(f"The structured document has invalid {field}.")
     return list(dict.fromkeys(value))
+
+
+def _sanitize_quality_evidence_references(
+    value: Any,
+    *,
+    fallback: Any,
+    segment_ids: set[str],
+) -> Any:
+    """Keep quality-editor evidence bounded to the supplied transcript.
+
+    Ollama's JSON schema can constrain the evidence shape but cannot express a
+    per-request enum containing every segment identifier. Preserve valid
+    choices, cap them to the artifact contract, and use the already accepted
+    document's evidence when an editor response contains only unknown ids.
+    """
+
+    if isinstance(value, dict):
+        fallback_dict = fallback if isinstance(fallback, dict) else {}
+        repaired: dict[str, Any] = {}
+        for key, item in value.items():
+            fallback_item = fallback_dict.get(key)
+            if key == "evidence":
+                candidates = item if isinstance(item, list) else []
+                valid = [
+                    candidate
+                    for candidate in candidates
+                    if isinstance(candidate, str) and candidate in segment_ids
+                ]
+                valid = list(dict.fromkeys(valid))[:MAX_DOCUMENT_EVIDENCE_ITEMS]
+                if not valid:
+                    fallback_candidates = (
+                        fallback_item if isinstance(fallback_item, list) else []
+                    )
+                    valid = [
+                        candidate
+                        for candidate in fallback_candidates
+                        if isinstance(candidate, str) and candidate in segment_ids
+                    ][:MAX_DOCUMENT_EVIDENCE_ITEMS]
+                repaired[key] = valid
+            else:
+                repaired[key] = _sanitize_quality_evidence_references(
+                    item,
+                    fallback=fallback_item,
+                    segment_ids=segment_ids,
+                )
+        return repaired
+    if isinstance(value, list):
+        fallback_list = fallback if isinstance(fallback, list) else []
+        repaired_items = [
+            _sanitize_quality_evidence_references(
+                item,
+                fallback=(fallback_list[index] if index < len(fallback_list) else None),
+                segment_ids=segment_ids,
+            )
+            for index, item in enumerate(value)
+        ]
+        return [
+            item
+            for item in repaired_items
+            if not (
+                isinstance(item, dict)
+                and "evidence" in item
+                and item.get("evidence") == []
+            )
+        ]
+    return value
 
 
 def _merge_findings(batch_results: list[dict[str, Any]]) -> tuple[Finding, ...]:

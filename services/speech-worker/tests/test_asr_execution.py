@@ -459,6 +459,32 @@ def test_timestamp_tokens_restore_punctuation_and_split_readable_sentences() -> 
     ]
 
 
+def test_zero_duration_sentence_boundary_does_not_overlap_following_text() -> None:
+    chunk = AudioChunkPlan(
+        chunk_index=0,
+        start_frame=0,
+        end_frame=48_000,
+        start_ms=0,
+        end_ms=3000,
+    )
+    payload = {
+        "text": "甲。乙。",
+        "language": "Chinese",
+        "segments": [
+            {"text": "甲", "start": 1.0, "end": 1.0},
+            {"text": "乙", "start": 1.0, "end": 2.0},
+        ],
+    }
+
+    segments = _result_segments(payload, chunk=chunk, source_duration_ms=3000)
+
+    assert [item["text"] for item in segments] == ["甲。", "乙。"]
+    assert [(item["start_ms"], item["end_ms"]) for item in segments] == [
+        (1000, 1001),
+        (1001, 2000),
+    ]
+
+
 def test_short_pause_between_sentences_is_accounted_without_merging_text() -> None:
     chunk = AudioChunkPlan(
         chunk_index=0,

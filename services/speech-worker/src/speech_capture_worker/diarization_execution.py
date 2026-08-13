@@ -41,6 +41,7 @@ from speech_capture_worker.transcript import (
     SpeakerLabelStatus,
     TranscriptOutcome,
     TranscriptSegment,
+    chronological_segments,
 )
 
 DIARIZATION_SCHEMA_VERSION = "1.0.0"
@@ -498,7 +499,7 @@ class SpeakerDiarizationExecutor:
             )
             segments.extend(snapshot.stable_segments)
             if not snapshot.has_more_segments:
-                return segments
+                return chronological_segments(segments)
             if snapshot.next_after_segment_sequence <= after_sequence:
                 raise DiarizationFailed(
                     "Transcript pagination did not advance during speaker diarization."

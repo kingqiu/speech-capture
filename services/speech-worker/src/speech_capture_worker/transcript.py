@@ -64,6 +64,24 @@ class TranscriptSegment:
         return asdict(self)
 
 
+def chronological_segments(
+    segments: list[TranscriptSegment],
+) -> list[TranscriptSegment]:
+    """Return stable transcript outcomes in source-timeline order.
+
+    Snapshot pagination intentionally follows append-only ``segment_sequence``
+    order so clients can reconnect without missing updates. Gap recovery can
+    append a segment whose source time is earlier than already committed text,
+    though, so downstream semantic consumers must not mistake append order for
+    reading order.
+    """
+
+    return sorted(
+        segments,
+        key=lambda value: (value.start_ms, value.end_ms, value.segment_sequence),
+    )
+
+
 @dataclass(frozen=True)
 class ProvisionalTranscript:
     job_id: str

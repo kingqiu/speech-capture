@@ -34,7 +34,11 @@ from speech_capture_worker.structuring_execution import (
     OllamaStructuringEngine,
     StructuringExecutor,
     StructuringOutcome,
+    _dedupe_document_categories,
     _document_json_schema,
+    _repair_speaker_supplement_evidence,
+    _sanitize_quality_evidence_references,
+    _timeline_window_boundaries,
     _validate_document,
 )
 
@@ -156,8 +160,10 @@ class FakeStructuringEngine:
         self.extract_calls = 0
         self.synthesize_calls = 0
         self.speaker_supplement_calls = 0
+        self.timeline_repair_calls = 0
         self.polish_calls = 0
         self.coverage_calls = 0
+        self.meeting_repair_calls = 0
         self.interview_repair_calls = 0
         self.voice_memo_repair_calls = 0
         self.extract_inputs = []
@@ -274,12 +280,31 @@ class FakeStructuringEngine:
             for speaker_id in speaker_ids
         ]
 
+    def synthesize_timeline_sections(self, segments):
+        self.timeline_repair_calls += 1
+        return [
+            {
+                "title": "完整时间线",
+                "summary": "覆盖完整录音。",
+                "details": [],
+                "start_segment_id": segments[0]["segment_id"],
+                "end_segment_id": segments[-1]["segment_id"],
+            }
+        ]
+
     def synthesize_missing_scene_sections(self, document, findings, segments, *, content_type):
         self.coverage_calls += 1
         return [dict(section) for section in self.coverage_sections]
 
     def refine_interview_document(self, document, segments):
         self.interview_repair_calls += 1
+        return dict(document)
+
+    def refine_meeting_document(self, document, segments):
+        self.meeting_repair_calls += 1
+        return dict(document)
+
+    def refine_meeting_outcomes(self, document, segments):
         return dict(document)
 
     def refine_voice_memo_document(self, document, segments):
@@ -305,6 +330,221 @@ class FakeStructuringEngine:
                 text = text.replace(old, new)
             results.append({"segment_id": item["segment_id"], "text": text})
         return results
+
+
+class PartialBatchSpeakerStructuringEngine(FakeStructuringEngine):
+    def __init__(self) -> None:
+        super().__init__()
+        self.speaker_supplement_requests = []
+
+    def synthesize_speaker_summaries(self, segments, *, speaker_ids, content_type):
+        self.speaker_supplement_requests.append(list(speaker_ids))
+        requested = list(speaker_ids)
+        if len(requested) > 1:
+            requested = requested[:-1]
+        return super().synthesize_speaker_summaries(
+            segments,
+            speaker_ids=requested,
+            content_type=content_type,
+        )
+
+
+def test_speaker_supplement_retries_an_omitted_participant_individually() -> None:
+    engine = PartialBatchSpeakerStructuringEngine()
+    executor = object.__new__(StructuringExecutor)
+    executor.engine = engine
+    segments = [
+        {
+            "segment_id": f"segment-{index}",
+            "speaker_id": speaker_id,
+            "text": "有实质内容的发言" * 70,
+        }
+        for index, speaker_id in enumerate(("speaker_01", "speaker_02", "speaker_03"), start=1)
+    ]
+
+    document = executor._synthesize_document_with_speaker_coverage(
+        [],
+        segments,
+        content_type=ContentType.MEETING,
+    )
+
+    assert [item["speaker_id"] for item in document["speaker_summaries"]] == [
+        "speaker_01",
+        "speaker_02",
+        "speaker_03",
+    ]
+    assert engine.speaker_supplement_requests == [
+        ["speaker_01", "speaker_02", "speaker_03"],
+        ["speaker_03"],
+    ]
+
+
+def test_speaker_supplement_repairs_evidence_from_the_wrong_participant() -> None:
+    repaired = _repair_speaker_supplement_evidence(
+        [
+            {
+                "speaker_id": "speaker_02",
+                "display_name": "",
+                "affiliation": "",
+                "role": "",
+                "summary": "重点讨论上线计划。",
+                "evidence": ["seg_other"],
+            }
+        ],
+        expected_speaker_ids={"speaker_02"},
+        segments=[
+            {
+                "segment_id": "seg_other",
+                "speaker_id": "speaker_01",
+                "text": "这是其他人的发言。",
+            },
+            {
+                "segment_id": "seg_own",
+                "speaker_id": "speaker_02",
+                "text": "上线计划需要分批推进。",
+            },
+        ],
+    )
+
+    assert repaired[0]["evidence"] == ["seg_own"]
+
+
+def test_document_synthesis_repairs_a_timeline_that_omits_the_opening() -> None:
+    engine = FakeStructuringEngine()
+    executor = object.__new__(StructuringExecutor)
+    executor.engine = engine
+    segments = [
+        {"segment_id": "s0001", "speaker_id": None, "text": "开场。"},
+        {"segment_id": "s0002", "speaker_id": None, "text": "正文。"},
+    ]
+    document = engine.synthesize_document([], segments, content_type=ContentType.MEETING)
+    document["timeline_sections"][0]["start_segment_id"] = "s0002"
+    engine.synthesize_document = lambda *args, **kwargs: document
+
+    repaired = executor._synthesize_document_with_speaker_coverage(
+        [],
+        segments,
+        content_type=ContentType.MEETING,
+    )
+
+    assert repaired["timeline_sections"][0]["start_segment_id"] == "s0001"
+    assert engine.timeline_repair_calls == 1
+
+
+def test_timeline_windows_cover_a_long_recording_without_an_oversized_tail() -> None:
+    segments = [
+        {
+            "segment_id": f"segment-{minute:02d}",
+            "start_ms": minute * 60_000,
+            "end_ms": minute * 60_000 + 45_000,
+        }
+        for minute in range(40)
+    ]
+
+    windows = _timeline_window_boundaries(segments)
+    positions = {segment["segment_id"]: index for index, segment in enumerate(segments)}
+
+    assert windows[0]["start_segment_id"] == "segment-00"
+    assert windows[-1]["end_segment_id"] == "segment-39"
+    assert all(
+        (
+            segments[positions[window["end_segment_id"]]]["end_ms"]
+            - segments[positions[window["start_segment_id"]]]["start_ms"]
+        )
+        <= 8 * 60_000
+        for window in windows
+    )
+
+
+def test_ollama_timeline_summarizes_each_fixed_window_independently(monkeypatch) -> None:
+    engine = OllamaStructuringEngine(model="qwen3:14b", editor_model="qwen3:8b")
+    segments = [
+        {
+            "segment_id": f"segment-{minute:02d}",
+            "start_ms": minute * 60_000,
+            "end_ms": minute * 60_000 + 45_000,
+            "speaker_id": "speaker_01",
+            "text": f"第 {minute} 分钟的内容。",
+        }
+        for minute in range(12)
+    ]
+    requests = []
+
+    def generate(prompt, **kwargs):
+        requests.append({"prompt": prompt, **kwargs})
+        return json.dumps(
+            {
+                "title": "窗口摘要",
+                "summary": "概括当前窗口。",
+                "details": [],
+                "start_segment_id": "ignored",
+                "end_segment_id": "ignored",
+            },
+            ensure_ascii=False,
+        )
+
+    monkeypatch.setattr(engine, "_generate", generate)
+
+    result = engine.synthesize_timeline_sections(segments)
+    windows = _timeline_window_boundaries(segments)
+
+    assert len(requests) == len(windows)
+    assert [item["start_segment_id"] for item in result] == [
+        window["start_segment_id"] for window in windows
+    ]
+    assert all(request["num_ctx"] == 8192 for request in requests)
+
+
+def test_meeting_validation_drops_a_thread_whose_development_predates_its_initial_state() -> None:
+    engine = FakeStructuringEngine()
+    segments = [
+        {"segment_id": "seg_early", "speaker_id": "speaker_01", "text": "先讨论。"},
+        {"segment_id": "seg_late", "speaker_id": "speaker_01", "text": "后提出方案。"},
+    ]
+    document = engine.synthesize_document([], segments, content_type=ContentType.MEETING)
+    document["discussion_threads"] = [
+        {
+            "title": "时间顺序错误的议题",
+            "initial_position": {"text": "后提出方案。", "evidence": ["seg_late"]},
+            "developments": [{"text": "先讨论。", "evidence": ["seg_early"]}],
+            "current_direction": {"text": "后提出方案。", "evidence": ["seg_late"]},
+            "status": "open",
+        }
+    ]
+
+    validated = _validate_document(
+        document,
+        segment_ids={"seg_early", "seg_late"},
+        speaker_ids={"speaker_01"},
+        content_type=ContentType.MEETING,
+        segment_texts={"seg_early": "先讨论。", "seg_late": "后提出方案。"},
+        segment_speakers={"seg_early": "speaker_01", "seg_late": "speaker_01"},
+        segment_starts={"seg_early": 1_000, "seg_late": 2_000},
+    )
+
+    assert validated["discussion_threads"] == []
+
+
+def test_meeting_document_with_empty_scene_sections_is_revalidatable() -> None:
+    engine = FakeStructuringEngine()
+    segments = [
+        {"segment_id": "seg_one", "speaker_id": "speaker_01", "text": "会议内容。"}
+    ]
+    document = engine.synthesize_document([], segments, content_type=ContentType.MEETING)
+    document["discussion_threads"] = []
+    document["scene_sections"] = []
+
+    validated = _validate_document(
+        document,
+        segment_ids={"seg_one"},
+        speaker_ids={"speaker_01"},
+        content_type=ContentType.MEETING,
+        segment_texts={"seg_one": "会议内容。"},
+        segment_speakers={"seg_one": "speaker_01"},
+        segment_starts={"seg_one": 1_000},
+    )
+
+    assert validated["scene_sections"] == []
 
 
 def create_structuring_job(
@@ -1219,6 +1459,30 @@ def test_ollama_engine_requires_valid_model_name() -> None:
         OllamaStructuringEngine(model="   ")
 
 
+def test_ollama_document_synthesis_retries_truncated_json(monkeypatch) -> None:
+    engine = OllamaStructuringEngine(model="qwen3:14b", editor_model="qwen3:8b")
+    responses = iter(['{"title":"未闭合"', '{"title":"完整文档"}'])
+    requests = []
+
+    def generate(prompt, **kwargs):
+        requests.append({"prompt": prompt, **kwargs})
+        return next(responses)
+
+    monkeypatch.setattr(engine, "_generate", generate)
+
+    document = engine.synthesize_document(
+        [],
+        [{"segment_id": "seg_retry", "text": "完整原文。", "speaker_id": "speaker_1"}],
+        content_type=ContentType.MEETING,
+    )
+
+    assert document == {"title": "完整文档"}
+    assert len(requests) == 2
+    assert requests[0]["num_predict"] == 4608
+    assert requests[1]["num_predict"] == 6144
+    assert "上一次输出未形成完整 JSON" in requests[1]["prompt"]
+
+
 @pytest.mark.parametrize(
     ("content_type", "kind", "label"),
     [
@@ -1282,7 +1546,78 @@ def test_meeting_profile_preserves_approved_document_contract() -> None:
 
     assert "scene_sections" not in schema["properties"]
     assert "topics" in schema["required"]
+    assert "discussion_threads" in schema["required"]
     assert "timeline_sections" in schema["required"]
+
+
+def test_meeting_quality_repair_preserves_dedicated_timeline_and_discussion_sections() -> None:
+    class MeetingEditor:
+        model_id = "meeting-editor"
+
+        def refine_meeting_document(self, document, segments):
+            return {
+                key: value
+                for key, value in document.items()
+                if key not in {"discussion_threads", "timeline_sections"}
+            }
+
+    executor = object.__new__(StructuringExecutor)
+    executor.engine = MeetingEditor()
+    document = {
+        "title": "项目会",
+        "timeline_sections": [{"title": "第一阶段"}],
+        "discussion_threads": [{"title": "方案选择"}],
+    }
+
+    repaired = executor._repair_meeting_quality(document, [], aliases={})
+
+    assert repaired["timeline_sections"] == document["timeline_sections"]
+    assert repaired["discussion_threads"] == document["discussion_threads"]
+
+
+def test_quality_repair_sanitizes_unknown_and_excess_evidence_references() -> None:
+    repaired = _sanitize_quality_evidence_references(
+        {
+            "summary": {
+                "text": "校订后的摘要",
+                "evidence": ["seg_1", "unknown", "seg_2", "seg_3", "seg_4"],
+            },
+            "highlights": [{"text": "要点", "evidence": ["unknown"]}],
+            "decisions": [{"text": "无有效证据的新增决定", "evidence": ["unknown"]}],
+        },
+        fallback={
+            "summary": {"text": "原摘要", "evidence": ["seg_4"]},
+            "highlights": [{"text": "原要点", "evidence": ["seg_2"]}],
+            "decisions": [],
+        },
+        segment_ids={"seg_1", "seg_2", "seg_3", "seg_4"},
+    )
+
+    assert repaired["summary"]["evidence"] == ["seg_1", "seg_2", "seg_3"]
+    assert repaired["highlights"][0]["evidence"] == ["seg_2"]
+    assert repaired["decisions"] == []
+
+
+def test_quality_repair_deduplicates_items_across_note_categories() -> None:
+    repaired = _dedupe_document_categories(
+        {
+            "decisions": [{"text": "按两批上线。", "evidence": ["seg_1"]}],
+            "actions": [
+                {"task": "按两批上线", "owner": "", "deadline": "", "evidence": ["seg_1"]},
+                {"task": "整理清单", "owner": "", "deadline": "", "evidence": ["seg_2"]},
+            ],
+            "risks": [{"text": "容量不足", "evidence": ["seg_3"]}],
+            "open_questions": [
+                {"text": "容量不足。", "evidence": ["seg_3"]},
+                {"text": "何时复核？", "evidence": ["seg_4"]},
+            ],
+        }
+    )
+
+    assert [item["text"] for item in repaired["decisions"]] == ["按两批上线。"]
+    assert [item["task"] for item in repaired["actions"]] == ["整理清单"]
+    assert [item["text"] for item in repaired["risks"]] == ["容量不足"]
+    assert [item["text"] for item in repaired["open_questions"]] == ["何时复核？"]
 
 
 def test_timeline_sections_must_cover_corrected_transcript_continuously() -> None:

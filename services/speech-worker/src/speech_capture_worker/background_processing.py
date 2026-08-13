@@ -31,6 +31,7 @@ from speech_capture_worker.gap_analysis import (
 from speech_capture_worker.gap_retranscription import GapRetranscriptionExecutor
 from speech_capture_worker.gap_speech_activity import (
     GapSpeechActivityAnalyzer,
+    GapSpeechActivityOutcome,
     PyannoteVoiceActivityDetector,
 )
 from speech_capture_worker.job_store import JobStore
@@ -161,7 +162,22 @@ class ContinuousJobExecutor:
             model_revision=VAD_MODEL_REVISION,
             cache_dir=self.data_dir / "models" / "pyannote",
         )
-        GapSpeechActivityAnalyzer(self.store, detector).analyze(job.job_id)
+        speech_activity = GapSpeechActivityAnalyzer(self.store, detector).analyze(job.job_id)
+        if speech_activity.outcome is GapSpeechActivityOutcome.SAFE_PAUSED:
+            current = self.store.get_job(job.job_id)
+            if current.state is JobState.ALIGNING:
+                self.store.transition_job(
+                    job.job_id,
+                    JobState.PAUSED,
+                    expected_revision=current.revision,
+                    reason_code="gap_speech_activity_resource_blocked",
+                    error_code="SPEECH_ACTIVITY_RESOURCE_BLOCKED",
+                    error_message=(
+                        "Worker resources must recover before speech-activity analysis can start."
+                    ),
+                    event_type="resource.safe_paused",
+                )
+            return BackgroundStepOutcome.ADVANCED
         retranscribed = GapRetranscriptionExecutor(
             self.store,
             self._asr_engine(job.model_profile),

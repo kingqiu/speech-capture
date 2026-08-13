@@ -47,6 +47,7 @@ from speech_capture_worker.structuring_execution import (
 from speech_capture_worker.transcript import (
     TranscriptOutcome,
     TranscriptSegment,
+    chronological_segments,
 )
 
 ARTIFACT_SCHEMA_VERSION = "1.6.0"
@@ -462,7 +463,7 @@ class ArtifactGenerator:
             )
             segments.extend(snapshot.stable_segments)
             if not snapshot.has_more_segments:
-                return segments
+                return chronological_segments(segments)
             if snapshot.next_after_segment_sequence <= after_sequence:
                 raise ArtifactGenerationFailed(
                     "Transcript pagination did not advance during artifact generation."
@@ -752,29 +753,10 @@ def _show_transcript_segment(segment: TranscriptSegment) -> bool:
         return duration_ms >= 2000
     if segment.outcome is not TranscriptOutcome.TRANSCRIBED:
         return True
-    if duration_ms <= 10:
-        return False
-    if (
-        segment.language
-        and segment.language.casefold()
-        not in {
-            "chinese",
-            "mandarin",
-            "zh",
-            "zh-cn",
-        }
-        and duration_ms < 1000
-    ):
-        return False
-    if duration_ms < 300 and (segment.text or "").strip("，。！？,.!? ") in {
-        "啊",
-        "嗯",
-        "哎",
-        "呃",
-        "唉",
-    }:
-        return False
-    return True
+    # Every accepted text segment is evidence-addressable in speech-record.json.
+    # Keep the complete corrected transcript equally addressable even when an
+    # alignment fragment is extremely short or its language tag is noisy.
+    return bool((segment.text or "").strip())
 
 
 def _with_legacy_timeline_sections(
@@ -1078,7 +1060,13 @@ def _build_note_markdown(
                     "",
                 ]
             )
+            summary_signature = "".join(topic["summary"].strip().rstrip("。；;").split()).casefold()
             for detail in _unique_evidence_items(topic["details"]):
+                detail_signature = (
+                    "".join(detail["text"].strip().rstrip("。；;").split()).casefold()
+                )
+                if detail_signature in summary_signature:
+                    continue
                 lines.append(
                     f"- {detail['text']}"
                     + _note_evidence_suffix(

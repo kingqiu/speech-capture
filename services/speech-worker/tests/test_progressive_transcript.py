@@ -3,6 +3,7 @@ import json
 import math
 import sqlite3
 import threading
+from dataclasses import replace
 
 import pytest
 
@@ -19,6 +20,7 @@ from speech_capture_worker.transcript import (
     SpeakerLabelStatus,
     TranscriptOutcome,
     TranscriptTimingStatus,
+    chronological_segments,
 )
 
 SOURCE = b"synthetic-progressive-audio"
@@ -84,6 +86,53 @@ def commit_text(
         text=text,
         language="zh",
     )
+
+
+def test_chronological_segments_separates_reading_order_from_append_order(tmp_path) -> None:
+    with JobStore(
+        tmp_path / "worker.sqlite3",
+        source_probe=source_probe,
+    ) as store:
+        job = create_transcribing_job(store, suffix="chronological")
+        first, _ = commit_text(
+            store,
+            job.job_id,
+            key="first",
+            start_ms=0,
+            end_ms=1000,
+            text="第一段",
+        )
+
+    later = replace(
+        first,
+        segment_sequence=2,
+        segment_id="seg_00000002",
+        commit_key="later",
+        start_ms=5000,
+        end_ms=6000,
+    )
+    recovered_gap = replace(
+        first,
+        segment_sequence=3,
+        segment_id="seg_00000003",
+        commit_key="recovered_gap",
+        start_ms=2500,
+        end_ms=3000,
+    )
+    appended = [first, later, recovered_gap]
+
+    ordered = chronological_segments(appended)
+
+    assert [segment.segment_id for segment in ordered] == [
+        "seg_00000001",
+        "seg_00000003",
+        "seg_00000002",
+    ]
+    assert [segment.segment_id for segment in appended] == [
+        "seg_00000001",
+        "seg_00000002",
+        "seg_00000003",
+    ]
 
 
 def test_provisional_tail_is_revision_guarded_idempotent_and_private(tmp_path) -> None:

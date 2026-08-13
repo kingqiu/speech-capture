@@ -30,9 +30,13 @@ from speech_capture_worker.transcript import TranscriptOutcome, TranscriptSegmen
 
 NATURAL_PAUSE_SCHEMA_VERSION = "1.0.0"
 NATURAL_PAUSE_EVIDENCE_TYPE = "combined_natural_pause"
-MAX_BOUNDARY_SPEECH_DURATION_MS = 350
-MAX_BOUNDARY_SPEECH_RATIO = 0.25
-MAX_BOUNDARY_DISTANCE_MS = 350
+MAX_BOUNDARY_SPEECH_DURATION_MS = 500
+MAX_BOUNDARY_SPEECH_RATIO = 0.50
+MAX_BOUNDARY_DISTANCE_MS = 500
+MAX_REJECTED_BOUNDARY_SPEECH_DURATION_MS = 1_000
+MAX_REJECTED_BOUNDARY_SPEECH_RATIO = 0.70
+MAX_REJECTED_BOUNDARY_DISTANCE_MS = 1_000
+BOUNDARY_TOUCH_TOLERANCE_MS = 40
 FAILED_RETRANSCRIPTION_PREFIX = "gap_retranscription_failed_"
 
 
@@ -114,14 +118,20 @@ class NaturalPauseMaterializer:
             if _is_vad_no_speech(evidence):
                 candidates.append((evidence, "VAD_CONFIRMED_NO_SPEECH", None))
                 continue
-            if _boundary_residual_side(evidence, segments=segments) is None:
-                continue
             retranscription = _retranscription_checkpoint(
                 checkpoints,
                 start_ms=range_value[0],
                 end_ms=range_value[1],
             )
-            if retranscription is not None:
+            if (
+                retranscription is not None
+                and _boundary_residual_side(
+                    evidence,
+                    segments=segments,
+                    retranscription=retranscription,
+                )
+                is not None
+            ):
                 candidates.append(
                     (
                         evidence,
@@ -222,6 +232,7 @@ def _boundary_residual_side(
     evidence: dict[str, Any],
     *,
     segments: list[TranscriptSegment],
+    retranscription: CheckpointRecord,
 ) -> str | None:
     start_ms = evidence.get("start_ms")
     end_ms = evidence.get("end_ms")
@@ -235,24 +246,30 @@ def _boundary_residual_side(
         or not _is_int(end_ms)
         or not _is_int(speech_duration_ms)
         or speech_duration_ms <= 0
-        or speech_duration_ms > MAX_BOUNDARY_SPEECH_DURATION_MS
         or not isinstance(speech_ratio, (int, float))
         or isinstance(speech_ratio, bool)
         or speech_ratio <= 0
-        or speech_ratio > MAX_BOUNDARY_SPEECH_RATIO
         or not isinstance(regions, list)
         or not regions
     ):
         return None
-    if any(
-        not isinstance(region, dict)
-        or not _is_int(region.get("start_ms"))
-        or not _is_int(region.get("end_ms"))
-        or region["start_ms"] < start_ms
-        or region["end_ms"] <= region["start_ms"]
-        or region["end_ms"] > end_ms
-        for region in regions
-    ):
+    positive_regions: list[dict[str, int]] = []
+    for region in regions:
+        if (
+            not isinstance(region, dict)
+            or not _is_int(region.get("start_ms"))
+            or not _is_int(region.get("end_ms"))
+            or region["start_ms"] < start_ms
+            or region["end_ms"] < region["start_ms"]
+            or region["end_ms"] > end_ms
+        ):
+            return None
+        # VAD frame-to-millisecond rounding can collapse an edge frame to 0 ms.
+        # It carries no additional speech duration, so ignore only this exact case.
+        if region["end_ms"] == region["start_ms"]:
+            continue
+        positive_regions.append(region)
+    if not positive_regions:
         return None
     previous_touches = any(
         segment.outcome is TranscriptOutcome.TRANSCRIBED and segment.end_ms == start_ms
@@ -262,14 +279,55 @@ def _boundary_residual_side(
         segment.outcome is TranscriptOutcome.TRANSCRIBED and segment.start_ms == end_ms
         for segment in segments
     )
-    if previous_touches and all(
-        region["end_ms"] <= start_ms + MAX_BOUNDARY_DISTANCE_MS for region in regions
-    ):
+    rejected_fragment = (
+        retranscription.checkpoint_key.startswith(BOUNDARY_FRAGMENT_REJECTION_PREFIX)
+        and retranscription.payload.get("reason_code")
+        == "LOW_COVERAGE_BOUNDARY_FRAGMENT"
+    )
+    max_speech_duration_ms = (
+        MAX_REJECTED_BOUNDARY_SPEECH_DURATION_MS
+        if rejected_fragment
+        else MAX_BOUNDARY_SPEECH_DURATION_MS
+    )
+    max_speech_ratio = (
+        MAX_REJECTED_BOUNDARY_SPEECH_RATIO
+        if rejected_fragment
+        else MAX_BOUNDARY_SPEECH_RATIO
+    )
+    max_boundary_distance_ms = (
+        MAX_REJECTED_BOUNDARY_DISTANCE_MS
+        if rejected_fragment
+        else MAX_BOUNDARY_DISTANCE_MS
+    )
+    if end_ms - start_ms <= MAX_BOUNDARY_DISTANCE_MS:
+        max_speech_ratio = 1.0
+    if speech_duration_ms > max_speech_duration_ms or speech_ratio > max_speech_ratio:
+        return None
+
+    sides: set[str] = set()
+    for region in positive_regions:
+        start_residual = (
+            previous_touches
+            and region["start_ms"] <= start_ms + BOUNDARY_TOUCH_TOLERANCE_MS
+            and region["end_ms"] <= start_ms + max_boundary_distance_ms
+        )
+        end_residual = (
+            next_touches
+            and region["end_ms"] >= end_ms - BOUNDARY_TOUCH_TOLERANCE_MS
+            and region["start_ms"] >= end_ms - max_boundary_distance_ms
+        )
+        if not start_residual and not end_residual:
+            return None
+        if start_residual:
+            sides.add("start")
+        if end_residual:
+            sides.add("end")
+    if sides == {"start"}:
         return "start"
-    if next_touches and all(
-        region["start_ms"] >= end_ms - MAX_BOUNDARY_DISTANCE_MS for region in regions
-    ):
+    if sides == {"end"}:
         return "end"
+    if sides == {"start", "end"}:
+        return "both"
     return None
 
 

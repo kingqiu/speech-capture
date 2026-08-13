@@ -517,6 +517,193 @@ def test_natural_pause_refuses_interior_speech_even_after_asr_rejection(tmp_path
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")
+def test_natural_pause_materializes_failed_boundary_residual(tmp_path) -> None:
+    with JobStore(
+        tmp_path / "worker.sqlite3",
+        source_probe=source_probe_for(2),
+    ) as store:
+        job = create_aligning_job_with_gap(
+            store,
+            suffix="failed-boundary-residual",
+            duration_seconds=2,
+        )
+        alignment = next(
+            checkpoint
+            for checkpoint in store.list_checkpoints(job.job_id, stage="aligning")
+            if checkpoint.checkpoint_key == "transcript_alignment_report"
+        )
+        unresolved = alignment.payload["unresolved_ranges"][0]
+        duration_ms = unresolved["end_ms"] - unresolved["start_ms"]
+        store.put_checkpoint(
+            job.job_id,
+            stage="aligning",
+            checkpoint_key="gap_speech_activity_evidence",
+            payload={
+                "schema_version": "1.0.0",
+                "alignment_report_generation": alignment.generation,
+                "alignment_report_sha256": alignment.payload_sha256,
+                "evidence": [
+                    {
+                        **unresolved,
+                        "duration_ms": duration_ms,
+                        "speech_duration_ms": 150,
+                        "speech_ratio": round(150 / duration_ms, 8),
+                        "observation": "speech_detected",
+                        "reason_code": "DETECTOR_RETURNED_SPEECH_REGIONS",
+                        "materialization_authorized": False,
+                        "speech_regions": [
+                            {
+                                "start_ms": unresolved["start_ms"],
+                                "end_ms": unresolved["start_ms"] + 150,
+                            },
+                        ],
+                    }
+                ],
+            },
+        )
+        store.put_checkpoint(
+            job.job_id,
+            stage="aligning",
+            checkpoint_key=(
+                "gap_retranscription_failed_"
+                f"{unresolved['start_ms']:010d}_{unresolved['end_ms']:010d}"
+            ),
+            payload={
+                "schema_version": "1.0.0",
+                "start_ms": unresolved["start_ms"],
+                "end_ms": unresolved["end_ms"],
+                "attempt_count": 3,
+                "last_error_code": None,
+            },
+        )
+
+        result = NaturalPauseMaterializer(store).materialize(job.job_id)
+
+    assert result.outcome is NaturalPauseOutcome.MATERIALIZED
+    assert result.created_segment_count == 1
+    assert result.job.state is JobState.DIARIZING
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")
+def test_natural_pause_materializes_rejected_boundary_filler(tmp_path) -> None:
+    with JobStore(
+        tmp_path / "worker.sqlite3",
+        source_probe=source_probe_for(2),
+    ) as store:
+        job = create_aligning_job_with_gap(
+            store,
+            suffix="rejected-boundary-filler",
+            duration_seconds=2,
+        )
+        alignment = next(
+            checkpoint
+            for checkpoint in store.list_checkpoints(job.job_id, stage="aligning")
+            if checkpoint.checkpoint_key == "transcript_alignment_report"
+        )
+        unresolved = alignment.payload["unresolved_ranges"][0]
+        duration_ms = unresolved["end_ms"] - unresolved["start_ms"]
+        store.put_checkpoint(
+            job.job_id,
+            stage="aligning",
+            checkpoint_key="gap_speech_activity_evidence",
+            payload={
+                "schema_version": "1.0.0",
+                "alignment_report_generation": alignment.generation,
+                "alignment_report_sha256": alignment.payload_sha256,
+                "evidence": [
+                    {
+                        **unresolved,
+                        "duration_ms": duration_ms,
+                        "speech_duration_ms": 900,
+                        "speech_ratio": round(900 / duration_ms, 8),
+                        "observation": "speech_detected",
+                        "reason_code": "DETECTOR_RETURNED_SPEECH_REGIONS",
+                        "materialization_authorized": False,
+                        "speech_regions": [
+                            {
+                                "start_ms": unresolved["start_ms"],
+                                "end_ms": unresolved["start_ms"] + 900,
+                            }
+                        ],
+                    }
+                ],
+            },
+        )
+        store.put_checkpoint(
+            job.job_id,
+            stage="aligning",
+            checkpoint_key=(
+                "gap_retranscription_rejected_"
+                f"{unresolved['start_ms']:010d}_{unresolved['end_ms']:010d}"
+            ),
+            payload={
+                "schema_version": "1.0.0",
+                "start_ms": unresolved["start_ms"],
+                "end_ms": unresolved["end_ms"],
+                "reason_code": "LOW_COVERAGE_BOUNDARY_FRAGMENT",
+                "transcribed_duration_ms": 80,
+            },
+        )
+
+        result = NaturalPauseMaterializer(store).materialize(job.job_id)
+
+    assert result.outcome is NaturalPauseOutcome.MATERIALIZED
+    assert result.created_segment_count == 1
+    assert result.job.state is JobState.DIARIZING
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")
+def test_downstream_revision_recomputes_gap_evidence_when_timeline_changed(
+    tmp_path,
+) -> None:
+    with JobStore(
+        tmp_path / "worker.sqlite3",
+        source_probe=source_probe_for(1),
+    ) as store:
+        source = create_aligning_job_with_gap(
+            store,
+            suffix="downstream-recompute-vad",
+        )
+        write_speech_evidence(store, source.job_id)
+        current = store.get_job(source.job_id)
+        for state in (
+            JobState.DIARIZING,
+            JobState.STRUCTURING,
+            JobState.QUALITY_CHECK,
+            JobState.PROCESSED,
+        ):
+            current = store.transition_job(
+                source.job_id,
+                state,
+                expected_revision=current.revision,
+            )
+        source_attempts = store.list_asr_attempts(source.job_id)
+
+        result = DownstreamRevisionCreator(store).create(
+            source.job_id,
+            idempotency_key="derived-recompute-vad-v1",
+        )
+        revision_attempts = store.list_asr_attempts(result.revision_job.job_id)
+        provenance = next(
+            checkpoint
+            for checkpoint in store.list_checkpoints(
+                result.revision_job.job_id,
+                stage="derived_revision",
+            )
+            if checkpoint.checkpoint_key == "immutable_asr_replay"
+        )
+
+    assert result.created is True
+    assert result.revision_job.state is JobState.ALIGNING
+    assert result.copied_asr_attempt_count == len(source_attempts) == 1
+    assert [attempt.raw_sha256 for attempt in revision_attempts] == [
+        attempt.raw_sha256 for attempt in source_attempts
+    ]
+    assert provenance.payload["status"] == "awaiting_recomputed_gap_evidence"
+    assert provenance.payload["fresh_asr_inference"] is False
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")
 def test_downstream_revision_replays_raw_asr_without_boundary_fragment(tmp_path) -> None:
     with JobStore(
         tmp_path / "worker.sqlite3",

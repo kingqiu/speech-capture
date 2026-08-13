@@ -368,8 +368,17 @@ class FakeStructuringEngine:
     def refine_interview_document(self, document, segments):
         return dict(document)
 
+    def refine_meeting_document(self, document, segments):
+        return dict(document)
+
+    def refine_meeting_outcomes(self, document, segments):
+        return dict(document)
+
     def refine_voice_memo_document(self, document, segments):
         return dict(document)
+
+    def synthesize_speaker_summaries(self, segments, *, speaker_ids, content_type):
+        return []
 
     def reconcile_decisions(self, document, segments, *, content_type):
         return list(document.get("decisions", []))
