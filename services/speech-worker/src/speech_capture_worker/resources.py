@@ -219,6 +219,59 @@ def require_resource_preflight(report: ResourceReport) -> None:
         )
 
 
+def estimate_upload_staging_peak_bytes(*, source_size_bytes: int) -> int:
+    """Estimate resumable parts plus the atomic assembled source at verification peak."""
+
+    if (
+        not isinstance(source_size_bytes, int)
+        or isinstance(source_size_bytes, bool)
+        or source_size_bytes <= 0
+    ):
+        raise InvalidJobRequest("source_size_bytes must be greater than zero.")
+    return source_size_bytes * 2
+
+
+def require_upload_storage_capacity(
+    storage_path: Path,
+    source_size_bytes: int,
+    *,
+    policy: ResourcePolicy | None = None,
+    disk: DiskSnapshot | None = None,
+) -> None:
+    """Protect the disk reserve before accepting a new resumable source."""
+
+    selected_policy = policy or ResourcePolicy()
+    snapshot = disk or snapshot_disk(storage_path)
+    estimated_peak_bytes = estimate_upload_staging_peak_bytes(
+        source_size_bytes=source_size_bytes
+    )
+    reserve_bytes = max(
+        selected_policy.minimum_disk_reserve_bytes,
+        int(snapshot.total_bytes * selected_policy.disk_reserve_fraction),
+    )
+    free_after_bytes = snapshot.free_bytes - estimated_peak_bytes
+    if free_after_bytes < reserve_bytes:
+        raise ResourceBlocked(
+            "Worker storage cannot safely stage this upload.",
+            details={
+                "issues": [
+                    {
+                        "code": "UPLOAD_DISK_RESERVE_TOO_LOW",
+                        "status": ResourceStatus.BLOCKED,
+                        "message": (
+                            "Staging upload parts and the verified source would reduce free "
+                            "disk below the configured safety reserve."
+                        ),
+                        "action": "Free disk space manually, then retry the upload.",
+                    }
+                ],
+                "estimated_required_bytes": estimated_peak_bytes,
+                "disk_reserve_bytes": reserve_bytes,
+                "disk_free_after_bytes": free_after_bytes,
+            },
+        )
+
+
 def estimate_job_disk_bytes(
     *,
     source_size_bytes: int,

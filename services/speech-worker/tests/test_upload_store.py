@@ -9,6 +9,7 @@ from speech_capture_worker.domain import UploadCreateRequest, UploadState
 from speech_capture_worker.errors import (
     IdempotencyConflict,
     InvalidJobRequest,
+    ResourceBlocked,
     SourceUndecodable,
     UploadChecksumMismatch,
     UploadIncomplete,
@@ -273,6 +274,28 @@ def test_complete_upload_is_atomic_verified_and_idempotent(tmp_path) -> None:
     assert source_path.read_bytes() == SOURCE
     assert stat.S_IMODE(source_path.stat().st_mode) & 0o077 == 0
     assert not list((tmp_path / "sources").glob(".*.assembling"))
+    assert not (tmp_path / "uploads" / upload.upload_id).exists()
+
+
+def test_new_upload_capacity_is_checked_but_idempotent_resume_is_not_reblocked(tmp_path) -> None:
+    checks = []
+
+    def check_capacity(path, source_size_bytes):
+        checks.append((path, source_size_bytes))
+        if len(checks) > 1:
+            raise ResourceBlocked("Synthetic capacity block.")
+
+    with JobStore(
+        tmp_path / "worker.sqlite3",
+        upload_capacity_check=check_capacity,
+    ) as store:
+        first, first_created = store.create_upload(request(), idempotency_key="upload-001")
+        resumed, resumed_created = store.create_upload(request(), idempotency_key="upload-001")
+
+    assert first_created is True
+    assert resumed_created is False
+    assert resumed.upload_id == first.upload_id
+    assert checks == [(tmp_path, len(SOURCE))]
 
 
 def test_whole_source_checksum_mismatch_preserves_parts_and_marks_failed(tmp_path) -> None:
@@ -374,6 +397,29 @@ def test_interrupted_verification_recovers_without_losing_parts(tmp_path) -> Non
     assert restored.received_part_count == 3
     assert restored.last_error_code == "UPLOAD_VERIFICATION_INTERRUPTED"
     assert not temporary.exists()
+
+
+def test_startup_recovery_releases_legacy_parts_for_completed_upload(tmp_path) -> None:
+    database = tmp_path / "worker.sqlite3"
+    with JobStore(
+        database,
+        upload_chunk_size_bytes=4,
+        source_probe=successful_probe,
+    ) as store:
+        upload, _ = store.create_upload(request(), idempotency_key="upload-001")
+        put_all_parts(store, upload.upload_id)
+        store.complete_upload(upload.upload_id)
+
+    legacy_parts = tmp_path / "uploads" / upload.upload_id / "parts"
+    legacy_parts.mkdir(parents=True)
+    (legacy_parts / "00000001.part").write_bytes(SOURCE[:4])
+
+    with JobStore(database) as restarted:
+        restarted.recover_interrupted_uploads()
+        restored = restarted.get_upload(upload.upload_id)
+
+    assert restored.state is UploadState.COMPLETE
+    assert not legacy_parts.parent.exists()
 
 
 def test_concurrent_identical_upload_creation_produces_one_manifest(tmp_path) -> None:

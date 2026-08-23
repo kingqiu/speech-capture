@@ -141,7 +141,19 @@ describe("probeWorker", () => {
     };
 
     await expect(probeWorker(transport, WORKER, null)).resolves.toEqual({
-      state: "unreachable"
+      state: "unreachable",
+      diagnostic: "连接检查发生未预期异常"
+    });
+  });
+
+  it("preserves a safe transport diagnostic for the settings UI", async () => {
+    const transport = new QueueTransport([
+      { status: 0, json: null, error: "Obsidian 网络层返回 ERR_NAME_NOT_RESOLVED" }
+    ]);
+
+    await expect(probeWorker(transport, WORKER, null)).resolves.toEqual({
+      state: "unreachable",
+      diagnostic: "健康检查失败：Obsidian 网络层返回 ERR_NAME_NOT_RESOLVED"
     });
   });
 });

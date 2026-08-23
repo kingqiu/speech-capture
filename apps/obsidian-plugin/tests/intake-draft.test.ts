@@ -70,6 +70,7 @@ describe("intake draft helpers", () => {
     expect(
       estimateJobDiskBytes(486 * 1024 * 1024, 42 * 60 + 18)
     ).toEqual({
+      uploadPeakBytes: 1_019_215_872,
       workingBytes: 512_083_456,
       totalBytes: 1_021_691_392
     });

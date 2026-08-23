@@ -8,7 +8,9 @@ from speech_capture_worker.resources import (
     MemorySnapshot,
     ResourcePolicy,
     estimate_job_disk_bytes,
+    estimate_upload_staging_peak_bytes,
     require_resource_preflight,
+    require_upload_storage_capacity,
 )
 
 
@@ -145,6 +147,29 @@ def test_processing_estimate_does_not_count_already_staged_source_twice() -> Non
     )
 
     assert intake_estimate - processing_estimate == source_size
+
+
+def test_upload_staging_peak_counts_parts_and_atomic_source() -> None:
+    source_size = 200 * 1024**2
+
+    assert estimate_upload_staging_peak_bytes(source_size_bytes=source_size) == 2 * source_size
+
+
+def test_upload_storage_capacity_preserves_disk_reserve(tmp_path) -> None:
+    require_upload_storage_capacity(
+        tmp_path,
+        2 * GIB,
+        disk=disk(free_gib=30),
+    )
+
+    with pytest.raises(ResourceBlocked) as caught:
+        require_upload_storage_capacity(
+            tmp_path,
+            3 * GIB,
+            disk=disk(free_gib=25),
+        )
+
+    assert caught.value.details["issues"][0]["code"] == "UPLOAD_DISK_RESERVE_TOO_LOW"
 
 
 @pytest.mark.parametrize(

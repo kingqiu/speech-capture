@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import os
+import shutil
 import sqlite3
 import threading
 from collections.abc import Callable, Iterator, Sequence
@@ -116,6 +117,7 @@ class JobStore:
         *,
         upload_chunk_size_bytes: int = DEFAULT_UPLOAD_CHUNK_SIZE_BYTES,
         source_probe: Callable[[Path], MediaProbeResult] = probe_audio_source,
+        upload_capacity_check: Callable[[Path, int], None] | None = None,
     ) -> None:
         if (
             not isinstance(upload_chunk_size_bytes, int)
@@ -131,6 +133,7 @@ class JobStore:
         self.jobs_directory = self.data_directory / "jobs"
         self.upload_chunk_size_bytes = upload_chunk_size_bytes
         self._source_probe = source_probe
+        self._upload_capacity_check = upload_capacity_check
         parent_existed = self.database_path.parent.exists()
         self.database_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         if not parent_existed:
@@ -3279,6 +3282,12 @@ class JobStore:
                     )
                 return self._row_to_upload(row), False
 
+            if self._upload_capacity_check is not None:
+                self._upload_capacity_check(
+                    self.data_directory,
+                    request.source_size_bytes,
+                )
+
             upload_id = f"upl_{uuid4().hex}"
             now = _utc_now()
             self._connection.execute(
@@ -3473,35 +3482,39 @@ class JobStore:
 
         with self._transaction():
             upload = self._row_to_upload(self._fetch_upload_row(upload_id))
-            if upload.state is UploadState.COMPLETE:
-                return upload, False
+            was_complete = upload.state is UploadState.COMPLETE
             if upload.state is UploadState.VERIFYING:
                 raise UploadStateConflict(
                     "The upload is already being verified.",
                     details={"upload_id": upload_id, "state": upload.state.value},
                 )
-            missing_parts = self._list_missing_upload_parts_in_transaction(upload)
-            if missing_parts:
-                raise UploadIncomplete(
-                    "The upload cannot be completed until every part is received.",
-                    details={
-                        "upload_id": upload_id,
-                        "missing_part_numbers": missing_parts,
-                    },
+            if not was_complete:
+                missing_parts = self._list_missing_upload_parts_in_transaction(upload)
+                if missing_parts:
+                    raise UploadIncomplete(
+                        "The upload cannot be completed until every part is received.",
+                        details={
+                            "upload_id": upload_id,
+                            "missing_part_numbers": missing_parts,
+                        },
+                    )
+                now = _utc_now()
+                self._connection.execute(
+                    """
+                    UPDATE uploads
+                    SET
+                        state = ?,
+                        last_error_code = NULL,
+                        last_error_message = NULL,
+                        updated_at = ?
+                    WHERE upload_id = ?
+                    """,
+                    (UploadState.VERIFYING.value, now, upload_id),
                 )
-            now = _utc_now()
-            self._connection.execute(
-                """
-                UPDATE uploads
-                SET
-                    state = ?,
-                    last_error_code = NULL,
-                    last_error_message = NULL,
-                    updated_at = ?
-                WHERE upload_id = ?
-                """,
-                (UploadState.VERIFYING.value, now, upload_id),
-            )
+
+        if was_complete:
+            self._remove_completed_upload_parts(upload_id)
+            return upload, False
 
         try:
             source_relative_path, probe = self._assemble_and_probe_upload(upload)
@@ -3553,7 +3566,10 @@ class JobStore:
                     upload_id,
                 ),
             )
-            return self._row_to_upload(self._fetch_upload_row(upload_id)), True
+            completed = self._row_to_upload(self._fetch_upload_row(upload_id))
+
+        self._remove_completed_upload_parts(upload_id)
+        return completed, True
 
     def recover_interrupted_uploads(self) -> list[UploadRecord]:
         """Return interrupted verification to a resumable upload boundary."""
@@ -3597,6 +3613,16 @@ class JobStore:
                 temporary_path.unlink()
             except FileNotFoundError:
                 pass
+        with self._lock:
+            completed_upload_ids = [
+                str(row["upload_id"])
+                for row in self._connection.execute(
+                    "SELECT upload_id FROM uploads WHERE state = ? ORDER BY upload_id",
+                    (UploadState.COMPLETE.value,),
+                ).fetchall()
+            ]
+        for completed_upload_id in completed_upload_ids:
+            self._remove_completed_upload_parts(completed_upload_id)
         return recovered
 
     def get_verified_source_path(self, upload_id: str) -> Path:
@@ -4846,6 +4872,24 @@ class JobStore:
         part_directory = self.uploads_directory / upload_id / "parts"
         _ensure_private_directory(part_directory, root=self.uploads_directory)
         return part_directory / f"{part_number:08d}.part"
+
+    def _remove_completed_upload_parts(self, upload_id: str) -> None:
+        _validate_upload_id(upload_id)
+        upload_directory = self.uploads_directory / upload_id
+        try:
+            if upload_directory.is_symlink():
+                raise UploadStorageError("Completed upload staging is not a private directory.")
+            shutil.rmtree(upload_directory)
+            _fsync_directory(self.uploads_directory)
+        except FileNotFoundError:
+            return
+        except UploadStorageError:
+            raise
+        except OSError as exc:
+            raise UploadStorageError(
+                "Verified upload staging could not be released safely.",
+                details={"recommended_action": "Retry upload completion."},
+            ) from exc
 
     def _assemble_and_probe_upload(
         self,

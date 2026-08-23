@@ -1,4 +1,4 @@
-export const SETTINGS_SCHEMA_VERSION = 1 as const;
+export const SETTINGS_SCHEMA_VERSION = 2 as const;
 
 export interface WorkerConnectionSettings {
   readonly id: string;
@@ -9,7 +9,7 @@ export interface WorkerConnectionSettings {
 
 export interface SpeechCaptureSettings {
   readonly schemaVersion: typeof SETTINGS_SCHEMA_VERSION;
-  readonly vaultId: string | null;
+  readonly vaultIdsByWorker: Readonly<Record<string, string>>;
   readonly workers: readonly WorkerConnectionSettings[];
   readonly preferredWorkerId: string | null;
   readonly preferredProfile: "accuracy" | "speed";
@@ -29,7 +29,7 @@ const LOCAL_WORKER: WorkerConnectionSettings = Object.freeze({
 
 export const DEFAULT_SETTINGS: SpeechCaptureSettings = Object.freeze({
   schemaVersion: SETTINGS_SCHEMA_VERSION,
-  vaultId: null,
+  vaultIdsByWorker: Object.freeze({}),
   workers: Object.freeze([LOCAL_WORKER]),
   preferredWorkerId: LOCAL_WORKER_ID,
   preferredProfile: "accuracy",
@@ -46,17 +46,28 @@ export function parseSettings(value: unknown): SpeechCaptureSettings {
     ? value.workers.flatMap((worker) => parseWorker(worker))
     : [];
   const workers = withLocalCandidate(parsedWorkers);
-  const preferredWorkerId =
+  const requestedPreferredWorkerId =
     typeof value.preferredWorkerId === "string" &&
     workers.some((worker) => worker.id === value.preferredWorkerId)
       ? value.preferredWorkerId
       : null;
+  const preferredWorkerId =
+    requestedPreferredWorkerId ?? workers[0]?.id ?? null;
+  const vaultIdsByWorker = parseVaultIdsByWorker(value.vaultIdsByWorker, workers);
+  const legacyVaultId =
+    typeof value.vaultId === "string" && isSafeIdentifier(value.vaultId)
+      ? value.vaultId
+      : null;
+  if (
+    legacyVaultId &&
+    preferredWorkerId &&
+    vaultIdsByWorker[preferredWorkerId] === undefined
+  ) {
+    vaultIdsByWorker[preferredWorkerId] = legacyVaultId;
+  }
   return {
     schemaVersion: SETTINGS_SCHEMA_VERSION,
-    vaultId:
-      typeof value.vaultId === "string" && isSafeIdentifier(value.vaultId)
-        ? value.vaultId
-        : null,
+    vaultIdsByWorker,
     workers,
     preferredWorkerId,
     preferredProfile: value.preferredProfile === "speed" ? "speed" : "accuracy",
@@ -66,6 +77,39 @@ export function parseSettings(value: unknown): SpeechCaptureSettings {
         : DEFAULT_SETTINGS.outputFolder,
     leftSidebarCollapsed: value.leftSidebarCollapsed === true,
     rightSidebarCollapsed: value.rightSidebarCollapsed === true
+  };
+}
+
+export type RemoteWorkerDraftResult =
+  | { readonly ok: true; readonly worker: WorkerConnectionSettings }
+  | {
+      readonly ok: false;
+      readonly reason: "name_required" | "name_too_long" | "invalid_endpoint";
+    };
+
+export function remoteWorkerFromDraft(
+  displayName: string,
+  endpoint: string
+): RemoteWorkerDraftResult {
+  const normalizedName = displayName.trim();
+  if (!normalizedName) {
+    return { ok: false, reason: "name_required" };
+  }
+  if (normalizedName.length > 80) {
+    return { ok: false, reason: "name_too_long" };
+  }
+  const normalizedEndpoint = parseEndpoint(endpoint.trim(), "remote");
+  if (normalizedEndpoint === null) {
+    return { ok: false, reason: "invalid_endpoint" };
+  }
+  return {
+    ok: true,
+    worker: {
+      id: `remote-${stableIdentifier(normalizedEndpoint)}`,
+      displayName: normalizedName,
+      endpoint: normalizedEndpoint,
+      kind: "remote"
+    }
   };
 }
 
@@ -119,6 +163,33 @@ function parseEndpoint(
 function normalizeEndpoint(url: URL): string {
   url.pathname = url.pathname.replace(/\/+$/, "");
   return url.toString().replace(/\/$/, "");
+}
+
+function parseVaultIdsByWorker(
+  value: unknown,
+  workers: readonly WorkerConnectionSettings[]
+): Record<string, string> {
+  if (!isRecord(value)) {
+    return {};
+  }
+  const knownWorkerIds = new Set(workers.map((worker) => worker.id));
+  return Object.fromEntries(
+    Object.entries(value).filter(
+      (entry): entry is [string, string] =>
+        knownWorkerIds.has(entry[0]) &&
+        typeof entry[1] === "string" &&
+        isSafeIdentifier(entry[1])
+    )
+  );
+}
+
+function stableIdentifier(value: string): string {
+  let hash = 0x811c9dc5;
+  for (const character of new TextEncoder().encode(value)) {
+    hash ^= character;
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0");
 }
 
 function withLocalCandidate(

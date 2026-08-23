@@ -71,7 +71,13 @@ def serve(config: ServerConfig, *, runner: Any | None = None) -> None:
 
         runner = uvicorn.run
     validated.data_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    jobs = JobStore(validated.data_dir / "worker.sqlite3")
+    from speech_capture_worker.resources import require_upload_storage_capacity
+
+    jobs = JobStore(
+        validated.data_dir / "worker.sqlite3",
+        upload_capacity_check=require_upload_storage_capacity,
+    )
+    jobs.recover_interrupted_uploads()
     security = DeviceSecurityStore(validated.data_dir / "security.sqlite3")
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
     from speech_capture_worker.background_processing import BackgroundProcessingService

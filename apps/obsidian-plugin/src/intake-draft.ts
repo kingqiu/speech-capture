@@ -115,7 +115,11 @@ export function formatBytes(bytes: number): string {
 export function estimateJobDiskBytes(
   sourceSizeBytes: number,
   durationSeconds: number | null
-): { readonly workingBytes: number; readonly totalBytes: number } | null {
+): {
+  readonly uploadPeakBytes: number;
+  readonly workingBytes: number;
+  readonly totalBytes: number;
+} | null {
   if (
     durationSeconds === null ||
     !Number.isFinite(durationSeconds) ||
@@ -132,7 +136,12 @@ export function estimateJobDiskBytes(
     Math.ceil(sourceSizeBytes * 0.1)
   );
   const workingBytes = workingAudioBytes + artifactHeadroomBytes;
-  return { workingBytes, totalBytes: sourceSizeBytes + workingBytes };
+  const uploadPeakBytes = sourceSizeBytes * 2;
+  return {
+    uploadPeakBytes,
+    workingBytes,
+    totalBytes: Math.max(uploadPeakBytes, sourceSizeBytes + workingBytes)
+  };
 }
 
 export function mediaTypeLabel(file: Pick<File, "name" | "type">): string {

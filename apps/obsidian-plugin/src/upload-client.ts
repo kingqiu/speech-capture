@@ -17,6 +17,8 @@ import type {
 } from "./worker-probe";
 
 const SOURCE_HASH_SLICE_BYTES = 4 * 1024 * 1024;
+const DEFAULT_UPLOAD_RETRY_DELAY_MS = 60_000;
+const DEFAULT_UPLOAD_RETRY_LIMIT = 3;
 
 export interface UploadSource {
   readonly name: string;
@@ -28,6 +30,7 @@ export interface UploadSource {
 export type SubmissionPhase =
   | "hashing"
   | "uploading"
+  | "waiting_retry"
   | "verifying"
   | "creating_job"
   | "done";
@@ -38,6 +41,8 @@ export interface SubmissionProgress {
   readonly totalBytes: number;
   readonly completedParts: number;
   readonly totalParts: number;
+  readonly retryAttempt?: number;
+  readonly retryLimit?: number;
 }
 
 export interface SubmitRecordingRequest {
@@ -50,6 +55,8 @@ export interface SubmitRecordingRequest {
   readonly modelProfile: ModelProfile;
   readonly contentTypeOverride?: string | null;
   readonly onProgress?: (progress: SubmissionProgress) => void;
+  readonly retryDelayMs?: number;
+  readonly retryLimit?: number;
 }
 
 export interface SubmitRecordingResult {
@@ -119,19 +126,16 @@ export async function submitRecording(
     );
     const partBytes = await request.source.slice(start, end).arrayBuffer();
     const partSha256 = bytesToHex(sha256(new Uint8Array(partBytes)));
-    const partResponse = await transport.request(
-      request.worker,
-      `/v1/uploads/${uploadEnvelope.upload.upload_id}/parts/${partNumber}`,
-      {
-        method: "PUT",
-        rawBody: partBytes,
-        bearerToken: request.bearerToken,
-        headers: {
-          "Content-Type": "application/octet-stream",
-          "X-Part-SHA256": partSha256
-        }
-      }
-    );
+    const partResponse = await uploadPartWithRetry(transport, request, {
+      uploadId: uploadEnvelope.upload.upload_id,
+      partNumber,
+      partBytes,
+      partSha256,
+      start,
+      end,
+      completedParts,
+      totalParts
+    });
     parseUploadPartEnvelope(partResponse, partNumber, partSha256, end - start);
     completedParts += 1;
     report(request, {
@@ -196,6 +200,90 @@ export async function submitRecording(
     totalParts
   });
   return { upload: completedUpload.upload, job: jobEnvelope.job };
+}
+
+async function uploadPartWithRetry(
+  transport: WorkerTransport,
+  request: SubmitRecordingRequest,
+  part: {
+    readonly uploadId: string;
+    readonly partNumber: number;
+    readonly partBytes: ArrayBuffer;
+    readonly partSha256: string;
+    readonly start: number;
+    readonly end: number;
+    readonly completedParts: number;
+    readonly totalParts: number;
+  }
+): Promise<WorkerTransportResponse> {
+  const retryDelayMs = request.retryDelayMs ?? DEFAULT_UPLOAD_RETRY_DELAY_MS;
+  const retryLimit = request.retryLimit ?? DEFAULT_UPLOAD_RETRY_LIMIT;
+  if (!Number.isSafeInteger(retryDelayMs) || retryDelayMs < 0) {
+    throw new SubmissionError("invalid_source", "上传重试间隔无效。");
+  }
+  if (!Number.isSafeInteger(retryLimit) || retryLimit < 0 || retryLimit > 3) {
+    throw new SubmissionError("invalid_source", "上传自动重试次数无效。");
+  }
+  let furthestUploadedBytes = 0;
+  for (let retryAttempt = 0; ; retryAttempt += 1) {
+    let response: WorkerTransportResponse;
+    try {
+      response = await transport.request(
+        request.worker,
+        `/v1/uploads/${part.uploadId}/parts/${part.partNumber}`,
+        {
+          method: "PUT",
+          rawBody: part.partBytes,
+          bearerToken: request.bearerToken,
+          headers: {
+            "Content-Type": "application/octet-stream",
+            "X-Part-SHA256": part.partSha256
+          },
+          onUploadProgress: (uploadedBytes) => {
+            furthestUploadedBytes = Math.max(furthestUploadedBytes, uploadedBytes);
+            report(request, {
+              phase: "uploading",
+              processedBytes: Math.min(
+                part.end,
+                part.start + furthestUploadedBytes
+              ),
+              totalBytes: request.source.size,
+              completedParts: part.completedParts,
+              totalParts: part.totalParts
+            });
+          }
+        }
+      );
+    } catch {
+      response = { status: 0, json: null };
+    }
+    if (!isRetryableUploadResponse(response) || retryAttempt >= retryLimit) {
+      return response;
+    }
+    report(request, {
+      phase: "waiting_retry",
+      processedBytes: Math.min(
+        part.end,
+        part.start + furthestUploadedBytes
+      ),
+      totalBytes: request.source.size,
+      completedParts: part.completedParts,
+      totalParts: part.totalParts,
+      retryAttempt: retryAttempt + 1,
+      retryLimit
+    });
+    await wait(retryDelayMs);
+  }
+}
+
+function isRetryableUploadResponse(response: WorkerTransportResponse): boolean {
+  return [0, 408, 425, 429, 502, 503, 504].includes(response.status);
+}
+
+function wait(milliseconds: number): Promise<void> {
+  return milliseconds === 0
+    ? Promise.resolve()
+    : new Promise((resolve) => window.setTimeout(resolve, milliseconds));
 }
 
 export async function hashSource(

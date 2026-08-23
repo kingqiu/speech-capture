@@ -247,6 +247,22 @@ export class SpeechWorkbenchView extends ItemView {
     this.releaseReviewAudioUrl();
   }
 
+  public async onWorkerSettingsChanged(): Promise<void> {
+    this.workerProbe = null;
+    this.probingWorker = false;
+    this.pairingTicket = "";
+    this.pairingState = { state: "idle" };
+    this.jobs = [];
+    this.selectedJobId = null;
+    this.selectedSnapshot = null;
+    this.corrections = [];
+    this.summaryRevisions = null;
+    this.connectionRecovery = null;
+    this.viewMode = "intake";
+    this.render();
+    await this.refreshWorker();
+  }
+
   private render(): void {
     this.contentEl.empty();
     this.contentEl.addClass("speech-capture-view");
@@ -1708,17 +1724,24 @@ export class SpeechWorkbenchView extends ItemView {
       });
     } else if (this.workerProbe?.state === "unreachable") {
       const warning = field.createDiv({ cls: "speech-capture-inline-warning" });
-      warning.createSpan({ text: "未检测到可用 Worker。任务和草稿不会切换到其他设备。" });
+      warning.createSpan({
+        text: `未检测到可用 Worker：${this.workerProbe.diagnostic}。任务和草稿不会切换到其他设备。`
+      });
       const retry = warning.createEl("button", {
         text: "重新检测",
         attr: { type: "button" }
       });
       retry.addEventListener("click", () => void this.refreshWorker());
+      const remote = preferredWorker.kind === "remote";
       const help = warning.createEl("button", {
-        text: "查看安装或启动说明",
+        text: remote ? "管理处理设备" : "查看安装或启动说明",
         attr: { type: "button" }
       });
-      help.addEventListener("click", () => this.openLocalWorkerHelp());
+      help.addEventListener("click", () =>
+        remote
+          ? this.plugin.openWorkerSettings()
+          : this.openLocalWorkerHelp()
+      );
     } else if (this.workerProbe?.state === "pairing_required") {
       const warning = field.createDiv({ cls: "speech-capture-inline-warning" });
       warning.createSpan({ text: "需要连接此设备。配对完成前不会上传音频。" });
@@ -1833,12 +1856,17 @@ export class SpeechWorkbenchView extends ItemView {
     facts.createEl("h3", { text: "Worker 预计占用" });
     this.fact(
       facts,
+      "上传验证峰值",
+      estimate ? `约 ${formatBytes(estimate.uploadPeakBytes)}` : "验证音频后确认"
+    );
+    this.fact(
+      facts,
       "处理临时文件",
       estimate ? `约 ${formatBytes(estimate.workingBytes)}` : "验证音频后确认"
     );
     this.fact(
       facts,
-      "预计总占用",
+      "预计峰值总占用",
       estimate ? `约 ${formatBytes(estimate.totalBytes)}` : "验证音频后确认"
     );
 
@@ -2412,7 +2440,7 @@ export class SpeechWorkbenchView extends ItemView {
       return;
     }
     const worker = this.plugin.preferredWorker();
-    const vaultId = this.plugin.settings.vaultId;
+    const vaultId = this.plugin.authorizedVaultId();
     const token = worker ? this.plugin.credentials.get(worker.id) : null;
     if (
       !worker ||
@@ -3328,12 +3356,30 @@ export class SpeechWorkbenchView extends ItemView {
   private async submitDraft(): Promise<void> {
     const worker = this.plugin.preferredWorker();
     const file = this.draft.file;
-    const vaultId = this.plugin.settings.vaultId;
+    const vaultId = this.plugin.authorizedVaultId();
     const token = worker ? this.plugin.credentials.get(worker.id) : null;
     if (!worker || !file || !vaultId || !token || !this.selectedProfileCanStart()) {
       this.submissionState = {
         state: "error",
         message: "提交条件已变化，请重新检测 Worker 后再试"
+      };
+      this.render();
+      this.focusSubmissionError();
+      return;
+    }
+    const diskEstimate = estimateJobDiskBytes(file.size, this.sourceDurationSeconds);
+    const readiness =
+      this.workerProbe?.state === "ready" || this.workerProbe?.state === "warning"
+        ? this.workerProbe.readiness
+        : null;
+    if (
+      diskEstimate !== null &&
+      readiness !== null &&
+      readiness.disk_free_bytes - diskEstimate.totalBytes < readiness.disk_reserve_bytes
+    ) {
+      this.submissionState = {
+        state: "error",
+        message: "Worker 磁盘空间不足，无法在保留安全余量的前提下上传并处理此文件"
       };
       this.render();
       this.focusSubmissionError();
@@ -3418,7 +3464,9 @@ export class SpeechWorkbenchView extends ItemView {
       });
       status.createEl("p", {
         text:
-          progress.phase === "uploading"
+          progress.phase === "waiting_retry"
+            ? `连接中断，1 分钟后自动续传（${(progress.retryAttempt ?? 1).toString()}/${(progress.retryLimit ?? 3).toString()}）`
+            : progress.phase === "uploading"
             ? `已确认 ${progress.completedParts}/${progress.totalParts} 个分段`
             : "请保持 Obsidian 打开，上传完成后即可关闭"
       });
@@ -3599,6 +3647,8 @@ function submissionPhaseLabel(phase: SubmissionProgress["phase"]): string {
       return "正在安全读取音频";
     case "uploading":
       return "正在上传音频";
+    case "waiting_retry":
+      return "等待自动续传";
     case "verifying":
       return "正在核对完整性";
     case "creating_job":

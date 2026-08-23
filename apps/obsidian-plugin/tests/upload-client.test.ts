@@ -39,6 +39,7 @@ describe("submitRecording", () => {
       })
     ]);
     const phases: string[] = [];
+    const uploadedBytes: number[] = [];
 
     const result = await submitRecording(transport, {
       worker: WORKER,
@@ -48,7 +49,12 @@ describe("submitRecording", () => {
       recordingDate: "2026-08-03",
       recordingContext: "  正确公司名是聚衣堂。  ",
       modelProfile: "accuracy",
-      onProgress: (progress) => phases.push(progress.phase)
+      onProgress: (progress) => {
+        phases.push(progress.phase);
+        if (progress.phase === "uploading") {
+          uploadedBytes.push(progress.processedBytes);
+        }
+      }
     });
 
     expect(result.job.state).toBe("queued");
@@ -72,6 +78,7 @@ describe("submitRecording", () => {
     );
     expect(phases).toContain("hashing");
     expect(phases.at(-1)).toBe("done");
+    expect(uploadedBytes).toEqual(expect.arrayContaining([4, 6, 8, 9, 10]));
     expect(source.slices).toEqual([
       [0, 10],
       [4, 8],
@@ -90,6 +97,82 @@ describe("submitRecording", () => {
       [4 * 1024 * 1024, 8 * 1024 * 1024],
       [8 * 1024 * 1024, 9 * 1024 * 1024]
     ]);
+  });
+
+  it("retries a disconnected part at the resumable boundary without regressing progress", async () => {
+    const source = trackedSource("meeting.wav", "audio/wav", "abcdefghij");
+    const transport = new QueueTransport([
+      response(200, uploadEnvelope("uploading", [2, 3])),
+      response(0, null),
+      response(503, null),
+      response(200, partEnvelope(2, "efgh")),
+      response(200, partEnvelope(3, "ij")),
+      response(200, uploadEnvelope("complete", [])),
+      response(200, {
+        created: true,
+        job: {
+          job_id: `job_${"c".repeat(32)}`,
+          state: "queued",
+          revision: 0
+        }
+      })
+    ]);
+    const retries: number[] = [];
+    const progress: number[] = [];
+
+    await submitRecording(transport, {
+      worker: WORKER,
+      bearerToken: "scw_synthetic-token",
+      vaultId: "vault_one",
+      source,
+      recordingDate: "2026-08-03",
+      recordingContext: "",
+      modelProfile: "accuracy",
+      retryDelayMs: 0,
+      onProgress: (update) => {
+        if (update.phase === "uploading" || update.phase === "waiting_retry") {
+          progress.push(update.processedBytes);
+        }
+        if (update.phase === "waiting_retry") {
+          retries.push(update.retryAttempt ?? -1);
+        }
+      }
+    });
+
+    expect(retries).toEqual([1, 2]);
+    expect(
+      transport.requests.filter((item) => item.path.endsWith("/parts/2"))
+    ).toHaveLength(3);
+    expect(progress.every((value, index) => index === 0 || value >= progress[index - 1]!))
+      .toBe(true);
+  });
+
+  it("stops after three automatic retries so the existing manual retry remains available", async () => {
+    const source = trackedSource("meeting.wav", "audio/wav", "abcdefghij");
+    const transport = new QueueTransport([
+      response(200, uploadEnvelope("uploading", [2, 3])),
+      response(0, null),
+      response(0, null),
+      response(0, null),
+      response(0, null)
+    ]);
+
+    await expect(
+      submitRecording(transport, {
+        worker: WORKER,
+        bearerToken: "scw_synthetic-token",
+        vaultId: "vault_one",
+        source,
+        recordingDate: "2026-08-03",
+        recordingContext: "",
+        modelProfile: "accuracy",
+        retryDelayMs: 0
+      })
+    ).rejects.toMatchObject({ code: "worker_unavailable" });
+
+    expect(
+      transport.requests.filter((item) => item.path.endsWith("/parts/2"))
+    ).toHaveLength(4);
   });
 
   it("infers a safe audio media type when the desktop file type is empty", () => {
@@ -167,6 +250,7 @@ class QueueTransport implements WorkerTransport {
     rawBody?: ArrayBuffer;
     bearerToken?: string;
     headers?: Readonly<Record<string, string>>;
+    onUploadProgress?: (uploadedBytes: number) => void;
   }> = [];
 
   public constructor(private readonly responses: WorkerTransportResponse[]) {}
@@ -180,9 +264,14 @@ class QueueTransport implements WorkerTransport {
       readonly rawBody?: ArrayBuffer;
       readonly bearerToken?: string;
       readonly headers?: Readonly<Record<string, string>>;
+      readonly onUploadProgress?: (uploadedBytes: number) => void;
     } = {}
   ): Promise<WorkerTransportResponse> {
     this.requests.push({ path, ...options });
+    if (options.rawBody !== undefined && options.onUploadProgress !== undefined) {
+      options.onUploadProgress(Math.floor(options.rawBody.byteLength / 2));
+      options.onUploadProgress(options.rawBody.byteLength);
+    }
     const next = this.responses.shift();
     if (next === undefined) {
       throw new Error("Synthetic response queue exhausted.");

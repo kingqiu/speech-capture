@@ -29,6 +29,7 @@ export const REQUIRED_STAGE_I_FEATURES = Object.freeze([
 export interface WorkerTransportResponse {
   readonly status: number;
   readonly json: unknown;
+  readonly error?: string;
 }
 
 export interface WorkerTransport {
@@ -41,12 +42,13 @@ export interface WorkerTransport {
       readonly rawBody?: ArrayBuffer;
       readonly bearerToken?: string;
       readonly headers?: Readonly<Record<string, string>>;
+      readonly onUploadProgress?: (uploadedBytes: number) => void;
     }
   ): Promise<WorkerTransportResponse>;
 }
 
 export type WorkerProbeResult =
-  | { readonly state: "unreachable" }
+  | { readonly state: "unreachable"; readonly diagnostic: string }
   | { readonly state: "incompatible"; readonly issueCodes: readonly string[] }
   | { readonly state: "pairing_required"; readonly workerVersion: string }
   | {
@@ -106,7 +108,7 @@ export async function probeWorker(
     const healthResponse = await transport.request(worker, "/v1/health");
     const health = parseHealth(healthResponse);
     if (health === null) {
-      return { state: "unreachable" };
+      return unreachable("健康检查", healthResponse);
     }
 
     const negotiationRequest: CompatibilityRequestSchema = {
@@ -127,7 +129,7 @@ export async function probeWorker(
     );
     const compatibility = parseCompatibility(negotiationResponse);
     if (compatibility === null) {
-      return { state: "unreachable" };
+      return unreachable("能力协商", negotiationResponse);
     }
     if (!compatibility.compatible) {
       return {
@@ -152,7 +154,7 @@ export async function probeWorker(
     }
     const readiness = parseReadiness(readinessResponse);
     if (readiness === null) {
-      return { state: "unreachable" };
+      return unreachable("就绪检查", readinessResponse);
     }
     return {
       state: readiness.state,
@@ -160,8 +162,24 @@ export async function probeWorker(
       readiness
     };
   } catch {
-    return { state: "unreachable" };
+    return { state: "unreachable", diagnostic: "连接检查发生未预期异常" };
   }
+}
+
+function unreachable(
+  stage: string,
+  response: WorkerTransportResponse
+): Extract<WorkerProbeResult, { readonly state: "unreachable" }> {
+  if (response.error) {
+    return { state: "unreachable", diagnostic: `${stage}失败：${response.error}` };
+  }
+  if (response.status === 0) {
+    return { state: "unreachable", diagnostic: `${stage}没有收到网络响应` };
+  }
+  return {
+    state: "unreachable",
+    diagnostic: `${stage}响应无效（HTTP ${response.status}）`
+  };
 }
 
 function parseHealth(response: WorkerTransportResponse): HealthResponse | null {
