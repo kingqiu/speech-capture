@@ -233,7 +233,7 @@ class AsrChunkExecutor:
                 )
             prior_attempts = attempts_by_chunk[chunk.chunk_index]
             if len(prior_attempts) >= self.max_attempts:
-                return self._mark_chunk_partial(
+                return self._materialize_failed_chunk(
                     job,
                     plan,
                     chunk,
@@ -395,7 +395,7 @@ class AsrChunkExecutor:
                 error_code="ASR_ENGINE_EXCEPTION",
             )
             if attempt_number >= self.max_attempts:
-                return self._mark_chunk_partial(
+                return self._materialize_failed_chunk(
                     job,
                     plan,
                     chunk,
@@ -451,7 +451,7 @@ class AsrChunkExecutor:
         )
         if issues:
             if attempt_number >= self.max_attempts:
-                return self._mark_chunk_partial(
+                return self._materialize_failed_chunk(
                     job,
                     plan,
                     chunk,
@@ -558,7 +558,7 @@ class AsrChunkExecutor:
             resource_report=resource_report,
         )
 
-    def _mark_chunk_partial(
+    def _materialize_failed_chunk(
         self,
         job: JobRecord,
         plan: NormalizedAudioPlan,
@@ -568,7 +568,7 @@ class AsrChunkExecutor:
         issues: tuple[CoverageIssue, ...],
     ) -> AsrRunResult:
         source_duration_ms = self.store.get_job_duration_ms(job.job_id)
-        self.store.commit_transcript_segment(
+        failed_segment, _ = self.store.commit_transcript_segment(
             job.job_id,
             commit_key=f"chunk_{chunk.chunk_index:08d}_failed",
             start_ms=chunk.start_ms,
@@ -582,19 +582,42 @@ class AsrChunkExecutor:
             plan,
             chunk,
         )
-        current = self.store.get_job(job.job_id)
-        partial = self.store.transition_job(
+        self.store.put_checkpoint(
             job.job_id,
-            JobState.PARTIAL,
-            expected_revision=current.revision,
-            reason_code="asr_chunk_retries_exhausted",
-            error_code="ASR_CHUNK_RETRIES_EXHAUSTED",
-            error_message="One audio range could not be transcribed after safe retries.",
-            event_type="job.partial",
+            stage="transcribing",
+            checkpoint_key=f"chunk_{chunk.chunk_index:08d}_materialized",
+            payload={
+                "attempt_number": attempt.attempt_number,
+                "raw_sha256": attempt.raw_sha256,
+                "segment_ids": [failed_segment.segment_id],
+                "start_ms": chunk.start_ms,
+                "end_ms": chunk.end_ms,
+                "outcome": TranscriptOutcome.FAILED.value,
+                "error_code": "ASR_CHUNK_RETRIES_EXHAUSTED",
+                "issues": [asdict(issue) for issue in issues],
+            },
         )
+        all_materialized = len(self._materialized_chunks(job.job_id)) == len(plan.chunks)
+        if all_materialized:
+            current = self.store.get_job(job.job_id)
+            aligned = self.store.transition_job(
+                job.job_id,
+                JobState.ALIGNING,
+                expected_revision=current.revision,
+                reason_code="all_asr_chunks_materialized",
+                event_type="job.transcription_completed",
+            )
+            return AsrRunResult(
+                outcome=AsrRunOutcome.TRANSCRIPTION_COMPLETED,
+                job=aligned,
+                chunk_index=chunk.chunk_index,
+                attempt=attempt,
+                issues=issues,
+                resource_report=None,
+            )
         return AsrRunResult(
-            outcome=AsrRunOutcome.PARTIAL,
-            job=partial,
+            outcome=AsrRunOutcome.CHUNK_COMPLETED,
+            job=self.store.get_job(job.job_id),
             chunk_index=chunk.chunk_index,
             attempt=attempt,
             issues=issues,

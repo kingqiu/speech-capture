@@ -67,7 +67,7 @@ export function jobProgressLabel(
   estimatedRemainingSeconds: number | null
 ): string {
   if (["paused", "waiting_user", "partial", "failed", "cancelled"].includes(state)) {
-    return `本阶段停在 ${progressPercent.toString()}% · 已保存最后进度`;
+    return `本阶段处理未完成（${progressPercent.toString()}%）· 已保存最后进度`;
   }
   return `本阶段已完成 ${progressPercent.toString()}%${estimatedRemainingSeconds === null ? "" : ` · 预计还需 ${formatRemaining(estimatedRemainingSeconds)}`}`;
 }
@@ -113,7 +113,7 @@ export function taskStatePresentation(
     return {
       kind: "warning",
       icon: "circle-alert",
-      title: "当前任务只完成了一部分",
+      title: "当前任务有未完成的处理区间",
       detail: "已成功生成的内容仍可使用；重试只会继续未完成的当前阶段。",
       action: "retry",
       actionLabel: "重试当前阶段"

@@ -21,7 +21,7 @@ describe("task state presentation", () => {
 
   it("does not show a live ETA while processing is interrupted", () => {
     expect(jobProgressLabel("paused", 46, 520)).toBe(
-      "本阶段停在 46% · 已保存最后进度"
+      "本阶段处理未完成（46%）· 已保存最后进度"
     );
     expect(jobProgressLabel("transcribing", 46, 520)).toBe(
       "本阶段已完成 46% · 预计还需 约 9 分钟"

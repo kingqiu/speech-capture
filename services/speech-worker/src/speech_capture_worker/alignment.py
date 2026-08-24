@@ -262,14 +262,10 @@ class TranscriptAlignmentFinalizer:
             issue.code in {"INAUDIBLE_TRANSCRIPT_RANGE", "FAILED_TRANSCRIPT_RANGE"}
             for issue in transcript_issues
         )
-        failed_ranges_present = any(
-            issue.code == "FAILED_TRANSCRIPT_RANGE" for issue in transcript_issues
-        )
         ready_for_diarization = (
             evidence_complete
             and alignment_complete
             and timeline_accounted
-            and not failed_ranges_present
         )
         return AlignmentReport(
             schema_version=ALIGNMENT_REPORT_SCHEMA_VERSION,
@@ -346,17 +342,29 @@ class TranscriptAlignmentFinalizer:
                 )
                 continue
             attempt = attempts.get((chunk.chunk_index, attempt_number))
+            failed_materialization = (
+                checkpoint_payload.get("outcome") == TranscriptOutcome.FAILED.value
+            )
+            expected_attempt_states = (
+                {AsrAttemptState.FAILED, AsrAttemptState.REJECTED}
+                if failed_materialization
+                else {AsrAttemptState.SUCCEEDED}
+            )
             if (
                 attempt is None
-                or attempt.state is not AsrAttemptState.SUCCEEDED
+                or attempt.state not in expected_attempt_states
                 or attempt.raw_sha256 != raw_sha256
             ):
                 issues.append(
                     AlignmentIssue(
-                        code="MISSING_SUCCEEDED_ASR_ATTEMPT",
+                        code=(
+                            "MISSING_FAILED_ASR_ATTEMPT"
+                            if failed_materialization
+                            else "MISSING_SUCCEEDED_ASR_ATTEMPT"
+                        ),
                         message=(
                             "A materialized chunk does not reference matching "
-                            "successful raw evidence."
+                            "raw ASR evidence."
                         ),
                         chunk_index=chunk.chunk_index,
                     )
@@ -399,9 +407,10 @@ class TranscriptAlignmentFinalizer:
             invalid_segment_ids = sorted(
                 segment_id
                 for segment_id in checkpoint_segment_ids
-                if not _segment_matches_chunk(
-                    segments_by_id[segment_id],
-                    chunk,
+                if not (
+                    _failed_segment_matches_chunk(segments_by_id[segment_id], chunk)
+                    if failed_materialization
+                    else _segment_matches_chunk(segments_by_id[segment_id], chunk)
                 )
             )
             if invalid_segment_ids:
@@ -416,6 +425,9 @@ class TranscriptAlignmentFinalizer:
                         segment_id=invalid_segment_ids[0],
                     )
                 )
+                continue
+            if failed_materialization:
+                materialized_chunk_count += 1
                 continue
             raw_payload = self.store.get_asr_attempt_payload(
                 job_id,
@@ -783,8 +795,20 @@ def _segment_matches_chunk(
 ) -> bool:
     return (
         segment.outcome is TranscriptOutcome.TRANSCRIBED
-        and segment.start_ms >= chunk.start_ms
-        and segment.end_ms <= chunk.end_ms
+        and segment.start_ms >= chunk.start_ms - 50
+        and segment.end_ms <= chunk.end_ms + 50
+    )
+
+
+def _failed_segment_matches_chunk(
+    segment: TranscriptSegment,
+    chunk: AudioChunkPlan,
+) -> bool:
+    return (
+        segment.outcome is TranscriptOutcome.FAILED
+        and segment.start_ms == chunk.start_ms
+        and segment.end_ms == chunk.end_ms
+        and segment.error_code == "ASR_CHUNK_RETRIES_EXHAUSTED"
     )
 
 

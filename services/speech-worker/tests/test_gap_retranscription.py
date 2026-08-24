@@ -16,6 +16,10 @@ from speech_capture_worker.alignment import (
     TranscriptAlignmentFinalizer,
 )
 from speech_capture_worker.asr_execution import AsrChunkExecutor, AsrRunOutcome
+from speech_capture_worker.bounded_gap_resolution import (
+    BoundedGapMaterializer,
+    _bounded_outcome,
+)
 from speech_capture_worker.domain import JobState, ResourceStatus, UploadCreateRequest
 from speech_capture_worker.downstream_revision import DownstreamRevisionCreator
 from speech_capture_worker.errors import InvalidJobRequest
@@ -36,6 +40,7 @@ from speech_capture_worker.resources import (
     ResourceIssue,
     ResourceReport,
 )
+from speech_capture_worker.transcript import TranscriptOutcome
 
 
 def wav_bytes(*, duration_seconds: float) -> bytes:
@@ -257,6 +262,153 @@ def write_speech_evidence(store: JobStore, job_id: str) -> None:
                 }
             ],
         },
+    )
+
+
+def write_bounded_speech_evidence(store: JobStore, job_id: str) -> None:
+    alignment = next(
+        checkpoint
+        for checkpoint in store.list_checkpoints(job_id, stage="aligning")
+        if checkpoint.checkpoint_key == "transcript_alignment_report"
+    )
+    for marker in (2, 3):
+        alignment, _ = store.put_checkpoint(
+            job_id,
+            stage="aligning",
+            checkpoint_key="transcript_alignment_report",
+            payload={**alignment.payload, "test_alignment_generation": marker},
+        )
+    evidence = [
+        {
+            **value,
+            "duration_ms": value["end_ms"] - value["start_ms"],
+            "speech_duration_ms": value["end_ms"] - value["start_ms"],
+            "speech_ratio": 1.0,
+            "observation": "speech_detected",
+            "reason_code": "DETECTOR_RETURNED_SPEECH_REGIONS",
+            "materialization_authorized": False,
+            "speech_regions": [value],
+        }
+        for value in alignment.payload["unresolved_ranges"]
+    ]
+    store.put_checkpoint(
+        job_id,
+        stage="aligning",
+        checkpoint_key="gap_speech_activity_evidence",
+        payload={
+            "schema_version": "1.0.0",
+            "alignment_report_generation": alignment.generation,
+            "alignment_report_sha256": alignment.payload_sha256,
+            "evidence": evidence,
+        },
+    )
+
+
+def advance_alignment_generation_to_limit(store: JobStore, job_id: str) -> None:
+    alignment = next(
+        checkpoint
+        for checkpoint in store.list_checkpoints(job_id, stage="aligning")
+        if checkpoint.checkpoint_key == "transcript_alignment_report"
+    )
+    for marker in range(
+        alignment.generation + 1,
+        4,
+    ):
+        alignment, _ = store.put_checkpoint(
+            job_id,
+            stage="aligning",
+            checkpoint_key="transcript_alignment_report",
+            payload={**alignment.payload, "test_alignment_generation": marker},
+        )
+
+
+@pytest.mark.parametrize(
+    ("evidence", "reason_code"),
+    [
+        (
+            {
+                "observation": "speech_detected",
+                "speech_duration_ms": 0,
+                "speech_regions": [],
+            },
+            "AUTOMATED_GAP_REPAIR_EXHAUSTED_WITH_CONTRADICTORY_VAD",
+        ),
+        (
+            {
+                "observation": "no_speech_detected",
+                "speech_duration_ms": 1,
+                "speech_regions": [{"start_ms": 0, "end_ms": 1}],
+            },
+            "AUTOMATED_GAP_REPAIR_EXHAUSTED_WITH_CONTRADICTORY_VAD",
+        ),
+        (
+            {"observation": "unknown_historical_value"},
+            "AUTOMATED_GAP_REPAIR_EXHAUSTED_WITH_UNSUPPORTED_VAD",
+        ),
+    ],
+)
+def test_bounded_gap_resolution_preserves_inconsistent_vad_as_inaudible(
+    evidence,
+    reason_code,
+) -> None:
+    outcome, observed_reason = _bounded_outcome(evidence)
+
+    assert outcome is TranscriptOutcome.INAUDIBLE
+    assert observed_reason == reason_code
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")
+def test_bounded_gap_resolution_closes_non_convergent_speech_gap(tmp_path) -> None:
+    with JobStore(
+        tmp_path / "worker.sqlite3",
+        source_probe=source_probe_for(1),
+    ) as store:
+        job = create_aligning_job_with_gap(store, suffix="bounded")
+        write_bounded_speech_evidence(store, job.job_id)
+
+        result = BoundedGapMaterializer(store).materialize(job.job_id)
+        snapshot = store.get_job_snapshot(job.job_id)
+        checkpoints = store.list_checkpoints(job.job_id, stage="aligning")
+
+    assert result.job.state is JobState.DIARIZING
+    assert result.created_segment_count == 1
+    assert result.inaudible_count == 1
+    assert any(
+        segment.outcome is TranscriptOutcome.INAUDIBLE
+        for segment in snapshot.stable_segments
+    )
+    assert any(
+        checkpoint.checkpoint_key.endswith("_materialized")
+        and checkpoint.payload["evidence_type"]
+        == "bounded_automatic_gap_resolution"
+        for checkpoint in checkpoints
+    )
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")
+def test_bounded_gap_resolution_preserves_gap_without_current_vad(tmp_path) -> None:
+    with JobStore(
+        tmp_path / "worker.sqlite3",
+        source_probe=source_probe_for(1),
+    ) as store:
+        job = create_aligning_job_with_gap(store, suffix="bounded-no-vad")
+        advance_alignment_generation_to_limit(store, job.job_id)
+
+        result = BoundedGapMaterializer(store).materialize(job.job_id)
+        snapshot = store.get_job_snapshot(job.job_id)
+        checkpoint = next(
+            value
+            for value in store.list_checkpoints(job.job_id, stage="aligning")
+            if value.checkpoint_key.endswith("_materialized")
+        )
+
+    assert result.job.state is JobState.DIARIZING
+    assert result.created_segment_count == 1
+    assert snapshot.stable_segments[-1].outcome is TranscriptOutcome.INAUDIBLE
+    assert checkpoint.payload["speech_activity_generation"] is None
+    assert checkpoint.payload["speech_evidence_exact_range_match"] is False
+    assert checkpoint.payload["reason_code"] == (
+        "AUTOMATED_GAP_REPAIR_EXHAUSTED_WITHOUT_EXACT_VAD_RANGE"
     )
 
 

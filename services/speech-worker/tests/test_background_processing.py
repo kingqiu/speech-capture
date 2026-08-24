@@ -296,3 +296,98 @@ def test_alignment_resource_block_pauses_before_gap_retranscription(
     assert outcome is BackgroundStepOutcome.ADVANCED
     assert current.state is JobState.PAUSED
     assert current.last_error_code == "SPEECH_ACTIVITY_RESOURCE_BLOCKED"
+
+
+def test_alignment_generation_limit_skips_repeated_vad(monkeypatch, tmp_path) -> None:
+    with JobStore(
+        tmp_path / "worker.sqlite3",
+        source_probe=_source_probe,
+    ) as store:
+        queued = _queued_job(store, suffix="bounded-gap")
+        preprocessing = store.claim_job_for_processing(
+            queued.job_id,
+            expected_revision=queued.revision,
+        )
+        transcribing = store.transition_job(
+            queued.job_id,
+            JobState.TRANSCRIBING,
+            expected_revision=preprocessing.revision,
+        )
+        aligning = store.transition_job(
+            queued.job_id,
+            JobState.ALIGNING,
+            expected_revision=transcribing.revision,
+        )
+
+        class FakeFinalizer:
+            def __init__(self, received_store):
+                assert received_store is store
+
+            def finalize(self, job_id):
+                return SimpleNamespace(job=store.get_job(job_id))
+
+        class FakeGapAnalyzer:
+            def __init__(self, received_store):
+                assert received_store is store
+
+            def analyze(self, _job_id):
+                return None
+
+        class FakeSilenceMaterializer:
+            def __init__(self, received_store):
+                assert received_store is store
+
+            def materialize(self, job_id):
+                return SimpleNamespace(
+                    alignment=SimpleNamespace(job=store.get_job(job_id))
+                )
+
+        class FakeBoundedMaterializer:
+            def __init__(self, received_store):
+                assert received_store is store
+
+            def materialize(self, job_id):
+                current = store.get_job(job_id)
+                diarizing = store.transition_job(
+                    job_id,
+                    JobState.DIARIZING,
+                    expected_revision=current.revision,
+                )
+                return SimpleNamespace(alignment=SimpleNamespace(job=diarizing))
+
+        class UnexpectedDetector:
+            def __init__(self, **_kwargs):
+                raise AssertionError("VAD must not rerun after the safe limit")
+
+        monkeypatch.setattr(
+            "speech_capture_worker.background_processing.TranscriptAlignmentFinalizer",
+            FakeFinalizer,
+        )
+        monkeypatch.setattr(
+            "speech_capture_worker.background_processing.TranscriptGapAnalyzer",
+            FakeGapAnalyzer,
+        )
+        monkeypatch.setattr(
+            "speech_capture_worker.background_processing.DefiniteSilenceMaterializer",
+            FakeSilenceMaterializer,
+        )
+        monkeypatch.setattr(
+            "speech_capture_worker.background_processing.BoundedGapMaterializer",
+            FakeBoundedMaterializer,
+        )
+        monkeypatch.setattr(
+            "speech_capture_worker.background_processing.PyannoteVoiceActivityDetector",
+            UnexpectedDetector,
+        )
+        executor = ContinuousJobExecutor(store, data_dir=tmp_path)
+        monkeypatch.setattr(
+            executor,
+            "_alignment_checkpoint",
+            lambda _job_id: SimpleNamespace(generation=3),
+        )
+
+        outcome = executor._advance_alignment(aligning)
+        current = store.get_job(queued.job_id)
+
+    assert outcome is BackgroundStepOutcome.ADVANCED
+    assert current.state is JobState.DIARIZING

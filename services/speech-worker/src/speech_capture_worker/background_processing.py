@@ -18,6 +18,10 @@ from speech_capture_worker.alignment import TranscriptAlignmentFinalizer
 from speech_capture_worker.artifact_generation import ArtifactGenerator
 from speech_capture_worker.asr_execution import AsrChunkExecutor, MlxQwenAsrEngine
 from speech_capture_worker.audio_preprocessing import AudioPreprocessor
+from speech_capture_worker.bounded_gap_resolution import (
+    MAX_AUTOMATED_ALIGNMENT_GENERATIONS,
+    BoundedGapMaterializer,
+)
 from speech_capture_worker.diarization_execution import (
     DIARIZATION_MODEL_REVISION,
     PyannoteSpeakerDiarizationEngine,
@@ -156,6 +160,31 @@ class ContinuousJobExecutor:
         TranscriptGapAnalyzer(self.store).analyze(job.job_id)
         silence = DefiniteSilenceMaterializer(self.store).materialize(job.job_id)
         if silence.alignment.job.state is JobState.DIARIZING:
+            return BackgroundStepOutcome.ADVANCED
+
+        current_alignment = self._alignment_checkpoint(job.job_id)
+        if (
+            current_alignment is not None
+            and current_alignment.generation
+            >= MAX_AUTOMATED_ALIGNMENT_GENERATIONS
+        ):
+            bounded = BoundedGapMaterializer(self.store).materialize(job.job_id)
+            if bounded.alignment.job.state is JobState.DIARIZING:
+                return BackgroundStepOutcome.ADVANCED
+            current = self.store.get_job(job.job_id)
+            if current.state is JobState.ALIGNING:
+                self.store.transition_job(
+                    job.job_id,
+                    JobState.WAITING_USER,
+                    expected_revision=current.revision,
+                    reason_code="bounded_gap_resolution_requires_review",
+                    error_code="ALIGNMENT_REVIEW_REQUIRED",
+                    error_message=(
+                        "Automatic gap repair reached its safe limit; preserved "
+                        "evidence requires review."
+                    ),
+                    event_type="job.waiting_for_alignment_review",
+                )
             return BackgroundStepOutcome.ADVANCED
 
         detector = PyannoteVoiceActivityDetector(

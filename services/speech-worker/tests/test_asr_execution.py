@@ -9,6 +9,7 @@ import wave
 import numpy as np
 import pytest
 
+from speech_capture_worker.alignment import TranscriptAlignmentFinalizer
 from speech_capture_worker.asr_domain import AsrAttemptState
 from speech_capture_worker.asr_execution import (
     AsrChunkExecutor,
@@ -338,7 +339,9 @@ def test_rejected_attempt_retries_without_losing_raw_evidence(tmp_path) -> None:
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")
-def test_retry_exhaustion_records_failed_range_and_partial_job(tmp_path) -> None:
+def test_retry_exhaustion_materializes_failed_range_and_completes_transcription(
+    tmp_path,
+) -> None:
     engine = FakeEngine([RuntimeError("private failure"), RuntimeError("private failure")])
     with JobStore(
         tmp_path / "worker.sqlite3",
@@ -357,8 +360,10 @@ def test_retry_exhaustion_records_failed_range_and_partial_job(tmp_path) -> None
         )
         first = executor.run_next(job.job_id)
         second = executor.run_next(job.job_id)
+        finalized = TranscriptAlignmentFinalizer(store).finalize(job.job_id)
         snapshot = store.get_job_snapshot(job.job_id)
         attempts = store.list_asr_attempts(job.job_id)
+        checkpoints = store.list_checkpoints(job.job_id, stage="transcribing")
         raw = store.get_asr_attempt_payload(
             job.job_id,
             chunk_index=0,
@@ -366,12 +371,18 @@ def test_retry_exhaustion_records_failed_range_and_partial_job(tmp_path) -> None
         )
 
     assert first.outcome is AsrRunOutcome.RETRYABLE_FAILURE
-    assert second.outcome is AsrRunOutcome.PARTIAL
-    assert second.job.state is JobState.PARTIAL
+    assert second.outcome is AsrRunOutcome.TRANSCRIPTION_COMPLETED
+    assert second.job.state is JobState.ALIGNING
+    assert finalized.job.state is JobState.DIARIZING
     assert len(attempts) == 2
     assert raw == {"exception_type": "RuntimeError"}
     assert snapshot.stable_segments[0].outcome is TranscriptOutcome.FAILED
     assert snapshot.stable_segments[0].error_code == "ASR_CHUNK_RETRIES_EXHAUSTED"
+    assert any(
+        checkpoint.checkpoint_key == "chunk_00000000_materialized"
+        and checkpoint.payload["outcome"] == TranscriptOutcome.FAILED.value
+        for checkpoint in checkpoints
+    )
     assert "private failure" not in json.dumps(raw)
 
 

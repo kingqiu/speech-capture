@@ -1817,7 +1817,9 @@ class JobStore:
                     )
                 return self._row_to_transcript_segment(prior), False
             latest_stable_end = self._latest_stable_segment_end_ms(job_id)
-            if start_ms < latest_stable_end:
+            if not (allow_aligning and job.state is JobState.ALIGNING) and (
+                start_ms < latest_stable_end
+            ):
                 raise TranscriptConflict(
                     "Stable transcript segments must be committed in timeline order.",
                     details={"latest_stable_end_ms": latest_stable_end},
