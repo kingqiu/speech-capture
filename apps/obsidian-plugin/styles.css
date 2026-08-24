@@ -534,6 +534,21 @@
   transition: width 160ms ease;
 }
 
+.speech-capture-progress.is-indeterminate .speech-capture-progress__fill {
+  animation: speech-capture-progress-indeterminate 1.4s ease-in-out infinite;
+  border-radius: inherit;
+  width: 34%;
+}
+
+@keyframes speech-capture-progress-indeterminate {
+  0% {
+    transform: translateX(-110%);
+  }
+  100% {
+    transform: translateX(310%);
+  }
+}
+
 .speech-capture-active-task {
   overflow: auto;
   padding: 20px;
@@ -732,9 +747,24 @@
   margin-top: 9px !important;
 }
 
+.speech-capture-processing-meta {
+  color: var(--text-faint);
+  display: block;
+  font-size: 12px;
+  line-height: 1.5;
+  margin-top: 6px;
+}
+
 .speech-capture-progress.is-large {
   height: 9px;
   margin-top: 16px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .speech-capture-progress.is-indeterminate .speech-capture-progress__fill {
+    animation: none;
+    transform: translateX(95%);
+  }
 }
 
 .speech-capture-processing-safe {

@@ -5,6 +5,7 @@ import {
   jobProgressLabel,
   jobStageIndex,
   resourcePresentation,
+  structuringProgressPresentation,
   taskStatePresentation
 } from "../src/task-state-presentation";
 
@@ -26,6 +27,21 @@ describe("task state presentation", () => {
     expect(jobProgressLabel("transcribing", 46, 520)).toBe(
       "本阶段已完成 46% · 预计还需 约 9 分钟"
     );
+  });
+
+  it("does not reuse a previous stage's completed percentage for structuring", () => {
+    expect(structuringProgressPresentation("diarizing", 1)).toEqual({
+      step: "正在准备提炼上下文",
+      progressPercent: null
+    });
+    expect(structuringProgressPresentation("structuring", 0.42)).toEqual({
+      step: "正在提取关键事实与证据",
+      progressPercent: 42
+    });
+    expect(structuringProgressPresentation("structuring", 0.9)).toEqual({
+      step: "正在校验笔记结构与证据",
+      progressPercent: 90
+    });
   });
 
   it("shows exact disk facts without exposing Worker paths", () => {

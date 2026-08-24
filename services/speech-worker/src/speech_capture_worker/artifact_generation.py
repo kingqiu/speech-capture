@@ -249,6 +249,10 @@ class ArtifactGenerator:
         )
         if structuring_checkpoint is None:
             raise ArtifactGenerationFailed("Artifact generation requires the structuring evidence.")
+        if structuring_checkpoint.payload.get("document_available") is not True:
+            raise ArtifactGenerationFailed(
+                "Artifact generation requires a validated final structured document."
+            )
         if job.source_upload_id is None:
             raise ArtifactGenerationFailed("Artifact generation requires a verified source upload.")
 
@@ -280,6 +284,10 @@ class ArtifactGenerator:
             segments=segments,
             source_title=job.source_display_name,
         )
+        if _usable_document(document) is None:
+            raise ArtifactGenerationFailed(
+                "Artifact generation requires a validated final structured document."
+            )
         transcript_edits = _transcript_edits(
             structuring_raw.get("transcript_edit_results", structuring_raw["batch_results"])
         )

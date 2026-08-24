@@ -26,6 +26,11 @@ export interface TaskStatePresentation {
   readonly actionLabel?: string;
 }
 
+export interface StructuringProgressPresentation {
+  readonly step: string;
+  readonly progressPercent: number | null;
+}
+
 export function jobStageIndex(
   state: JobState,
   lastProgressStage: JobState | null = null
@@ -70,6 +75,38 @@ export function jobProgressLabel(
     return `本阶段处理未完成（${progressPercent.toString()}%）· 已保存最后进度`;
   }
   return `本阶段已完成 ${progressPercent.toString()}%${estimatedRemainingSeconds === null ? "" : ` · 预计还需 ${formatRemaining(estimatedRemainingSeconds)}`}`;
+}
+
+export function structuringProgressPresentation(
+  progressStage: JobState | null,
+  stageProgress: number | null
+): StructuringProgressPresentation {
+  if (progressStage !== "structuring" || stageProgress === null) {
+    return {
+      step: "正在准备提炼上下文",
+      progressPercent: null
+    };
+  }
+  const progressPercent = Math.max(0, Math.min(100, Math.round(stageProgress * 100)));
+  const step =
+    progressPercent < 4
+      ? "正在准备提炼上下文"
+      : progressPercent < 24
+        ? "正在校订完整逐字稿"
+        : progressPercent < 30
+          ? "正在识别内容类型"
+          : progressPercent < 60
+            ? "正在提取关键事实与证据"
+            : progressPercent < 70
+              ? "正在生成笔记初稿"
+              : progressPercent < 78
+                ? "正在补全说话人与时间线"
+                : progressPercent < 88
+                  ? "正在核对内容覆盖"
+                  : progressPercent < 95
+                    ? "正在校验笔记结构与证据"
+                    : "正在保存提炼结果";
+  return { step, progressPercent };
 }
 
 export function taskStatePresentation(

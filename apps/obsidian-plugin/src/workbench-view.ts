@@ -69,6 +69,7 @@ import {
   jobProgressLabel,
   jobStageIndex,
   resourcePresentation,
+  structuringProgressPresentation,
   taskStatePresentation
 } from "./task-state-presentation";
 import {
@@ -2182,6 +2183,61 @@ export class SpeechWorkbenchView extends ItemView {
     const duration = snapshot?.progress?.duration_ms ?? 0;
     const processed = snapshot?.progress?.processed_ms ?? 0;
     const progress = Math.round((snapshot?.progress?.stage_progress ?? 0) * 100);
+    if (snapshot?.job.state === "structuring") {
+      const presentation = structuringProgressPresentation(
+        snapshot.progress?.stage ?? null,
+        snapshot.progress?.stage_progress ?? null
+      );
+      const stageElapsed = formatElapsedSince(snapshot.job.updated_at);
+      const progressAge =
+        snapshot.progress?.stage === "structuring"
+          ? formatRelativeAge(snapshot.progress.updated_at)
+          : null;
+      card.createEl("strong", {
+        cls: "speech-capture-processing-time",
+        text: "正在提炼最终笔记"
+      });
+      card.createEl("p", {
+        text: `当前步骤：${presentation.step}`
+      });
+      card.createEl("small", {
+        cls: "speech-capture-processing-meta",
+        text: `${stageElapsed} · Worker ${this.connectionRecovery ? "连接待恢复" : "已连接"} · ${
+          progressAge
+            ? `最近保存提炼进度 ${progressAge}`
+            : "正在等待第一个提炼进度点"
+        }`
+      });
+      const track = card.createDiv({
+        cls: `speech-capture-progress is-large ${presentation.progressPercent === null ? "is-indeterminate" : ""}`,
+        attr: {
+          role: "progressbar",
+          "aria-label": "提炼阶段进度",
+          ...(presentation.progressPercent === null
+            ? { "aria-valuetext": presentation.step }
+            : {
+                "aria-valuemin": "0",
+                "aria-valuemax": "100",
+                "aria-valuenow": presentation.progressPercent.toString(),
+                "aria-valuetext": `${presentation.step}，约 ${presentation.progressPercent.toString()}%`
+              })
+        }
+      });
+      track.createDiv({
+        cls: "speech-capture-progress__fill",
+        attr:
+          presentation.progressPercent === null
+            ? {}
+            : { style: `width: ${presentation.progressPercent}%` }
+      });
+      const safe = card.createDiv({ cls: "speech-capture-processing-safe" });
+      const icon = safe.createSpan();
+      setIcon(icon, "shield-check");
+      safe.createSpan({
+        text: `转写、对齐和说话人识别已完成 · ${snapshot.stable_segments.length.toString()} 个稳定片段已安全保存`
+      });
+      return;
+    }
     card.createEl("strong", {
       cls: "speech-capture-processing-time",
       text: `${formatDuration(processed)} / ${formatDuration(duration)}`
@@ -3778,6 +3834,39 @@ function formatDuration(milliseconds: number): string {
   return hours > 0
     ? `${hours.toString().padStart(2, "0")}:${minutes.toString().padStart(2, "0")}:${seconds.toString().padStart(2, "0")}`
     : `${minutes.toString().padStart(2, "0")}:${seconds.toString().padStart(2, "0")}`;
+}
+
+function formatElapsedSince(timestamp: string): string {
+  const startedAt = Date.parse(timestamp);
+  if (!Number.isFinite(startedAt)) {
+    return "提炼已开始";
+  }
+  const elapsedSeconds = Math.max(0, Math.floor((Date.now() - startedAt) / 1_000));
+  if (elapsedSeconds < 60) {
+    return "提炼已运行不到 1 分钟";
+  }
+  const hours = Math.floor(elapsedSeconds / 3_600);
+  const minutes = Math.floor((elapsedSeconds % 3_600) / 60);
+  return hours > 0
+    ? `提炼已运行 ${hours.toString()} 小时 ${minutes.toString()} 分钟`
+    : `提炼已运行 ${minutes.toString()} 分钟`;
+}
+
+function formatRelativeAge(timestamp: string): string {
+  const updatedAt = Date.parse(timestamp);
+  if (!Number.isFinite(updatedAt)) {
+    return "时间未知";
+  }
+  const elapsedSeconds = Math.max(0, Math.floor((Date.now() - updatedAt) / 1_000));
+  if (elapsedSeconds < 60) {
+    return "刚刚";
+  }
+  const minutes = Math.floor(elapsedSeconds / 60);
+  if (minutes < 60) {
+    return `${minutes.toString()} 分钟前`;
+  }
+  const hours = Math.floor(minutes / 60);
+  return `${hours.toString()} 小时前`;
 }
 
 function speakerLabel(speakerId: string | null): string {

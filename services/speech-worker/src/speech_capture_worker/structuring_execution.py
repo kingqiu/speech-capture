@@ -42,7 +42,11 @@ from speech_capture_worker.recording_context import (
     recording_context_sha256,
 )
 from speech_capture_worker.resources import GIB, ResourceReport, check_resource_preflight
-from speech_capture_worker.transcript import TranscriptSegment, chronological_segments
+from speech_capture_worker.transcript import (
+    DiarizationStatus,
+    TranscriptSegment,
+    chronological_segments,
+)
 
 STRUCTURING_SCHEMA_VERSION = "1.6.0"
 STRUCTURING_RAW_SCHEMA_VERSION = "1.6.0"
@@ -59,8 +63,11 @@ SUMMARY_REVISION_STAGE = "summary_revisions"
 SUMMARY_REVISION_DECISION_STAGE = "summary_revision_decisions"
 SUMMARY_REVISION_SCHEMA_VERSION = "1.1.0"
 STRUCTURING_HEADROOM_BYTES = GIB
-DEFAULT_BATCH_MAX_CHARS = 4000
-DEFAULT_EDITOR_BATCH_MAX_CHARS = 4800
+DEFAULT_BATCH_MAX_CHARS = 2200
+DEFAULT_EDITOR_BATCH_MAX_CHARS = 1800
+DEFAULT_BATCH_MAX_SEGMENTS = 120
+GLOBAL_SYNTHESIS_CONTEXT_TOKENS = 65_536
+MAX_SYNTHESIS_FINDINGS_PER_BATCH = 10
 SCENE_COVERAGE_REPAIR_VERSION = "2026-08-02.4"
 MEETING_QUALITY_REPAIR_VERSION = "2026-08-10.3"
 MEETING_OUTCOME_REPAIR_VERSION = "2026-08-10.3"
@@ -71,6 +78,8 @@ MAX_TRAIT_COUNT = 20
 MAX_DOCUMENT_TITLE_CHARACTERS = 120
 MAX_DOCUMENT_TEXT_CHARACTERS = 3000
 MAX_DOCUMENT_EVIDENCE_ITEMS = 3
+MIN_RICH_MEETING_CONTEXT_CHARACTERS = 80
+MAX_SPEAKER_SUMMARIES = 16
 
 
 class ContentType(StrEnum):
@@ -112,7 +121,7 @@ CLASSIFICATION_JSON_SCHEMA = {
 
 FINDINGS_JSON_SCHEMA = {
     "type": "array",
-    "maxItems": 30,
+    "maxItems": 16,
     "items": {
         "type": "object",
         "properties": {
@@ -197,7 +206,7 @@ SPEAKER_SUMMARY_JSON_SCHEMA = {
 SPEAKER_SUMMARIES_JSON_SCHEMA = {
     "type": "array",
     "items": SPEAKER_SUMMARY_JSON_SCHEMA,
-    "maxItems": 8,
+    "maxItems": MAX_SPEAKER_SUMMARIES,
 }
 
 DISCUSSION_THREAD_JSON_SCHEMA = {
@@ -303,7 +312,7 @@ DOCUMENT_JSON_SCHEMA = {
         "speaker_summaries": {
             "type": "array",
             "items": SPEAKER_SUMMARY_JSON_SCHEMA,
-            "maxItems": 8,
+            "maxItems": MAX_SPEAKER_SUMMARIES,
         },
         "decisions": {
             "type": "array",
@@ -639,7 +648,12 @@ class OllamaStructuringEngine:
             "kind 只能是 decision、action_item、fact、question、disagreement、"
             "uncertainty、deadline、topic、idea、next_step。"
             "evidence 必须来自下方给出的 segment_id，不能编造没有证据的内容。"
-            "候选数量由本批实际内容决定，合并重复表达，不要逐句罗列。必须通读并均匀覆盖本批的"
+            "候选数量由本批实际内容决定，最多保留 16 项，合并重复表达，不要逐句罗列。"
+            "口头语、寒暄、笑声、脏话、情绪感叹、输入法闲聊、指代不明的半句话、现场随口指令、"
+            "复述原话的过程性对话都不是候选。action_item 必须是明确要完成的工作或交付物；"
+            "decision 必须是已经达成的结论；question 必须是影响目标且尚未解决的实质问题，不能把"
+            "普通问句或反问句当成未决问题。topic 必须概括一组有共同目标的讨论，不能只是名词堆砌。"
+            "必须通读并均匀覆盖本批的"
             "开头、中段和结尾，不能在达到某个条数后丢弃后半段；宁可减少同一案例的细枝末节，也"
             "不能遗漏后续出现的独立人物、组织、项目、案例、结论或行动。\n"
             + extraction_guidance(content_type.value)
@@ -651,7 +665,7 @@ class OllamaStructuringEngine:
             prompt,
             format_schema=FINDINGS_JSON_SCHEMA,
             model=self.editor_model,
-            num_predict=3072,
+            num_predict=2048,
         )
         return _parse_json_list(response)
 
@@ -671,9 +685,10 @@ class OllamaStructuringEngine:
             stats["segments"] += 1
             stats["characters"] += len(str(segment.get("text") or ""))
         prompt = (
-            "你是资深中文内容编辑。请直接阅读下方完整的校订后逐字稿，生成一篇可直接使用的完整"
-            "笔记，而不是转写片段清单。请自行从完整逐字稿中发现背景、人物、组织、关系、决定和"
-            "关键细节。只返回符合 schema 的 JSON，不要解释。\n"
+            "你是资深中文内容编辑。下方是对完整校订逐字稿逐批阅读后形成的分层阅读包：每个"
+            "batch_range 表示已经完整阅读过的连续原文范围，候选索引携带可回查的原文证据片段。"
+            "请跨批次合并、核验并生成一篇可直接使用的完整笔记，而不是转写片段清单。只返回符合"
+            " schema 的 JSON，不要解释。\n"
             + synthesis_guidance(content_type.value)
             + "\n"
             + output_contract_guidance(content_type.value)
@@ -682,14 +697,18 @@ class OllamaStructuringEngine:
             "核心讨论和"
             "结果；context 提取目的、人物、组织、关系、约束等理解全文必需的上下文；highlights 只"
             "保留真正影响记录目标的信息，数量由原文决定，宁缺毋滥；topics 只作通用索引，按实际"
-            "语义组织，每个主题写概述并列出具体信息；speaker_summaries 只总结最多 8 位有实质"
+            "语义组织，每个主题写概述并列出具体信息；speaker_summaries 只总结最多 16 位有实质"
             "发言者，每人"
             "用简洁 summary 准确概括其核心立场；不能遗漏发言量较大的实质参与者；decisions 只写明确"
             "达成的结论；actions 写清任务，只有原文明确时才填 owner 和 deadline，否则填空字符串；"
-            "risks 与 open_questions 分开。合并重复内容，避免空话、"
+            "risks 与 open_questions 分开。任何口头语、笑声、脏话、情绪感叹、输入法闲聊、"
+            "指代不明的碎片、过程性追问和现场随口指令都不得进入 topics、decisions、actions、"
+            "risks 或 open_questions。没有可靠实质内容的栏目必须返回空数组，禁止为了填满模板而"
+            "收录句子。合并重复内容，避免空话、"
             "Meta 信息和同一内容在多个章节反复出现，保留人名、公司名、数字、范围和时间。\n"
-            "timeline_sections 是独立于内容类型模板的顺序摘要：必须按完整校订逐字稿从头到尾划分"
-            "连续语义段，第一段从逐字稿第一个 segment_id 开始，最后一段到最后一个 segment_id "
+            "timeline_sections 是独立于内容类型模板的顺序摘要：必须按 batch_range 的顺序从头到尾"
+            "划分连续语义段，第一段从第一个 batch_range.start_segment_id 开始，最后一段到最后一个"
+            " batch_range.end_segment_id "
             "结束，相邻段首尾不得跳过或重叠。边界按话题自然转折选择，通常每段约 3-8 分钟，但"
             "不要机械按固定分钟切割；同一话题在后面再次出现时仍保留在后面的时间位置。每段用"
             "具体 title、连贯 summary 和 0-5 条 details 概括该时间段实际内容，不套用会议、访谈、"
@@ -700,22 +719,22 @@ class OllamaStructuringEngine:
             "speaker_summaries 中的核心陈述应优先引用该 speaker_id 自己的"
             "发言；不能确认姓名、所属方或角色时对应字段填空字符串。owner 和 deadline 必须保留"
             "原文说法并能在所引证据中直接找到，禁止推算日期、转换成原文没有的日期或猜测负责人。\n"
-            "下方候选信息索引仅用于检查是否漏掉重要内容；它可能概括不准或重复，必须回到完整逐字稿"
-            "核验后才能写入笔记，不能把索引本身当作事实。\n"
+            "下方候选信息索引仅用于检查是否漏掉重要内容；它可能概括不准或重复，必须回到阅读包中"
+            "随附的原文证据核验后才能写入笔记，不能把索引本身当作事实。\n"
             + json.dumps(findings, ensure_ascii=False)
             + "\n"
             f"内容类型：{content_type.value}\n"
             "说话人发言量统计（characters >= 500 的 speaker 必须进入 speaker_summaries）：\n"
             + json.dumps(speaker_stats, ensure_ascii=False)
             + "\n"
-            "完整校订后逐字稿：\n" + json.dumps(segments, ensure_ascii=False)
+            "完整逐字稿的分层阅读包：\n" + json.dumps(segments, ensure_ascii=False)
         )
         schema = _document_json_schema(content_type)
         response = self._generate(
             prompt,
             format_schema=schema,
             num_predict=4608,
-            num_ctx=24576,
+            num_ctx=GLOBAL_SYNTHESIS_CONTEXT_TOKENS,
             timeout_seconds=1200,
         )
         try:
@@ -732,7 +751,7 @@ class OllamaStructuringEngine:
             "不要输出 JSON 之外的文字。",
             format_schema=schema,
             num_predict=6144,
-            num_ctx=24576,
+            num_ctx=GLOBAL_SYNTHESIS_CONTEXT_TOKENS,
             timeout_seconds=1200,
         )
         return _parse_json_object(retry_response)
@@ -782,7 +801,7 @@ class OllamaStructuringEngine:
             format_schema=_scene_coverage_json_schema(content_type),
             model=self.editor_model,
             num_predict=2048,
-            num_ctx=24576,
+            num_ctx=GLOBAL_SYNTHESIS_CONTEXT_TOKENS,
             timeout_seconds=1200,
         )
         return _parse_json_list(response)
@@ -818,7 +837,7 @@ class OllamaStructuringEngine:
             format_schema=_document_json_schema(ContentType.INTERVIEW),
             model=self.editor_model,
             num_predict=4608,
-            num_ctx=24576,
+            num_ctx=GLOBAL_SYNTHESIS_CONTEXT_TOKENS,
             timeout_seconds=1200,
         )
         return _parse_json_object(response)
@@ -860,7 +879,7 @@ class OllamaStructuringEngine:
                 format_schema=core_schema,
                 model=self.editor_model,
                 num_predict=3072,
-                num_ctx=24576,
+                num_ctx=GLOBAL_SYNTHESIS_CONTEXT_TOKENS,
                 timeout_seconds=1200,
             )
         )
@@ -964,7 +983,7 @@ class OllamaStructuringEngine:
             format_schema=_document_json_schema(ContentType.VOICE_MEMO),
             model=self.editor_model,
             num_predict=4608,
-            num_ctx=24576,
+            num_ctx=GLOBAL_SYNTHESIS_CONTEXT_TOKENS,
             timeout_seconds=1200,
         )
         return _parse_json_object(response)
@@ -1075,7 +1094,7 @@ class OllamaStructuringEngine:
             format_schema=DISCUSSION_THREADS_JSON_SCHEMA,
             model=self.editor_model,
             num_predict=1536,
-            num_ctx=24576,
+            num_ctx=GLOBAL_SYNTHESIS_CONTEXT_TOKENS,
         )
         return _parse_json_list(response)
 
@@ -1116,7 +1135,7 @@ class OllamaStructuringEngine:
             },
             model=self.editor_model,
             num_predict=1024,
-            num_ctx=24576,
+            num_ctx=GLOBAL_SYNTHESIS_CONTEXT_TOKENS,
         )
         return _parse_json_list(response)
 
@@ -1136,7 +1155,7 @@ class OllamaStructuringEngine:
             prompt,
             format_schema=TRANSCRIPT_EDITS_JSON_SCHEMA,
             model=self.editor_model,
-            num_predict=8192,
+            num_predict=4096,
         )
         return _parse_json_list(response)
 
@@ -1334,7 +1353,7 @@ class StructuringExecutor:
         try:
             additions = self.engine.synthesize_missing_scene_sections(
                 document,
-                _synthesis_finding_payload(uncovered),
+                _synthesis_finding_payload(uncovered, aliases=aliases),
                 segments,
                 content_type=content_type,
             )
@@ -1745,6 +1764,38 @@ class StructuringExecutor:
         segments = self._list_all_segments(job_id)
         segments_sha256 = _segments_identity_sha256(segments)
         transcribed = [segment for segment in segments if segment.text]
+        progress_snapshot = self.store.get_job_snapshot(job_id).progress
+        progress_baseline_elapsed = (
+            float(progress_snapshot.elapsed_seconds) if progress_snapshot is not None else 0.0
+        )
+        progress_floor = (
+            float(progress_snapshot.stage_progress)
+            if progress_snapshot is not None and progress_snapshot.stage is JobState.STRUCTURING
+            else 0.0
+        )
+        progress_diarization_status = (
+            progress_snapshot.diarization_status
+            if progress_snapshot is not None
+            else DiarizationStatus.NOT_STARTED
+        )
+        progress_started = time.monotonic()
+
+        def record_structuring_progress(stage_progress: float) -> None:
+            nonlocal progress_floor
+            if job.state is not JobState.STRUCTURING:
+                return
+            progress_floor = max(progress_floor, stage_progress)
+            self.store.put_job_progress(
+                job_id,
+                processed_ms=self.store.get_job_duration_ms(job_id),
+                stage_progress=progress_floor,
+                elapsed_seconds=(
+                    progress_baseline_elapsed + time.monotonic() - progress_started
+                ),
+                diarization_status=progress_diarization_status,
+            )
+
+        record_structuring_progress(0.01)
         evidence = _checkpoint_by_key(
             self.store.list_checkpoints(job_id, stage=STRUCTURING_STAGE),
             STRUCTURING_CHECKPOINT_KEY,
@@ -1807,6 +1858,7 @@ class StructuringExecutor:
                 transcribed,
                 max_chars=DEFAULT_EDITOR_BATCH_MAX_CHARS,
             )
+            record_structuring_progress(0.04)
             for index, batch in enumerate(editor_batches):
                 edit_error: str | None = None
                 try:
@@ -1826,6 +1878,9 @@ class StructuringExecutor:
                         "unavailable_reason_code": edit_error,
                     }
                 )
+                record_structuring_progress(
+                    0.04 + (0.18 * (index + 1) / max(1, len(editor_batches)))
+                )
             transcript_edit_map = _transcript_edit_map(transcript_edit_results)
             segment_payload = _segment_payload(
                 transcribed,
@@ -1839,6 +1894,7 @@ class StructuringExecutor:
             segment_speakers = {segment.segment_id: segment.speaker_id for segment in transcribed}
             segment_starts = {segment.segment_id: segment.start_ms for segment in segments}
             speaker_count = len(speaker_ids)
+            record_structuring_progress(0.24)
             try:
                 automatic_classification = _validate_classification(
                     self.engine.classify(
@@ -1853,6 +1909,7 @@ class StructuringExecutor:
                     traits=(),
                     confidence=0.0,
                 )
+            record_structuring_progress(0.29)
             classification, classification_source = _resolve_content_type(
                 automatic_classification,
                 job.content_type_override,
@@ -1874,6 +1931,9 @@ class StructuringExecutor:
                 if batch_result["unavailable_reason_code"]:
                     unavailable_reasons.append(batch_result["unavailable_reason_code"])
                 batch_results.append(batch_result)
+                record_structuring_progress(
+                    0.30 + (0.25 * (index + 1) / max(1, len(batches)))
+                )
             findings = _merge_findings(batch_results)
             document: dict[str, Any] | None = None
             document_candidate: dict[str, Any] | None = None
@@ -1884,16 +1944,23 @@ class StructuringExecutor:
             voice_memo_quality_repaired = False
             if transcribed:
                 try:
-                    finding_payload = _synthesis_finding_payload(findings)
+                    record_structuring_progress(0.60)
                     synthesis_payload, evidence_aliases = _synthesis_segment_payload(
                         transcribed,
                         transcript_edits=transcript_edit_map,
+                        batch_results=batch_results,
+                    )
+                    finding_payload = _synthesis_finding_payload(
+                        findings,
+                        aliases=evidence_aliases,
+                        batch_results=batch_results,
                     )
                     candidate = self._synthesize_document_with_speaker_coverage(
                         finding_payload,
                         synthesis_payload,
                         content_type=classification.type,
                     )
+                    record_structuring_progress(0.70)
                     if isinstance(candidate, dict):
                         document_candidate = candidate
                     base_document = _remap_document_evidence(
@@ -1908,6 +1975,7 @@ class StructuringExecutor:
                         content_type=classification.type,
                         segment_starts=segment_starts,
                     )
+                    record_structuring_progress(0.78)
                     quality_document = (
                         self._repair_meeting_quality(
                             repaired_document,
@@ -1931,6 +1999,7 @@ class StructuringExecutor:
                             else None
                         )
                     )
+                    record_structuring_progress(0.88)
                     try:
                         document = _validate_document(
                             quality_document or repaired_document,
@@ -1990,6 +2059,7 @@ class StructuringExecutor:
                         str(exc)[:500] if isinstance(exc, StructuringFailed) else None
                     )
                     unavailable_reasons.append(document_error)
+            record_structuring_progress(0.92)
             unavailable_reason = (
                 ",".join(dict.fromkeys(unavailable_reasons)) if unavailable_reasons else None
             )
@@ -2043,6 +2113,7 @@ class StructuringExecutor:
                 raw_sha256=raw_sha256,
                 raw_bytes=raw_bytes,
             )
+            record_structuring_progress(0.95)
             evidence, _ = self.store.put_checkpoint(
                 job_id,
                 stage=STRUCTURING_STAGE,
@@ -2087,7 +2158,27 @@ class StructuringExecutor:
                     "elapsed_seconds": round(elapsed_seconds, 6),
                 },
             )
+            record_structuring_progress(0.98)
+            if document is None:
+                raise StructuringFailed(
+                    "The final structured document is unavailable; "
+                    "artifact publication was blocked."
+                )
         else:
+            if (
+                job.state is JobState.STRUCTURING
+                and evidence.payload.get("document_available") is not True
+            ):
+                self.resynthesize_document(job_id)
+                evidence = _checkpoint_by_key(
+                    self.store.list_checkpoints(job_id, stage=STRUCTURING_STAGE),
+                    STRUCTURING_CHECKPOINT_KEY,
+                )
+                if evidence is None or evidence.payload.get("document_available") is not True:
+                    raise StructuringFailed(
+                        "The final structured document is unavailable; "
+                        "artifact publication was blocked."
+                    )
             classification, findings = self._load_durable_evidence(
                 job_id,
                 evidence=evidence,
@@ -2095,20 +2186,8 @@ class StructuringExecutor:
                 segments_sha256=segments_sha256,
             )
 
-        prior_progress = self.store.get_job_snapshot(job_id).progress
-        prior_elapsed_seconds = (
-            float(prior_progress.elapsed_seconds) if prior_progress is not None else 0.0
-        )
-        elapsed_seconds = prior_elapsed_seconds + float(
-            evidence.payload.get("elapsed_seconds", 0) or 0
-        )
         if job.state is JobState.STRUCTURING:
-            self.store.put_job_progress(
-                job_id,
-                processed_ms=self.store.get_job_duration_ms(job_id),
-                stage_progress=1.0,
-                elapsed_seconds=elapsed_seconds,
-            )
+            record_structuring_progress(1.0)
         current = self.store.get_job(job_id)
         if job.state is JobState.STRUCTURING:
             result_job = self.store.transition_job(
@@ -2142,9 +2221,13 @@ class StructuringExecutor:
         """Regenerate only the global document from durable extraction evidence."""
         job = self.store.get_job(job_id)
         recording_context = self._configure_recording_context(job)
-        if job.state not in {JobState.QUALITY_CHECK, JobState.PROCESSED}:
+        if job.state not in {
+            JobState.STRUCTURING,
+            JobState.QUALITY_CHECK,
+            JobState.PROCESSED,
+        }:
             raise InvalidJobRequest(
-                "Document re-synthesis requires a quality-check or processed job."
+                "Document re-synthesis requires a structuring, quality-check, or processed job."
             )
         plan = self.preprocessor.get_plan(job_id)
         segments = self._list_all_segments(job_id)
@@ -2247,10 +2330,6 @@ class StructuringExecutor:
         }
         segment_speakers = {segment.segment_id: segment.speaker_id for segment in transcribed}
         segment_starts = {segment.segment_id: segment.start_ms for segment in segments}
-        synthesis_payload, evidence_aliases = _synthesis_segment_payload(
-            transcribed,
-            transcript_edits=transcript_edit_map,
-        )
         started = time.monotonic()
         extraction_type_changed = (
             raw_payload.get("extraction_content_type") != classification.type
@@ -2302,6 +2381,11 @@ class StructuringExecutor:
                 )
             raw_payload["batch_results"] = repaired_results
         findings = _merge_findings(raw_payload["batch_results"])
+        synthesis_payload, evidence_aliases = _synthesis_segment_payload(
+            transcribed,
+            transcript_edits=transcript_edit_map,
+            batch_results=raw_payload["batch_results"],
+        )
         document: dict[str, Any] | None = None
         document_candidate: dict[str, Any] | None = None
         document_error: str | None = None
@@ -2340,6 +2424,12 @@ class StructuringExecutor:
                 )
                 if classification.type is ContentType.MEETING:
                     meeting_quality_repair_version = MEETING_QUALITY_REPAIR_VERSION
+                    # The meeting quality editor returns the complete meeting
+                    # outcome surface (decisions, actions, risks and open
+                    # questions). Re-running the narrower outcome editor after
+                    # recovering that exact candidate adds latency and can
+                    # replace already-grounded outcomes without new evidence.
+                    meeting_outcome_repair_version = MEETING_OUTCOME_REPAIR_VERSION
             elif (
                 recording_context_changed
                 or content_type_changed
@@ -2404,7 +2494,11 @@ class StructuringExecutor:
             document_was_resynthesized = candidate is None
             if document_was_resynthesized:
                 candidate = self._synthesize_document_with_speaker_coverage(
-                    _synthesis_finding_payload(findings),
+                    _synthesis_finding_payload(
+                        findings,
+                        aliases=evidence_aliases,
+                        batch_results=raw_payload["batch_results"],
+                    ),
                     synthesis_payload,
                     content_type=classification.type,
                 )
@@ -2638,6 +2732,10 @@ class StructuringExecutor:
             checkpoint_key=STRUCTURING_CHECKPOINT_KEY,
             payload=checkpoint_payload,
         )
+        if document is None:
+            raise StructuringFailed(
+                "The final structured document is unavailable; artifact publication was blocked."
+            )
         summary_revision_key, summary_changed = self._record_summary_revision(
             job_id,
             structuring_generation=updated.generation,
@@ -3255,8 +3353,15 @@ def _synthesis_segment_payload(
     segments: list[TranscriptSegment],
     *,
     transcript_edits: dict[str, str] | None = None,
+    batch_results: list[dict[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, str]]:
-    """Use short evidence aliases to reduce long-context input and structured output."""
+    """Build a bounded map-reduce packet with directly checkable source excerpts.
+
+    Every extraction batch has already read its complete contiguous transcript range.
+    For the global reduce step we retain the range boundaries, every cited evidence
+    segment, and one representative utterance per speaker. This prevents Ollama from
+    silently truncating very long transcripts while preserving evidence traceability.
+    """
 
     edits = transcript_edits or {}
     aliases: dict[str, str] = {}
@@ -3269,18 +3374,138 @@ def _synthesis_segment_payload(
             segment.segment_sequence,
         ),
     )
+    segment_by_id = {segment.segment_id: segment for segment in ordered_segments}
     for index, segment in enumerate(ordered_segments, start=1):
         alias = f"s{index:04d}"
         aliases[alias] = segment.segment_id
-        payload.append(
-            {
-                "segment_id": alias,
-                "start_ms": segment.start_ms,
-                "speaker_id": segment.speaker_id,
-                "text": edits.get(segment.segment_id, segment.text),
+    stable_to_alias = {stable: alias for alias, stable in aliases.items()}
+
+    if not batch_results:
+        retained_ids = {segment.segment_id for segment in ordered_segments}
+        ranges_by_start: dict[str, dict[str, Any]] = {}
+    else:
+        retained_ids: set[str] = set()
+        ranges_by_start = {}
+        for fallback_index, result in enumerate(batch_results):
+            if not isinstance(result, dict):
+                continue
+            ordered_ids = [
+                segment_id
+                for segment_id in result.get("segment_ids", [])
+                if isinstance(segment_id, str) and segment_id in segment_by_id
+            ]
+            if not ordered_ids:
+                continue
+            retained_ids.update((ordered_ids[0], ordered_ids[-1]))
+            for finding in _eligible_batch_findings(result):
+                retained_ids.update(
+                    segment_id
+                    for segment_id in finding.get("evidence", [])[:2]
+                    if isinstance(segment_id, str) and segment_id in segment_by_id
+                )
+            representatives: dict[str, TranscriptSegment] = {}
+            for segment_id in ordered_ids:
+                segment = segment_by_id[segment_id]
+                if not segment.speaker_id:
+                    continue
+                current = representatives.get(segment.speaker_id)
+                if current is None or len(segment.text or "") > len(current.text or ""):
+                    representatives[segment.speaker_id] = segment
+            retained_ids.update(
+                segment.segment_id
+                for segment in sorted(
+                    representatives.values(),
+                    key=lambda item: len(item.text or ""),
+                    reverse=True,
+                )[:4]
+            )
+            ranges_by_start[ordered_ids[0]] = {
+                "batch_index": int(result.get("batch_index", fallback_index)),
+                "start_segment_id": stable_to_alias[ordered_ids[0]],
+                "end_segment_id": stable_to_alias[ordered_ids[-1]],
+                "source_segment_count": len(ordered_ids),
             }
-        )
+
+        # The final meeting validator requires a viewpoint for every speaker
+        # who contributed at least 500 characters in the complete transcript.
+        # Batch-local representatives alone can under-sample a lower-volume
+        # participant, so retain enough of each substantive speaker's own
+        # longest utterances to preserve that same coverage after reduction.
+        segments_by_speaker: dict[str, list[TranscriptSegment]] = {}
+        for segment in ordered_segments:
+            if segment.speaker_id:
+                segments_by_speaker.setdefault(segment.speaker_id, []).append(segment)
+        for speaker_segments in segments_by_speaker.values():
+            if sum(len(segment.text or "") for segment in speaker_segments) < 500:
+                continue
+            retained_characters = sum(
+                len(segment_by_id[segment_id].text or "")
+                for segment_id in retained_ids
+                if segment_by_id[segment_id].speaker_id == speaker_segments[0].speaker_id
+            )
+            for segment in sorted(
+                speaker_segments,
+                key=lambda item: len(item.text or ""),
+                reverse=True,
+            ):
+                if retained_characters >= 500:
+                    break
+                if segment.segment_id in retained_ids:
+                    continue
+                retained_ids.add(segment.segment_id)
+                retained_characters += len(segment.text or "")
+
+    for segment in ordered_segments:
+        if segment.segment_id not in retained_ids:
+            continue
+        item = {
+            "segment_id": stable_to_alias[segment.segment_id],
+            "start_ms": segment.start_ms,
+            "speaker_id": segment.speaker_id,
+            "text": edits.get(segment.segment_id, segment.text),
+        }
+        if segment.segment_id in ranges_by_start:
+            item["batch_range"] = ranges_by_start[segment.segment_id]
+        payload.append(item)
     return payload, aliases
+
+
+def _eligible_batch_findings(result: dict[str, Any]) -> list[dict[str, Any]]:
+    priority = {
+        FindingKind.DECISION: 0,
+        FindingKind.ACTION_ITEM: 0,
+        FindingKind.NEXT_STEP: 0,
+        FindingKind.DEADLINE: 0,
+        FindingKind.DISAGREEMENT: 1,
+        FindingKind.QUESTION: 1,
+        FindingKind.UNCERTAINTY: 1,
+        FindingKind.FACT: 2,
+        FindingKind.TOPIC: 2,
+        FindingKind.IDEA: 3,
+    }
+    candidates: list[tuple[int, int, float, dict[str, Any]]] = []
+    for index, item in enumerate(result.get("findings", [])):
+        if not isinstance(item, dict):
+            continue
+        try:
+            kind = FindingKind(str(item.get("kind")))
+        except ValueError:
+            continue
+        text = item.get("text")
+        confidence = item.get("confidence")
+        if (
+            not isinstance(text, str)
+            or not isinstance(confidence, (int, float))
+            or isinstance(confidence, bool)
+            or confidence < 0.5
+            or not _is_substantive_finding_text(kind, text)
+        ):
+            continue
+        candidates.append((priority[kind], index, float(confidence), item))
+    selected = sorted(candidates, key=lambda row: (row[0], -row[2], row[1]))[
+        :MAX_SYNTHESIS_FINDINGS_PER_BATCH
+    ]
+    return [row[3] for row in sorted(selected, key=lambda row: row[1])]
 
 
 def _meeting_quality_segments(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -3608,18 +3833,81 @@ def _transcript_edit_map(batch_results: Any) -> dict[str, str]:
     return edits
 
 
-def _synthesis_finding_payload(findings: tuple[Finding, ...]) -> list[dict[str, Any]]:
-    """Keep candidate hints compact because the final model also receives the full transcript."""
+def _synthesis_finding_payload(
+    findings: tuple[Finding, ...],
+    *,
+    aliases: dict[str, str] | None = None,
+    batch_results: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Keep map-stage candidates compact and align them with reduce-stage aliases."""
 
-    return [
-        {
-            "kind": finding.kind.value,
-            "text": finding.text,
-            "evidence": list(finding.evidence),
-        }
-        for finding in findings
-        if not finding.unsupported
-    ]
+    stable_to_alias = {
+        stable: alias for alias, stable in (aliases or {}).items()
+    }
+    segment_batches: dict[str, int] = {}
+    for fallback_index, result in enumerate(batch_results or []):
+        if not isinstance(result, dict):
+            continue
+        batch_index = int(result.get("batch_index", fallback_index))
+        for segment_id in result.get("segment_ids", []):
+            if isinstance(segment_id, str):
+                segment_batches[segment_id] = batch_index
+
+    priority = {
+        FindingKind.DECISION: 0,
+        FindingKind.ACTION_ITEM: 0,
+        FindingKind.NEXT_STEP: 0,
+        FindingKind.DEADLINE: 0,
+        FindingKind.DISAGREEMENT: 1,
+        FindingKind.QUESTION: 1,
+        FindingKind.UNCERTAINTY: 1,
+        FindingKind.FACT: 2,
+        FindingKind.TOPIC: 2,
+        FindingKind.IDEA: 3,
+    }
+    grouped: dict[int, list[Finding]] = {}
+    for finding in findings:
+        if (
+            finding.unsupported
+            or finding.confidence < 0.5
+            or not _is_substantive_finding_text(finding.kind, finding.text)
+        ):
+            continue
+        batch_indexes = sorted(
+            {
+                segment_batches[value]
+                for value in finding.evidence
+                if value in segment_batches
+            }
+        )
+        grouped.setdefault(batch_indexes[0] if batch_indexes else -1, []).append(finding)
+
+    payload: list[dict[str, Any]] = []
+    for batch_index in sorted(grouped):
+        selected = sorted(
+            grouped[batch_index],
+            key=lambda item: (priority[item.kind], -item.confidence, item.text),
+        )[:MAX_SYNTHESIS_FINDINGS_PER_BATCH]
+        for finding in selected:
+            evidence = [
+                stable_to_alias.get(value, value) for value in finding.evidence[:2]
+            ]
+            batch_indexes = sorted(
+                {
+                    segment_batches[value]
+                    for value in finding.evidence
+                    if value in segment_batches
+                }
+            )
+            item: dict[str, Any] = {
+                "kind": finding.kind.value,
+                "text": finding.text,
+                "evidence": evidence,
+            }
+            if batch_indexes:
+                item["batch_indexes"] = batch_indexes
+            payload.append(item)
+    return payload
 
 
 def _select_uncovered_scene_findings(
@@ -3718,13 +4006,16 @@ def _build_batches(
     segments: list[TranscriptSegment],
     *,
     max_chars: int,
+    max_segments: int = DEFAULT_BATCH_MAX_SEGMENTS,
 ) -> tuple[tuple[TranscriptSegment, ...], ...]:
     batches: list[tuple[TranscriptSegment, ...]] = []
     current: list[TranscriptSegment] = []
     current_chars = 0
     for segment in segments:
         length = len(segment.text or "")
-        if current and current_chars + length > max_chars:
+        if current and (
+            current_chars + length > max_chars or len(current) >= max_segments
+        ):
             batches.append(tuple(current))
             current = []
             current_chars = 0
@@ -3808,6 +4099,8 @@ def _validate_findings(
                 "The structuring engine returned invalid finding confidence.",
                 details={"finding_index": index},
             )
+        if not _is_substantive_finding_text(kind, text):
+            continue
         findings.append(
             Finding(
                 finding_id=f"finding_{index:04d}",
@@ -3820,6 +4113,63 @@ def _validate_findings(
             )
         )
     return tuple(findings)
+
+
+def _is_substantive_finding_text(kind: FindingKind, text: str) -> bool:
+    """Reject conversational debris before it can reach a final-note category."""
+
+    normalized = re.sub(r"\s+", "", text).strip("，。！？!?；;：:、…·~～—-（）()[]【】\"'“”‘’")
+    if not normalized:
+        return False
+    filler = {
+        "嗯",
+        "啊",
+        "哦",
+        "噢",
+        "对",
+        "是",
+        "好",
+        "好的",
+        "可以",
+        "不错",
+        "继续",
+        "谢谢",
+        "我操",
+        "你",
+        "公司有",
+        "最近工作",
+        "就是那个",
+        "工厂",
+        "外协工厂",
+    }
+    if normalized in filler:
+        return False
+    if re.fullmatch(r"(?:哈|呵|嘿|哎|诶|呃|额|嗯|啊|哦|噢|对)+", normalized):
+        return False
+    if re.fullmatch(r"(?:这个|那个|然后|就是|你|我|他|她|它|都|有|是|可以)+", normalized):
+        return False
+    if len(set(normalized)) <= 3 and len(normalized) >= 8:
+        return False
+    if len(normalized) < 4:
+        return False
+    if kind is FindingKind.QUESTION:
+        interrogative = re.search(
+            r"(?:什么|为何|为什么|是否|能否|怎么|如何|哪(?:个|些|里)?|谁|多少|几|"
+            r"要不要|可不可以|有没有|吗|呢)",
+            normalized,
+        )
+        if "?" not in text and "？" not in text and interrogative is None:
+            return False
+    if kind in {FindingKind.ACTION_ITEM, FindingKind.NEXT_STEP}:
+        if len(normalized) < 6:
+            return False
+        if re.match(r"^(?:你|我|他)(?:写|加|弄|搞|看|说|记|划|放)", normalized) and len(
+            normalized
+        ) <= 14:
+            return False
+    if kind is FindingKind.DECISION and len(normalized) < 6:
+        return False
+    return True
 
 
 def _validate_transcript_edits(
@@ -3956,8 +4306,14 @@ def _validate_document(
                 ),
             }
         )
-    if content_type is ContentType.MEETING and len(context) < 2:
-        raise StructuringFailed("The meeting document has too little background context.")
+    if content_type is ContentType.MEETING:
+        has_multiple_context_facets = len(context) >= 2
+        has_single_rich_context = len(context) == 1 and (
+            len(context[0]["text"].strip()) >= MIN_RICH_MEETING_CONTEXT_CHARACTERS
+            and len(context[0]["evidence"]) >= 2
+        )
+        if not (has_multiple_context_facets or has_single_rich_context):
+            raise StructuringFailed("The meeting document has too little background context.")
     if content_type is ContentType.INTERVIEW:
         context = [
             {
@@ -4191,12 +4547,14 @@ def _validate_document(
             field=f"discussion_threads[{index}].initial_position",
         )
         raw_developments = item.get("developments")
-        if (
-            not isinstance(raw_developments, list)
-            or not raw_developments
-            or len(raw_developments) > 3
-        ):
+        if not isinstance(raw_developments, list) or len(raw_developments) > 3:
             raise StructuringFailed("The structured document has invalid developments.")
+        if not raw_developments:
+            # A topic without an observable development is still useful as a
+            # topic, but it is not a discussion thread. Dropping the empty
+            # shell keeps the final note honest without invalidating the
+            # evidence-grounded document around it.
+            continue
         developments = [
             _validate_evidence_text(
                 development,
@@ -4283,7 +4641,10 @@ def _validate_document(
     )
 
     raw_speaker_summaries = raw.get("speaker_summaries")
-    if not isinstance(raw_speaker_summaries, list) or len(raw_speaker_summaries) > 8:
+    if (
+        not isinstance(raw_speaker_summaries, list)
+        or len(raw_speaker_summaries) > MAX_SPEAKER_SUMMARIES
+    ):
         raise StructuringFailed("The structured document has invalid speaker summaries.")
     speaker_summaries: list[dict[str, Any]] = []
     seen_speakers: set[str] = set()

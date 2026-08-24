@@ -125,6 +125,8 @@ class FakeStructuringEngine:
     def synthesize_document(self, findings, segments, *, content_type):
         evidence = list(findings[0]["evidence"])
         text = findings[0]["text"]
+        start_segment_id = segments[0]["segment_id"]
+        end_segment_id = segments[-1]["segment_id"]
         return {
             "title": "端到端测试会议",
             "summary": {"text": text, "evidence": evidence},
@@ -155,10 +157,20 @@ class FakeStructuringEngine:
                 for index in range(5)
             ],
             "speaker_summaries": [],
+            "discussion_threads": [],
             "decisions": [],
             "actions": [],
             "risks": [],
             "open_questions": [],
+            "timeline_sections": [
+                {
+                    "title": "端到端测试主题",
+                    "summary": text,
+                    "details": [text],
+                    "start_segment_id": start_segment_id,
+                    "end_segment_id": end_segment_id,
+                }
+            ],
         }
 
     def synthesize_discussion_threads(self, segments, *, content_type):
@@ -166,6 +178,9 @@ class FakeStructuringEngine:
 
     def reconcile_decisions(self, document, segments, *, content_type):
         return list(document.get("decisions", []))
+
+    def refine_meeting_document(self, document, segments):
+        return document
 
     def polish_transcript_batch(self, segments):
         return [

@@ -7,6 +7,7 @@ import io
 import json
 import shutil
 import wave
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -31,13 +32,16 @@ from speech_capture_worker.resources import (
 )
 from speech_capture_worker.structuring_execution import (
     ContentType,
+    FindingKind,
     OllamaStructuringEngine,
     StructuringExecutor,
     StructuringOutcome,
     _dedupe_document_categories,
     _document_json_schema,
+    _is_substantive_finding_text,
     _repair_speaker_supplement_evidence,
     _sanitize_quality_evidence_references,
+    _synthesis_segment_payload,
     _timeline_window_boundaries,
     _validate_document,
 )
@@ -525,6 +529,42 @@ def test_meeting_validation_drops_a_thread_whose_development_predates_its_initia
     assert validated["discussion_threads"] == []
 
 
+def test_meeting_validation_drops_a_thread_without_developments() -> None:
+    engine = FakeStructuringEngine()
+    segments = [
+        {"segment_id": "seg_initial", "speaker_id": None, "text": "提出订单问题。"},
+        {"segment_id": "seg_current", "speaker_id": None, "text": "说明当前处理方向。"},
+    ]
+    document = engine.synthesize_document([], segments, content_type=ContentType.MEETING)
+    document["discussion_threads"] = [
+        {
+            "title": "只有起点和当前方向的空壳主线",
+            "initial_position": {"text": "提出订单问题。", "evidence": ["seg_initial"]},
+            "developments": [],
+            "current_direction": {
+                "text": "说明当前处理方向。",
+                "evidence": ["seg_current"],
+            },
+            "status": "open",
+        }
+    ]
+
+    validated = _validate_document(
+        document,
+        segment_ids={"seg_initial", "seg_current"},
+        speaker_ids=set(),
+        content_type=ContentType.MEETING,
+        segment_texts={
+            "seg_initial": "提出订单问题。",
+            "seg_current": "说明当前处理方向。",
+        },
+        segment_speakers={"seg_initial": None, "seg_current": None},
+        segment_starts={"seg_initial": 1_000, "seg_current": 2_000},
+    )
+
+    assert validated["discussion_threads"] == []
+
+
 def test_meeting_document_with_empty_scene_sections_is_revalidatable() -> None:
     engine = FakeStructuringEngine()
     segments = [
@@ -545,6 +585,156 @@ def test_meeting_document_with_empty_scene_sections_is_revalidatable() -> None:
     )
 
     assert validated["scene_sections"] == []
+
+
+def test_meeting_validation_accepts_one_evidence_rich_context_item() -> None:
+    engine = FakeStructuringEngine()
+    segments = [
+        {"segment_id": "seg_one", "speaker_id": "speaker_01", "text": "介绍项目背景。"},
+        {"segment_id": "seg_two", "speaker_id": "speaker_02", "text": "说明会议目标。"},
+    ]
+    document = engine.synthesize_document([], segments, content_type=ContentType.MEETING)
+    document["discussion_threads"] = []
+    document["context"] = [
+        {
+            "kind": "background",
+            "title": "项目背景、参与方与会议目标",
+            "text": (
+                "本次会议围绕项目操作流程、数据准确性与系统优化展开，参与方共同梳理"
+                "当前业务背景、约束条件和协作边界，并以明确后续执行规则和责任分工为目标。"
+                "讨论还覆盖现有问题、实施顺序和需要共同确认的验收标准。"
+            ),
+            "evidence": ["seg_one", "seg_two"],
+        }
+    ]
+
+    validated = _validate_document(
+        document,
+        segment_ids={"seg_one", "seg_two"},
+        speaker_ids=set(),
+        content_type=ContentType.MEETING,
+        segment_texts={"seg_one": "介绍项目背景。", "seg_two": "说明会议目标。"},
+        segment_speakers={"seg_one": None, "seg_two": None},
+        segment_starts={"seg_one": 1_000, "seg_two": 2_000},
+    )
+
+    assert len(validated["context"]) == 1
+
+
+def test_meeting_validation_rejects_one_terse_context_item() -> None:
+    engine = FakeStructuringEngine()
+    segments = [
+        {"segment_id": "seg_one", "speaker_id": "speaker_01", "text": "介绍项目背景。"},
+        {"segment_id": "seg_two", "speaker_id": "speaker_02", "text": "说明会议目标。"},
+    ]
+    document = engine.synthesize_document([], segments, content_type=ContentType.MEETING)
+    document["discussion_threads"] = []
+    document["context"] = [
+        {
+            "kind": "background",
+            "title": "会议背景",
+            "text": "讨论项目。",
+            "evidence": ["seg_one", "seg_two"],
+        }
+    ]
+
+    with pytest.raises(StructuringFailed, match="too little background context"):
+        _validate_document(
+            document,
+            segment_ids={"seg_one", "seg_two"},
+            speaker_ids=set(),
+            content_type=ContentType.MEETING,
+            segment_texts={"seg_one": "介绍项目背景。", "seg_two": "说明会议目标。"},
+            segment_speakers={"seg_one": None, "seg_two": None},
+            segment_starts={"seg_one": 1_000, "seg_two": 2_000},
+        )
+
+
+def test_synthesis_packet_retains_every_substantive_speakers_own_words() -> None:
+    segments = []
+    sequence = 0
+    for speaker_index in range(4):
+        sequence += 1
+        segments.append(
+            SimpleNamespace(
+                segment_id=f"seg_major_{speaker_index}",
+                segment_sequence=sequence,
+                start_ms=sequence * 1_000,
+                end_ms=sequence * 1_000 + 900,
+                speaker_id=f"speaker_0{speaker_index + 1}",
+                text="主要发言" * 50,
+            )
+        )
+    for part in range(6):
+        sequence += 1
+        segments.append(
+            SimpleNamespace(
+                segment_id=f"seg_lower_volume_{part}",
+                segment_sequence=sequence,
+                start_ms=sequence * 1_000,
+                end_ms=sequence * 1_000 + 900,
+                speaker_id="speaker_05",
+                text="补充观点" * 25,
+            )
+        )
+    batch_results = [
+        {
+            "batch_index": 0,
+            "segment_ids": [segment.segment_id for segment in segments],
+            "findings": [],
+        }
+    ]
+
+    payload, _ = _synthesis_segment_payload(segments, batch_results=batch_results)
+    retained_lower_volume_characters = sum(
+        len(item["text"])
+        for item in payload
+        if item["speaker_id"] == "speaker_05"
+    )
+
+    assert retained_lower_volume_characters >= 500
+
+
+def test_meeting_validation_accepts_nine_grounded_speaker_summaries() -> None:
+    engine = FakeStructuringEngine()
+    segments = [
+        {
+            "segment_id": f"seg_{index}",
+            "speaker_id": f"speaker_{index:02d}",
+            "text": f"第 {index} 位参与者说明自己的具体观点。",
+        }
+        for index in range(1, 10)
+    ]
+    document = engine.synthesize_document([], segments, content_type=ContentType.MEETING)
+    document["discussion_threads"] = []
+    document["speaker_summaries"] = [
+        {
+            "speaker_id": segment["speaker_id"],
+            "display_name": "",
+            "affiliation": "",
+            "role": "",
+            "summary": segment["text"],
+            "evidence": [segment["segment_id"]],
+        }
+        for segment in segments
+    ]
+
+    validated = _validate_document(
+        document,
+        segment_ids={segment["segment_id"] for segment in segments},
+        speaker_ids={segment["speaker_id"] for segment in segments},
+        content_type=ContentType.MEETING,
+        segment_texts={segment["segment_id"]: segment["text"] for segment in segments},
+        segment_speakers={
+            segment["segment_id"]: segment["speaker_id"] for segment in segments
+        },
+        segment_starts={
+            segment["segment_id"]: index * 1_000
+            for index, segment in enumerate(segments)
+        },
+    )
+
+    assert len(validated["speaker_summaries"]) == 9
 
 
 def create_structuring_job(
@@ -652,9 +842,15 @@ def test_structuring_classifies_and_extracts_evidence_linked_findings(tmp_path) 
         assert engine.synthesize_calls == 1
         assert engine.polish_calls >= 1
         assert all(item["text"].endswith("。") for batch in engine.extract_inputs for item in batch)
-        assert len(engine.synthesize_inputs[0]) == len(
+        assert len(engine.synthesize_inputs[0]) < len(
             [segment for segment in snapshot.stable_segments if segment.text]
         )
+        assert engine.synthesize_inputs[0][0]["batch_range"] == {
+            "batch_index": 0,
+            "start_segment_id": "s0001",
+            "end_segment_id": "s0004",
+            "source_segment_count": 4,
+        }
         assert all(item["segment_id"].startswith("s") for item in engine.synthesize_inputs[0])
         assert all(item["text"].endswith("。") for item in engine.synthesize_inputs[0])
         assert raw["prompt_version"] == "2026-08-02.9"
@@ -663,6 +859,42 @@ def test_structuring_classifies_and_extracts_evidence_linked_findings(tmp_path) 
             len(batch["transcript_edits"]) for batch in raw["transcript_edit_results"]
         ) == len(snapshot.stable_segments)
         assert any(checkpoint.checkpoint_key == "structuring_result" for checkpoint in checkpoints)
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")
+def test_structuring_replaces_inherited_progress_before_first_model_call(tmp_path) -> None:
+    with JobStore(
+        tmp_path / "worker.sqlite3",
+        source_probe=source_probe_for(95),
+    ) as store:
+        job = create_structuring_job(
+            store,
+            duration_seconds=95,
+            suffix="progress-reset",
+        )
+        engine = FakeStructuringEngine()
+        original_polish = engine.polish_transcript_batch
+        observed_progress = []
+
+        def observe_progress(segments):
+            observed_progress.append(store.get_job_snapshot(job.job_id).progress)
+            return original_polish(segments)
+
+        engine.polish_transcript_batch = observe_progress
+        StructuringExecutor(
+            store,
+            engine,
+            boundary_preflight=preflight(),
+        ).run(job.job_id)
+
+        assert observed_progress
+        assert observed_progress[0] is not None
+        assert observed_progress[0].stage is JobState.STRUCTURING
+        assert observed_progress[0].stage_progress == pytest.approx(0.04)
+        completed = store.get_job_snapshot(job.job_id).progress
+        assert completed is not None
+        assert completed.stage is JobState.STRUCTURING
+        assert completed.stage_progress == pytest.approx(1.0)
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")
@@ -1216,7 +1448,7 @@ def test_structuring_safely_pauses_before_model_work(tmp_path) -> None:
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")
-def test_structuring_engine_failure_degrades_without_inventing_findings(tmp_path) -> None:
+def test_structuring_engine_failure_blocks_artifact_publication(tmp_path) -> None:
     with JobStore(
         tmp_path / "worker.sqlite3",
         source_probe=source_probe_for(95),
@@ -1226,11 +1458,12 @@ def test_structuring_engine_failure_degrades_without_inventing_findings(tmp_path
             duration_seconds=95,
             suffix="fallback",
         )
-        result = StructuringExecutor(
-            store,
-            FakeStructuringEngine(error=RuntimeError("private failure detail")),
-            boundary_preflight=preflight(),
-        ).run(job.job_id)
+        with pytest.raises(StructuringFailed, match="publication was blocked"):
+            StructuringExecutor(
+                store,
+                FakeStructuringEngine(error=RuntimeError("private failure detail")),
+                boundary_preflight=preflight(),
+            ).run(job.job_id)
         checkpoints = store.list_checkpoints(job.job_id, stage="structuring")
         evidence = next(
             checkpoint
@@ -1239,11 +1472,10 @@ def test_structuring_engine_failure_degrades_without_inventing_findings(tmp_path
         )
         raw_path = store.data_directory / evidence.payload["raw_relative_path"]
 
-        assert result.outcome is StructuringOutcome.COMPLETED
-        assert result.job.state is JobState.QUALITY_CHECK
-        assert result.content_type is ContentType.GENERIC
-        assert result.finding_count == 0
-        assert result.unavailable_reason_code == "RuntimeError"
+        assert store.get_job(job.job_id).state is JobState.STRUCTURING
+        assert evidence.payload["document_available"] is False
+        assert evidence.payload["finding_count"] == 0
+        assert evidence.payload["unavailable_reason_code"] == "RuntimeError"
         assert b"private failure detail" not in raw_path.read_bytes()
 
 
@@ -1459,6 +1691,33 @@ def test_ollama_engine_requires_valid_model_name() -> None:
         OllamaStructuringEngine(model="   ")
 
 
+@pytest.mark.parametrize(
+    ("kind", "text"),
+    [
+        ("action_item", "不错。"),
+        ("action_item", "你写上，写备注嘛。"),
+        ("question", "你。"),
+        ("question", "哈哈哈哈哈！"),
+        ("decision", "嗯。"),
+        ("topic", "那个那个那个那个。"),
+    ],
+)
+def test_findings_reject_conversational_debris(kind: str, text: str) -> None:
+    assert _is_substantive_finding_text(FindingKind(kind), text) is False
+
+
+@pytest.mark.parametrize(
+    ("kind", "text"),
+    [
+        ("action_item", "国伟负责开发数据治理演示版本。"),
+        ("question", "库存数据由哪个系统提供，维护责任归谁？"),
+        ("decision", "会议确认先统一数据标准，再开展系统对接。"),
+    ],
+)
+def test_findings_keep_substantive_meeting_outcomes(kind: str, text: str) -> None:
+    assert _is_substantive_finding_text(FindingKind(kind), text) is True
+
+
 def test_ollama_document_synthesis_retries_truncated_json(monkeypatch) -> None:
     engine = OllamaStructuringEngine(model="qwen3:14b", editor_model="qwen3:8b")
     responses = iter(['{"title":"未闭合"', '{"title":"完整文档"}'])
@@ -1537,7 +1796,7 @@ def test_nonmeeting_profiles_have_scene_specific_synthesis_contracts(
     assert "不得为了固定条数填充" in captured["prompt"]
     assert "不可遗漏的候选事实" in captured["prompt"]
     assert "候选信息索引仅用于检查" in captured["prompt"]
-    assert "完整校订后逐字稿" in captured["prompt"]
+    assert "完整逐字稿的分层阅读包" in captured["prompt"]
     assert "独立于内容类型模板的顺序摘要" in captured["prompt"]
 
 

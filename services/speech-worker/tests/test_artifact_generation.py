@@ -999,6 +999,38 @@ def test_artifact_generation_requires_structuring_evidence(tmp_path) -> None:
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")
+def test_artifact_generation_blocks_unvalidated_structuring_document(tmp_path) -> None:
+    with JobStore(
+        tmp_path / "worker.sqlite3",
+        source_probe=source_probe_for(95),
+    ) as store:
+        job = create_quality_check_job(
+            store,
+            duration_seconds=95,
+            suffix="missing-document",
+        )
+        checkpoint = next(
+            item
+            for item in store.list_checkpoints(job.job_id, stage="structuring")
+            if item.checkpoint_key == "structuring_result"
+        )
+        payload = dict(checkpoint.payload)
+        payload["document_available"] = False
+        store.put_checkpoint(
+            job.job_id,
+            stage="structuring",
+            checkpoint_key="structuring_result",
+            payload=payload,
+        )
+
+        with pytest.raises(
+            ArtifactGenerationFailed,
+            match="validated final structured document",
+        ):
+            ArtifactGenerator(store).generate(job.job_id)
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")
 def test_vault_publisher_atomically_publishes_and_verifies_complete_package(
     tmp_path,
 ) -> None:
