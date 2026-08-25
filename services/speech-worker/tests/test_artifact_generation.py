@@ -744,6 +744,19 @@ def test_regeneration_preserves_manual_note_section_verbatim_and_rehashes_packag
             suffix="manual-section",
         )
         first = ArtifactGenerator(store).generate(job.job_id)
+        lease, _, _ = store.claim_publication(
+            job.job_id,
+            publisher_id="local_vault",
+            target_relative_path="Speech/Undated/manual-section",
+            manifest_sha256=first.manifest_sha256,
+            expected_revision=first.job.revision,
+        )
+        store.acknowledge_publication(
+            job.job_id,
+            lease_id=lease.lease_id,
+            publisher_id="local_vault",
+            manifest_sha256=first.manifest_sha256,
+        )
         package = store.get_job_stage_directory(job.job_id, stage="artifacts")
         note_path = package / "note.md"
         original = note_path.read_text("utf-8")
@@ -765,6 +778,12 @@ def test_regeneration_preserves_manual_note_section_verbatim_and_rehashes_packag
         evidence_note = (package / "note.evidence.md").read_text("utf-8")
         manifest = json.loads((package / "artifact-manifest.json").read_text("utf-8"))
         replayed = ArtifactGenerator(store).generate(job.job_id)
+        current_receipt = store.get_publication_receipt(job.job_id)
+        archived_receipts = store._connection.execute(  # noqa: SLF001
+            "SELECT manifest_sha256, reason_code FROM publication_receipt_history "
+            "WHERE job_id = ?",
+            (job.job_id,),
+        ).fetchall()
 
     assert regenerated.outcome is ArtifactOutcome.REGENERATED
     assert regenerated.manifest_sha256 != first.manifest_sha256
@@ -776,6 +795,10 @@ def test_regeneration_preserves_manual_note_section_verbatim_and_rehashes_packag
         note.encode("utf-8")
     ).hexdigest()
     assert replayed.outcome is ArtifactOutcome.ALREADY_GENERATED
+    assert current_receipt is None
+    assert [(row["manifest_sha256"], row["reason_code"]) for row in archived_receipts] == [
+        (first.manifest_sha256, "artifact_manifest_replaced")
+    ]
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")

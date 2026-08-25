@@ -39,12 +39,34 @@ describe("summary diff", () => {
     });
     expect(changes[2]).toMatchObject({
       kind: "removed",
-      beforeText: "• 旧风险"
+      beforeText: "• 旧风险",
+      evidenceIds: [],
+      deletionBasisMissing: true
     });
     expect(countSummaryChanges(changes)).toEqual({
       added: 1,
       modified: 1,
       removed: 1
+    });
+  });
+
+  it("hides derived chapters and uses user-facing labels for timeline sections", () => {
+    const changes = buildSummaryChanges(
+      {
+        chapters: [{ title: "旧派生章节" }],
+        timeline_sections: [{ title: "开场" }]
+      },
+      {
+        chapters: [],
+        timeline_sections: [{ title: "项目背景" }]
+      }
+    );
+
+    expect(changes).toHaveLength(1);
+    expect(changes[0]).toMatchObject({
+      id: "timeline_sections",
+      label: "按时间顺序摘要",
+      kind: "modified"
     });
   });
 

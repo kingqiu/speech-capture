@@ -2145,6 +2145,56 @@
         "title": "SummaryRevisionDecisionRequestSchema",
         "type": "object"
       },
+      "SummaryRevisionDraftEnvelope": {
+        "additionalProperties": false,
+        "properties": {
+          "job": {
+            "$ref": "#/components/schemas/JobSchema"
+          },
+          "revision": {
+            "$ref": "#/components/schemas/SummaryRevisionSchema"
+          },
+          "saved": {
+            "title": "Saved",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "job",
+          "revision",
+          "saved"
+        ],
+        "title": "SummaryRevisionDraftEnvelope",
+        "type": "object"
+      },
+      "SummaryRevisionDraftRequestSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "expected_draft_version": {
+            "minimum": 0.0,
+            "title": "Expected Draft Version",
+            "type": "integer"
+          },
+          "expected_revision": {
+            "minimum": 0.0,
+            "title": "Expected Revision",
+            "type": "integer"
+          },
+          "markdown": {
+            "maxLength": 2000000,
+            "minLength": 1,
+            "title": "Markdown",
+            "type": "string"
+          }
+        },
+        "required": [
+          "expected_revision",
+          "expected_draft_version",
+          "markdown"
+        ],
+        "title": "SummaryRevisionDraftRequestSchema",
+        "type": "object"
+      },
       "SummaryRevisionListResponse": {
         "additionalProperties": false,
         "properties": {
@@ -2287,6 +2337,45 @@
             "title": "Diff Truncated",
             "type": "boolean"
           },
+          "draft_markdown": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Draft Markdown"
+          },
+          "draft_sha256": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Draft Sha256"
+          },
+          "draft_updated_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Draft Updated At"
+          },
+          "draft_version": {
+            "minimum": 0.0,
+            "title": "Draft Version",
+            "type": "integer"
+          },
           "revision_key": {
             "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$",
             "title": "Revision Key",
@@ -2319,7 +2408,11 @@
           "diff_truncated",
           "created_at",
           "decided_at",
-          "artifact_manifest_sha256"
+          "artifact_manifest_sha256",
+          "draft_markdown",
+          "draft_version",
+          "draft_updated_at",
+          "draft_sha256"
         ],
         "title": "SummaryRevisionSchema",
         "type": "object"
@@ -6894,6 +6987,162 @@
           }
         ],
         "summary": "Decide Job Summary Revision",
+        "tags": [
+          "summaries"
+        ]
+      }
+    },
+    "/v1/jobs/{job_id}/summary-revisions/{revision_key}/draft": {
+      "put": {
+        "operationId": "saveJobSummaryRevisionDraft",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "title": "Job Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "revision_key",
+            "required": true,
+            "schema": {
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$",
+              "title": "Revision Key",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "title": "Idempotency-Key",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SummaryRevisionDraftRequestSchema"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SummaryRevisionDraftEnvelope"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Request Entity Too Large"
+          },
+          "415": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Unsupported Media Type"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Save Job Summary Revision Draft",
         "tags": [
           "summaries"
         ]

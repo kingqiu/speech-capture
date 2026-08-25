@@ -86,6 +86,51 @@ describe("Vault publication", () => {
     ).resolves.toBe(`${target}（新 2）`);
   });
 
+  it("publishes an accepted replacement to a verified new path and leaves the old Note intact", async () => {
+    const adapter = new MemoryAdapter();
+    const originalPackage = syntheticPackage("旧版 Note");
+    const replacementPackage = syntheticPackage("人工确认后的新版 Note");
+    const originalTarget = "语音笔记/2026-08-03-合成会议";
+    await publication.writePublicationPackage(adapter as never, {
+      targetRelativePath: originalTarget,
+      leaseId: "lease_original",
+      packageData: originalPackage
+    });
+
+    const inspection = await publication.inspectPublicationTarget(
+      adapter as never,
+      originalTarget,
+      replacementPackage
+    );
+    expect(inspection.kind).toBe("conflict");
+
+    const replacementTarget = await publication.chooseNewPublicationPath(
+      adapter as never,
+      originalTarget
+    );
+    await publication.writePublicationPackage(adapter as never, {
+      targetRelativePath: replacementTarget,
+      leaseId: "lease_replacement",
+      packageData: replacementPackage
+    });
+
+    const oldNote = new TextDecoder().decode(
+      new Uint8Array(await adapter.readBinary(`${originalTarget}/note.md`))
+    );
+    const newNote = new TextDecoder().decode(
+      new Uint8Array(await adapter.readBinary(`${replacementTarget}/note.md`))
+    );
+    expect(oldNote).toContain("旧版 Note");
+    expect(newNote).toContain("人工确认后的新版 Note");
+    await expect(
+      publication.inspectPublicationTarget(
+        adapter as never,
+        replacementTarget,
+        replacementPackage
+      )
+    ).resolves.toEqual({ kind: "matching" });
+  });
+
   it("removes only its own temporary directory when writing fails", async () => {
     const adapter = new MemoryAdapter("note.evidence.md");
     const target = "语音笔记/2026-08-03-合成会议";
@@ -103,7 +148,7 @@ describe("Vault publication", () => {
   });
 });
 
-function syntheticPackage(): DownloadedPublicationPackage {
+function syntheticPackage(noteText = "Worker 待发布的合成结论。"): DownloadedPublicationPackage {
   const names = [
     "transcript.raw.json",
     "transcript.md",
@@ -116,7 +161,7 @@ function syntheticPackage(): DownloadedPublicationPackage {
   const files = names.map((name) => {
     const bytes = new TextEncoder().encode(
       name === "note.md"
-        ? "# 合成会议\n\n- Worker 待发布的合成结论。"
+        ? `# 合成会议\n\n- ${noteText}`
         : `{\"file\":\"${name}\"}`
     );
     return {

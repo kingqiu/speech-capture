@@ -1027,6 +1027,64 @@ class JobStore:
             ).fetchone()
             return self._row_to_publication_receipt(row) if row is not None else None
 
+    def archive_stale_publication_receipt(
+        self,
+        job_id: str,
+        *,
+        current_manifest_sha256: str,
+        reason_code: str = "artifact_manifest_replaced",
+    ) -> PublicationReceiptRecord | None:
+        """Archive an acknowledgement that no longer describes current artifacts.
+
+        A published job may legitimately produce a new immutable artifact package
+        after an accepted summary revision.  The old acknowledgement remains useful
+        as history, but it must not continue to advertise the superseded Vault path
+        as the current Note.
+        """
+
+        if not isinstance(current_manifest_sha256, str) or not SHA256_PATTERN.fullmatch(
+            current_manifest_sha256
+        ):
+            raise InvalidJobRequest("current_manifest_sha256 must be lowercase SHA-256.")
+        validate_reason_code(reason_code)
+        with self._transaction():
+            current = self._row_to_job(self._fetch_job_row(job_id))
+            row = self._connection.execute(
+                "SELECT * FROM publication_receipts WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            receipt = self._row_to_publication_receipt(row)
+            if receipt.manifest_sha256 == current_manifest_sha256:
+                return None
+            now = _utc_now()
+            self._connection.execute(
+                """
+                INSERT INTO publication_receipt_history (
+                    job_id, lease_id, publisher_id, target_relative_path,
+                    manifest_sha256, published_at, archived_at,
+                    reason_code, triggering_revision, correction_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                """,
+                (
+                    receipt.job_id,
+                    receipt.lease_id,
+                    receipt.publisher_id,
+                    receipt.target_relative_path,
+                    receipt.manifest_sha256,
+                    receipt.published_at,
+                    now,
+                    reason_code,
+                    current.revision,
+                ),
+            )
+            self._connection.execute(
+                "DELETE FROM publication_receipts WHERE job_id = ?",
+                (job_id,),
+            )
+            return receipt
+
     def list_jobs(
         self,
         *,

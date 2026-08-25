@@ -11,6 +11,7 @@ import type {
   SegmentReviewEnvelope,
   SpeakerDisplayNameEnvelope,
   SummaryRevisionDecisionEnvelope,
+  SummaryRevisionDraftEnvelope,
   SummaryRevisionListResponse,
   SummaryRevisionRegenerationEnvelope,
   SummaryRevisionSchema,
@@ -209,6 +210,51 @@ export async function decideJobSummaryRevision(
     throw new JobClientError("invalid", "Worker 返回了无法识别的笔记版本操作结果。");
   }
   return value as unknown as SummaryRevisionDecisionEnvelope;
+}
+
+export async function saveJobSummaryRevisionDraft(
+  transport: WorkerTransport,
+  worker: WorkerConnectionSettings,
+  bearerToken: string,
+  request: {
+    readonly job: Pick<JobSchema, "job_id" | "revision">;
+    readonly revisionKey: string;
+    readonly expectedDraftVersion: number;
+    readonly markdown: string;
+  }
+): Promise<SummaryRevisionDraftEnvelope> {
+  const body = {
+    expected_revision: request.job.revision,
+    expected_draft_version: request.expectedDraftVersion,
+    markdown: request.markdown
+  };
+  const idempotency = bytesToHex(
+    sha256(
+      new TextEncoder().encode(
+        JSON.stringify({ ...body, revision_key: request.revisionKey })
+      )
+    )
+  );
+  const response = await transport.request(
+    worker,
+    `/v1/jobs/${encodeURIComponent(request.job.job_id)}/summary-revisions/${encodeURIComponent(request.revisionKey)}/draft`,
+    {
+      method: "PUT",
+      body,
+      bearerToken,
+      timeoutMs: 30_000,
+      headers: { "Idempotency-Key": `obsidian-${idempotency}` }
+    }
+  );
+  const value = parseSuccess(response);
+  if (
+    !isJobSummary(value.job) ||
+    !isSummaryRevision(value.revision) ||
+    typeof value.saved !== "boolean"
+  ) {
+    throw new JobClientError("invalid", "Worker 返回了无法识别的候选笔记草稿。");
+  }
+  return value as unknown as SummaryRevisionDraftEnvelope;
 }
 
 export async function reviewTranscriptSegment(
@@ -432,7 +478,11 @@ function isSummaryRevision(value: unknown): value is SummaryRevisionSchema {
     typeof value.created_at === "string" &&
     (value.decided_at === null || typeof value.decided_at === "string") &&
     (value.artifact_manifest_sha256 === null ||
-      typeof value.artifact_manifest_sha256 === "string")
+      typeof value.artifact_manifest_sha256 === "string") &&
+    (value.draft_markdown === null || typeof value.draft_markdown === "string") &&
+    typeof value.draft_version === "number" &&
+    (value.draft_updated_at === null || typeof value.draft_updated_at === "string") &&
+    (value.draft_sha256 === null || typeof value.draft_sha256 === "string")
   );
 }
 

@@ -464,6 +464,10 @@ class SummaryRevisionSchema(PublicSchema):
     created_at: str
     decided_at: str | None
     artifact_manifest_sha256: Sha256String | None
+    draft_markdown: str | None
+    draft_version: int = Field(ge=0)
+    draft_updated_at: str | None
+    draft_sha256: Sha256String | None
 
 
 class SummaryRevisionListResponse(PublicSchema):
@@ -492,6 +496,18 @@ class SummaryRevisionDecisionEnvelope(PublicSchema):
     job: JobSchema
     revision: SummaryRevisionSchema
     applied: bool
+
+
+class SummaryRevisionDraftRequestSchema(PublicSchema):
+    expected_revision: int = Field(ge=0)
+    expected_draft_version: int = Field(ge=0)
+    markdown: str = Field(min_length=1, max_length=2_000_000)
+
+
+class SummaryRevisionDraftEnvelope(PublicSchema):
+    job: JobSchema
+    revision: SummaryRevisionSchema
+    saved: bool
 
 
 class JobUpdateSchema(PublicSchema):

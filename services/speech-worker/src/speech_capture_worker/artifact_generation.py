@@ -190,14 +190,31 @@ class ArtifactGenerator:
         self.store = store
         self.preprocessor = preprocessor or AudioPreprocessor(store)
 
-    def generate(self, job_id: str, *, force: bool = False) -> ArtifactResult:
+    def generate(
+        self,
+        job_id: str,
+        *,
+        force: bool = False,
+        note_body_override: str | None = None,
+        note_revision_provenance: dict[str, Any] | None = None,
+    ) -> ArtifactResult:
         if not isinstance(force, bool):
             raise InvalidJobRequest("force must be a boolean.")
+        if note_body_override is not None:
+            if not isinstance(note_body_override, str) or not note_body_override.strip():
+                raise InvalidJobRequest("The human-edited Note body cannot be empty.")
+            if any(
+                line.strip() == MANUAL_SECTION_HEADING
+                for line in note_body_override.splitlines()
+            ):
+                raise InvalidJobRequest(
+                    "The human-edited Note body cannot replace the protected manual section."
+                )
         job = self.store.get_job(job_id)
         corrections = self.store.list_corrections(job_id)
         corrections_digest = corrections_sha256(corrections)
         regenerating_processed = False
-        if job.state is JobState.PROCESSED and not force:
+        if job.state in {JobState.PROCESSED, JobState.PUBLISHED} and not force:
             checkpoint = _checkpoint_by_key(
                 self.store.list_checkpoints(job_id, stage=ARTIFACT_STAGE),
                 ARTIFACT_CHECKPOINT_KEY,
@@ -363,6 +380,7 @@ class ArtifactGenerator:
             speaker_display_names=effective.speaker_display_names,
             raw_speaker_ids=raw_speaker_ids,
             recording_date=effective.recording_date,
+            note_revision_provenance=note_revision_provenance,
         )
         note_markdown = _build_note_markdown(
             job=job,
@@ -379,6 +397,9 @@ class ArtifactGenerator:
             speaker_display_names=effective.speaker_display_names,
             recording_date=effective.recording_date,
         )
+        if note_body_override is not None:
+            protected = manual_section or f"{MANUAL_SECTION_HEADING}\n\n"
+            note_markdown = f"{note_body_override.strip()}\n\n{protected.strip()}\n"
         evidence_note_markdown = _build_note_markdown(
             job=job,
             speech_id=speech_id,
@@ -419,6 +440,7 @@ class ArtifactGenerator:
             "alignment_report_generation": alignment_checkpoint.generation,
             "structuring_checkpoint_generation": structuring_checkpoint.generation,
             "corrections_sha256": corrections_digest,
+            "note_revision": note_revision_provenance,
         }
         manifest_bytes = _canonical_json(manifest).encode("utf-8") + b"\n"
         manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
@@ -438,7 +460,13 @@ class ArtifactGenerator:
                 "alignment_report_generation": alignment_checkpoint.generation,
                 "structuring_checkpoint_generation": structuring_checkpoint.generation,
                 "corrections_sha256": corrections_digest,
+                "note_revision": note_revision_provenance,
             },
+        )
+        self.store.archive_stale_publication_receipt(
+            job_id,
+            current_manifest_sha256=manifest_sha256,
+            reason_code="artifact_manifest_replaced",
         )
         current = self.store.get_job(job_id)
         if current.state is JobState.QUALITY_CHECK:
@@ -837,6 +865,7 @@ def _build_speech_record(
     speaker_display_names: dict[str, str],
     raw_speaker_ids: dict[str, str | None],
     recording_date: str | None,
+    note_revision_provenance: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     status = (
         "complete"
@@ -936,6 +965,7 @@ def _build_speech_record(
             "recording_context_processing_version": structuring_checkpoint.get(
                 "recording_context_processing_version"
             ),
+            "note_revision": note_revision_provenance,
         },
         "quality": {
             "transcript_complete": alignment_report.get("transcript_complete"),

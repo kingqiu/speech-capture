@@ -2054,6 +2054,38 @@ def test_meeting_quality_repair_preserves_timeline_and_accepts_unified_discussio
     assert repaired["discussion_threads"] == [{"title": "质量编辑后的方案选择"}]
 
 
+def test_meeting_quality_repair_uses_full_coverage_to_prevent_topic_deletion() -> None:
+    class MeetingEditor:
+        model_id = "meeting-editor"
+
+        def refine_meeting_document(self, document, segments):
+            return {**document, "topics": []}
+
+        def synthesize_meeting_topics(self, segments, *, existing_topics):
+            raise AssertionError("valid prior topics should be restored without another model call")
+
+    executor = object.__new__(StructuringExecutor)
+    executor.engine = MeetingEditor()
+    prior_topics = [
+        {
+            "title": "数据映射规则",
+            "summary": "确认订单和产线数据的映射关系。",
+            "details": ["字段来源", "映射方式", "更新时间"],
+            "evidence": ["seg_1"],
+        }
+    ]
+    repaired = executor._repair_meeting_quality(
+        {"title": "项目会", "topics": prior_topics, "timeline_sections": []},
+        [{"segment_id": "s0001", "text": "压缩包很短"}],
+        aliases={"s0001": "seg_1"},
+        coverage_segments=[
+            {"segment_id": "seg_1", "text": "数据映射规则需要逐字段核对。" * 80}
+        ],
+    )
+
+    assert repaired["topics"] == prior_topics
+
+
 def test_quality_repair_sanitizes_unknown_and_excess_evidence_references() -> None:
     repaired = _sanitize_quality_evidence_references(
         {

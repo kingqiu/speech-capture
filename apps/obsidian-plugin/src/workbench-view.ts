@@ -1,4 +1,4 @@
-import { ItemView, Modal, setIcon, type WorkspaceLeaf } from "obsidian";
+import { ItemView, Modal, normalizePath, setIcon, TFile, type WorkspaceLeaf } from "obsidian";
 
 import type {
   CorrectionSchema,
@@ -41,7 +41,8 @@ import {
   listJobs,
   regenerateJobSummary,
   renameJobSpeakerDisplayName,
-  reviewTranscriptSegment
+  reviewTranscriptSegment,
+  saveJobSummaryRevisionDraft
 } from "./job-client";
 import { ObsidianWorkerTransport } from "./obsidian-worker-transport";
 import {
@@ -84,7 +85,12 @@ import {
   type WorkerProbeResult
 } from "./worker-probe";
 import { workbenchLayoutSize } from "./workbench-layout";
-import { buildSummaryChanges, countSummaryChanges } from "./summary-diff";
+import {
+  buildSummaryChanges,
+  countSummaryChanges,
+  renderSummaryCandidateMarkdown
+} from "./summary-diff";
+import { publishedManifestIsStale } from "./summary-publication";
 import {
   chooseNewPublicationPath,
   inspectPublicationTarget,
@@ -171,7 +177,11 @@ type PublicationViewState =
       readonly diff: PublicationConflictDiff;
       readonly viewed: boolean;
     }
-  | { readonly state: "published"; readonly targetRelativePath: string }
+  | {
+      readonly state: "published";
+      readonly targetRelativePath: string;
+      readonly manifestSha256: string;
+    }
   | { readonly state: "error"; readonly message: string };
 
 export class SpeechWorkbenchView extends ItemView {
@@ -196,6 +206,10 @@ export class SpeechWorkbenchView extends ItemView {
   private summaryRevisions: SummaryRevisionListResponse | null = null;
   private selectedSummaryRevisionKey: string | null = null;
   private summaryDecisionSaving = false;
+  private summaryDraftEditing = false;
+  private summaryDraftText = "";
+  private summaryDraftSaving = false;
+  private summaryDraftFeedback: string | null = null;
   private summaryRegenerating = false;
   private summaryRegenerationStartedAt: number | null = null;
   private summaryRegenerationTimer: number | null = null;
@@ -310,6 +324,7 @@ export class SpeechWorkbenchView extends ItemView {
     this.corrections = [];
     this.summaryRevisions = null;
     this.summaryDecisionSaving = false;
+    this.resetSummaryDraftEditor();
     this.summaryRegenerating = false;
     this.summaryRegenerationStartedAt = null;
     this.summaryRegenerationFeedback = null;
@@ -973,6 +988,22 @@ export class SpeechWorkbenchView extends ItemView {
       text: "原始证据已保护"
     });
     protectedBadge.prepend(this.choiceMark("shield-check"));
+    if (revision.status === "pending") {
+      const edit = heading.createEl("button", {
+        text: this.summaryDraftEditing ? "返回差异对照" : "直接编辑候选 Note",
+        attr: { type: "button" }
+      });
+      edit.addEventListener("click", () => {
+        this.summaryDraftEditing = !this.summaryDraftEditing;
+        if (this.summaryDraftEditing) {
+          this.summaryDraftText =
+            revision.draft_markdown ??
+            renderSummaryCandidateMarkdown(revision.after_document);
+          this.summaryDraftFeedback = null;
+        }
+        this.render();
+      });
+    }
 
     const versions = main.createDiv({ cls: "speech-capture-summary-versions" });
     const base = versions.createDiv();
@@ -990,6 +1021,13 @@ export class SpeechWorkbenchView extends ItemView {
       revision.before_document,
       revision.after_document
     );
+    if (this.summaryDraftEditing && revision.status === "pending") {
+      this.renderSummaryDraftEditor(main, revision);
+      if (this.isNarrowWorkbench()) {
+        this.renderSummaryDecisionPanel(main, revision, true);
+      }
+      return;
+    }
     const counts = countSummaryChanges(changes);
     const overview = main.createDiv({ cls: "speech-capture-summary-overview" });
     overview.createEl("h3", { text: "本次机器提炼变化" });
@@ -1019,6 +1057,13 @@ export class SpeechWorkbenchView extends ItemView {
       const columns = card.createDiv({ cls: "speech-capture-summary-change__columns" });
       this.renderSummaryVersionText(columns, "修改前", change.beforeText, "before");
       this.renderSummaryVersionText(columns, "修改后", change.afterText, "after");
+      if (change.deletionBasisMissing) {
+        const warning = card.createEl("p", {
+          cls: "speech-capture-inline-warning",
+          text: "机器没有提供这一整块内容的删除依据，请人工核对后再决定是否采用新版。"
+        });
+        warning.prepend(this.choiceMark("triangle-alert"));
+      }
       if (change.evidenceIds.length > 0) {
         const evidence = card.createEl("p", {
           cls: "speech-capture-summary-change__evidence",
@@ -1051,6 +1096,50 @@ export class SpeechWorkbenchView extends ItemView {
 
     if (this.isNarrowWorkbench()) {
       this.renderSummaryDecisionPanel(main, revision, true);
+    }
+  }
+
+  private renderSummaryDraftEditor(
+    parent: HTMLElement,
+    revision: SummaryRevisionSchema
+  ): void {
+    const editor = parent.createDiv({ cls: "speech-capture-summary-draft" });
+    editor.createEl("h3", { text: "人工编辑候选 Note" });
+    editor.createEl("p", {
+      text: "这里只修改最终 Note 正文；原始 ASR、校订逐字稿、证据笔记和“我的补充”都不会改变。"
+    });
+    const textarea = editor.createEl("textarea", {
+      cls: "speech-capture-summary-draft__editor",
+      attr: {
+        "aria-label": "候选 Note Markdown",
+        spellcheck: "true"
+      }
+    });
+    textarea.value = this.summaryDraftText;
+    textarea.disabled = this.summaryDraftSaving;
+    textarea.addEventListener("input", () => {
+      this.summaryDraftText = textarea.value;
+      this.summaryDraftFeedback = null;
+    });
+    const footer = editor.createDiv({ cls: "speech-capture-summary-draft__footer" });
+    footer.createEl("span", {
+      text:
+        revision.draft_version > 0
+          ? `已保存人工草稿 v${revision.draft_version.toString()}`
+          : "尚未保存人工草稿"
+    });
+    const save = footer.createEl("button", {
+      cls: "mod-cta",
+      text: this.summaryDraftSaving ? "正在保存…" : "保存人工定稿",
+      attr: { type: "button" }
+    });
+    save.disabled = this.summaryDraftSaving || !this.summaryDraftText.trim();
+    save.addEventListener("click", () => void this.saveSummaryDraft(revision));
+    if (this.summaryDraftFeedback) {
+      editor.createEl("p", {
+        cls: "speech-capture-inline-warning",
+        text: this.summaryDraftFeedback
+      });
     }
   }
 
@@ -1095,6 +1184,13 @@ export class SpeechWorkbenchView extends ItemView {
     this.assurance(panel, "sparkles", "只切换机器提炼的 Note 正文");
     this.assurance(panel, "shield-check", "原始 ASR 与证据不会变化");
     this.assurance(panel, "notebook-pen", "“我的补充”保持当前内容");
+    if (revision.draft_version > 0) {
+      this.assurance(
+        panel,
+        "file-pen-line",
+        `将采用已保存的人工草稿 v${revision.draft_version.toString()}`
+      );
+    }
     if (this.taskError) {
       panel.createEl("p", {
         cls: "speech-capture-inline-warning",
@@ -1137,7 +1233,11 @@ export class SpeechWorkbenchView extends ItemView {
     } else {
       const accept = panel.createEl("button", {
         cls: "mod-cta speech-capture-summary-decision__accept",
-        text: this.summaryDecisionSaving ? "正在保存…" : "接受新版笔记",
+        text: this.summaryDecisionSaving
+          ? "正在保存…"
+          : revision.draft_version > 0
+            ? "接受人工定稿"
+            : "接受新版笔记",
         attr: { type: "button" }
       });
       accept.disabled = this.summaryDecisionSaving;
@@ -2889,6 +2989,17 @@ export class SpeechWorkbenchView extends ItemView {
       }
       const selectedState = this.selectedSnapshot?.job.state;
       const hasUnappliedReviewChanges = this.summaryRevisions?.can_regenerate === true;
+      if (
+        this.publicationState.state === "published" &&
+        publishedManifestIsStale(
+          this.publicationState.manifestSha256,
+          this.summaryRevisions
+        )
+      ) {
+        this.publicationState = { state: "idle" };
+        this.publicationBusy = false;
+        this.allowAutomaticPublicationView = true;
+      }
       const shouldPreparePublication =
         (selectedState === "processed" &&
           this.pendingSummaryRevision() === null &&
@@ -2945,6 +3056,7 @@ export class SpeechWorkbenchView extends ItemView {
     this.summaryRevisions = null;
     this.selectedSummaryRevisionKey = null;
     this.summaryDecisionSaving = false;
+    this.resetSummaryDraftEditor();
     this.summaryRegenerating = false;
     this.summaryRegenerationStartedAt = null;
     this.summaryRegenerationFeedback = null;
@@ -2977,6 +3089,7 @@ export class SpeechWorkbenchView extends ItemView {
     this.summaryRevisions = null;
     this.selectedSummaryRevisionKey = null;
     this.summaryDecisionSaving = false;
+    this.resetSummaryDraftEditor();
     this.summaryRegenerating = false;
     this.summaryRegenerationStartedAt = null;
     this.summaryRegenerationFeedback = null;
@@ -3275,6 +3388,84 @@ export class SpeechWorkbenchView extends ItemView {
     }
   }
 
+  private async saveSummaryDraft(revision: SummaryRevisionSchema): Promise<void> {
+    const worker = this.plugin.preferredWorker();
+    const token = worker ? this.plugin.credentials.get(worker.id) : null;
+    const job = this.selectedSnapshot?.job;
+    if (!worker || !token || !job || this.summaryDraftSaving) {
+      return;
+    }
+    const requestEpoch = this.taskSelectionEpoch;
+    this.summaryDraftSaving = true;
+    this.summaryDraftFeedback = null;
+    this.render();
+    try {
+      const result = await saveJobSummaryRevisionDraft(
+        new ObsidianWorkerTransport(),
+        worker,
+        token,
+        {
+          job,
+          revisionKey: revision.revision_key,
+          expectedDraftVersion: revision.draft_version,
+          markdown: this.summaryDraftText
+        }
+      );
+      if (!this.isCurrentTaskRequest(job.job_id, requestEpoch)) {
+        return;
+      }
+      this.applySummaryDraftResult(result);
+      this.summaryDraftText = result.revision.draft_markdown ?? this.summaryDraftText;
+      this.summaryDraftFeedback = result.saved
+        ? `人工草稿 v${result.revision.draft_version.toString()} 已保存；接受新版时将发布这份正文。`
+        : "当前内容已经保存。";
+    } catch (error) {
+      if (!this.isCurrentTaskRequest(job.job_id, requestEpoch)) {
+        return;
+      }
+      this.summaryDraftFeedback =
+        error instanceof JobClientError
+          ? error.message
+          : "人工草稿未能保存，请重新读取后再试。";
+      if (error instanceof JobClientError && error.code === "conflict") {
+        void this.refreshJobs("manual");
+      }
+    } finally {
+      if (this.isCurrentTaskRequest(job.job_id, requestEpoch)) {
+        this.summaryDraftSaving = false;
+        this.render();
+      }
+    }
+  }
+
+  private applySummaryDraftResult(
+    result: Awaited<ReturnType<typeof saveJobSummaryRevisionDraft>>
+  ): void {
+    this.jobs = this.jobs.map((item) =>
+      item.job_id === result.job.job_id ? result.job : item
+    );
+    if (this.selectedSnapshot?.job.job_id === result.job.job_id) {
+      this.selectedSnapshot = { ...this.selectedSnapshot, job: result.job };
+    }
+    if (this.summaryRevisions) {
+      this.summaryRevisions = {
+        ...this.summaryRevisions,
+        revisions: this.summaryRevisions.revisions.map((item) =>
+          item.revision_key === result.revision.revision_key
+            ? result.revision
+            : item
+        )
+      };
+    }
+  }
+
+  private resetSummaryDraftEditor(): void {
+    this.summaryDraftEditing = false;
+    this.summaryDraftText = "";
+    this.summaryDraftSaving = false;
+    this.summaryDraftFeedback = null;
+  }
+
   private async saveSummaryDecision(
     revision: SummaryRevisionSchema,
     decision: "accepted" | "rejected"
@@ -3310,7 +3501,19 @@ export class SpeechWorkbenchView extends ItemView {
       this.reviewMutationEpoch += 1;
       this.applySummaryDecisionResult(result);
       this.summaryDecisionSaving = false;
+      if (result.revision.artifact_manifest_sha256 !== null) {
+        // A decided candidate created a new immutable artifact package.  Never
+        // retain the prior publication receipt in view state: doing so would
+        // make “打开 Note” reopen the superseded Vault path.
+        this.allowAutomaticPublicationView = true;
+        this.taskDetailMode = "publication";
+        this.publicationState = { state: "idle" };
+        this.publicationBusy = false;
+      }
       this.render();
+      if (result.revision.artifact_manifest_sha256 !== null) {
+        window.setTimeout(() => void this.preparePublication(true, true), 0);
+      }
       void this.refreshJobs("manual");
     } catch (error) {
       if (!this.isCurrentTaskRequest(job.job_id, requestEpoch)) {
@@ -3538,7 +3741,11 @@ export class SpeechWorkbenchView extends ItemView {
       }
       if (status.receipt) {
         const target = status.receipt?.target_relative_path ?? status.suggested_target_relative_path;
-        this.publicationState = { state: "published", targetRelativePath: target };
+        this.publicationState = {
+          state: "published",
+          targetRelativePath: target,
+          manifestSha256: status.receipt.manifest_sha256
+        };
         this.publicationBusy = false;
         this.render();
         return;
@@ -3664,7 +3871,11 @@ export class SpeechWorkbenchView extends ItemView {
         if (this.selectedSnapshot) {
           this.selectedSnapshot = { ...this.selectedSnapshot, job: acknowledged.job };
         }
-        this.publicationState = { state: "published", targetRelativePath };
+        this.publicationState = {
+          state: "published",
+          targetRelativePath,
+          manifestSha256: packageData.manifestSha256
+        };
         this.publicationBusy = false;
         this.render();
       }
@@ -3761,8 +3972,17 @@ export class SpeechWorkbenchView extends ItemView {
   }
 
   private async openPublishedNote(targetRelativePath: string): Promise<void> {
-    const notePath = `${targetRelativePath}/note.md`;
-    await this.app.workspace.openLinkText(notePath, "", false);
+    const notePath = normalizePath(`${targetRelativePath}/note.md`);
+    const note = this.app.vault.getAbstractFileByPath(notePath);
+    if (!(note instanceof TFile)) {
+      this.publicationState = {
+        state: "error",
+        message: "当前发布回执指向的 Note 不存在，请重新检测发布状态。"
+      };
+      this.render();
+      return;
+    }
+    await this.app.workspace.getLeaf("tab").openFile(note);
   }
 
   private isCurrentTaskRequest(jobId: string, requestEpoch: number): boolean {

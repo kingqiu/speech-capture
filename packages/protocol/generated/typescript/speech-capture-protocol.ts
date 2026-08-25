@@ -1,5 +1,5 @@
 // Generated Worker protocol wire types. Do not edit manually.
-export const OPENAPI_SHA256 = "93fc203c416b163f81039f1bd1c3eca9dcff59b27f5c6649e2f7b7dd48310c90" as const;
+export const OPENAPI_SHA256 = "148d231b2055a6163e1dcc7aaf2576a33cd2585f60193a2e65d08ed62e880eb4" as const;
 export const OPENAPI_VERSION = "3.1.0" as const;
 export const PROTOCOL_VERSION = "1.0.0" as const;
 
@@ -459,6 +459,18 @@ export interface SummaryRevisionDecisionRequestSchema {
   readonly expected_revision: number;
 }
 
+export interface SummaryRevisionDraftEnvelope {
+  readonly job: JobSchema;
+  readonly revision: SummaryRevisionSchema;
+  readonly saved: boolean;
+}
+
+export interface SummaryRevisionDraftRequestSchema {
+  readonly expected_draft_version: number;
+  readonly expected_revision: number;
+  readonly markdown: string;
+}
+
 export interface SummaryRevisionListResponse {
   readonly can_regenerate: boolean;
   readonly current_version: number;
@@ -486,6 +498,10 @@ export interface SummaryRevisionSchema {
   readonly created_at: string;
   readonly decided_at: string | null;
   readonly diff_truncated: boolean;
+  readonly draft_markdown: string | null;
+  readonly draft_sha256: string | null;
+  readonly draft_updated_at: string | null;
+  readonly draft_version: number;
   readonly revision_key: string;
   readonly speaker_rename_count: number;
   readonly status: SummaryRevisionStatus;

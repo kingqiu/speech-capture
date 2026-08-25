@@ -1581,7 +1581,9 @@ class StructuringExecutor:
         segments: list[dict[str, Any]],
         *,
         aliases: dict[str, str],
+        coverage_segments: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any] | None:
+        coverage = coverage_segments if coverage_segments is not None else segments
         reverse_aliases = {stable: alias for alias, stable in aliases.items()}
         prompt_document = _remap_document_evidence(
             {key: value for key, value in document.items() if key != "chapters"},
@@ -1590,14 +1592,18 @@ class StructuringExecutor:
         repaired = self.engine.refine_meeting_document(prompt_document, segments)
         if not isinstance(repaired, dict):
             raise StructuringFailed("The meeting quality editor did not return a document.")
-        if _meeting_topics_need_repair(repaired.get("topics"), segments):
+        if _meeting_topics_need_repair(repaired.get("topics"), coverage):
+            prior_topics = prompt_document.get("topics")
+            if not _meeting_topics_need_repair(prior_topics, coverage):
+                repaired["topics"] = prior_topics
+        if _meeting_topics_need_repair(repaired.get("topics"), coverage):
             repaired["topics"] = self.engine.synthesize_meeting_topics(
                 segments,
                 existing_topics=(
                     repaired.get("topics") if isinstance(repaired.get("topics"), list) else []
                 ),
             )
-        if _meeting_topics_need_repair(repaired.get("topics"), segments):
+        if _meeting_topics_need_repair(repaired.get("topics"), coverage):
             raise StructuringFailed("The meeting quality editor omitted substantive topic detail.")
         repaired = _sanitize_quality_evidence_references(
             repaired,
@@ -2588,6 +2594,7 @@ class StructuringExecutor:
                                     repaired_document,
                                     synthesis_payload,
                                     aliases=evidence_aliases,
+                                    coverage_segments=segment_payload,
                                 )
                                 if classification.type is ContentType.MEETING
                                 else self._repair_interview_quality(
@@ -3038,6 +3045,10 @@ class StructuringExecutor:
             transcript_edits=transcript_edit_map,
             batch_results=raw_payload["batch_results"],
         )
+        coverage_payload = _segment_payload(
+            transcribed,
+            transcript_edits=transcript_edit_map,
+        )
         document: dict[str, Any] | None = None
         document_candidate: dict[str, Any] | None = None
         document_error: str | None = None
@@ -3192,6 +3203,7 @@ class StructuringExecutor:
                     repaired_document,
                     synthesis_payload,
                     aliases=evidence_aliases,
+                    coverage_segments=coverage_payload,
                 )
                 if should_repair_meeting
                 else self._repair_interview_quality(

@@ -782,6 +782,64 @@ def test_concurrent_identical_creation_produces_one_job(tmp_path) -> None:
     assert len({job.job_id for job, _ in results}) == 1
 
 
+def test_stale_publication_receipt_is_archived_but_matching_receipt_is_kept(
+    tmp_path,
+) -> None:
+    with JobStore(tmp_path / "worker.sqlite3") as store:
+        job, _ = store.create_job(request(), idempotency_key="publication-stale-receipt")
+        advance(
+            store,
+            job.job_id,
+            [
+                JobState.UPLOADING,
+                JobState.VERIFYING,
+                JobState.QUEUED,
+                JobState.PREPROCESSING,
+                JobState.TRANSCRIBING,
+                JobState.ALIGNING,
+                JobState.STRUCTURING,
+                JobState.QUALITY_CHECK,
+                JobState.PROCESSED,
+            ],
+        )
+        processed = store.get_job(job.job_id)
+        lease, _, _ = store.claim_publication(
+            job.job_id,
+            publisher_id="device_a",
+            target_relative_path="Speech/Undated/test--sp_123",
+            manifest_sha256="a" * 64,
+            expected_revision=processed.revision,
+        )
+        receipt, _, _ = store.acknowledge_publication(
+            job.job_id,
+            lease_id=lease.lease_id,
+            publisher_id="device_a",
+            manifest_sha256="a" * 64,
+        )
+
+        matching = store.archive_stale_publication_receipt(
+            job.job_id,
+            current_manifest_sha256="a" * 64,
+        )
+        archived = store.archive_stale_publication_receipt(
+            job.job_id,
+            current_manifest_sha256="b" * 64,
+        )
+        current = store.get_publication_receipt(job.job_id)
+        history = store._connection.execute(  # noqa: SLF001 - persistence boundary assertion
+            "SELECT manifest_sha256, reason_code FROM publication_receipt_history "
+            "WHERE job_id = ?",
+            (job.job_id,),
+        ).fetchall()
+
+    assert matching is None
+    assert archived == receipt
+    assert current is None
+    assert [(row["manifest_sha256"], row["reason_code"]) for row in history] == [
+        ("a" * 64, "artifact_manifest_replaced")
+    ]
+
+
 def test_database_permissions_and_integrity(tmp_path) -> None:
     database = tmp_path / "worker.sqlite3"
     with JobStore(database) as store:

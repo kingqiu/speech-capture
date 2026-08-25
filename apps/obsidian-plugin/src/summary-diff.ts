@@ -7,6 +7,7 @@ export interface SummaryChangeBlock {
   readonly beforeText: string;
   readonly afterText: string;
   readonly evidenceIds: readonly string[];
+  readonly deletionBasisMissing: boolean;
 }
 
 export interface SummaryChangeCounts {
@@ -26,7 +27,9 @@ const SECTION_ORDER = [
   "decisions",
   "actions",
   "risks",
-  "open_questions"
+  "open_questions",
+  "timeline_sections",
+  "scene_sections"
 ] as const;
 
 const SECTION_LABELS: Readonly<Record<string, string>> = {
@@ -40,8 +43,12 @@ const SECTION_LABELS: Readonly<Record<string, string>> = {
   decisions: "明确决定",
   actions: "后续事项",
   risks: "风险与注意",
-  open_questions: "待确认问题"
+  open_questions: "待确认问题",
+  timeline_sections: "按时间顺序摘要",
+  scene_sections: "内容章节"
 };
+
+const HIDDEN_DERIVED_KEYS = new Set(["chapters"]);
 
 export function buildSummaryChanges(
   before: Readonly<Record<string, unknown>> | null,
@@ -62,13 +69,15 @@ export function buildSummaryChanges(
     if (!beforeText && !afterText) {
       continue;
     }
+    const kind = !beforeText ? "added" : !afterText ? "removed" : "modified";
     changes.push({
       id: key,
       label: SECTION_LABELS[key] ?? humanizeKey(key),
-      kind: !beforeText ? "added" : !afterText ? "removed" : "modified",
+      kind,
       beforeText,
       afterText,
-      evidenceIds: collectEvidence(afterValue ?? beforeValue)
+      evidenceIds: kind === "removed" ? [] : collectEvidence(afterValue),
+      deletionBasisMissing: kind === "removed"
     });
   }
   return changes;
@@ -87,11 +96,38 @@ export function countSummaryChanges(
   );
 }
 
+export function renderSummaryCandidateMarkdown(
+  document: Readonly<Record<string, unknown>> | null
+): string {
+  if (!document) {
+    return "";
+  }
+  const title = readableValue(document.title) || "候选笔记";
+  const lines = [`# ${title}`];
+  const keys = orderedKeys(document, document).filter((key) => key !== "title");
+  for (const key of keys) {
+    const text = readableValue(document[key]);
+    if (!text) {
+      continue;
+    }
+    lines.push(
+      "",
+      `## ${SECTION_LABELS[key] ?? humanizeKey(key)}`,
+      "",
+      text.replace(/^• /gm, "- ")
+    );
+  }
+  return `${lines.join("\n").trim()}\n`;
+}
+
 function orderedKeys(
   before: Readonly<Record<string, unknown>>,
   after: Readonly<Record<string, unknown>>
 ): readonly string[] {
   const found = new Set([...Object.keys(before), ...Object.keys(after)]);
+  for (const key of HIDDEN_DERIVED_KEYS) {
+    found.delete(key);
+  }
   const ordered = SECTION_ORDER.filter((key) => found.delete(key));
   return [...ordered, ...[...found].sort()];
 }

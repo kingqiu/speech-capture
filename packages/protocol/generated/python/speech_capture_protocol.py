@@ -2,7 +2,7 @@
 
 from typing import Final, Literal, NotRequired, TypeAlias, TypedDict
 
-OPENAPI_SHA256: Final = "93fc203c416b163f81039f1bd1c3eca9dcff59b27f5c6649e2f7b7dd48310c90"
+OPENAPI_SHA256: Final = "148d231b2055a6163e1dcc7aaf2576a33cd2585f60193a2e65d08ed62e880eb4"
 OPENAPI_VERSION: Final = "3.1.0"
 PROTOCOL_VERSION: Final = "1.0.0"
 
@@ -337,6 +337,11 @@ class SummaryRevisionDecisionRequestSchema(TypedDict):
     decision: Literal['accepted', 'rejected']
     expected_revision: int
 
+class SummaryRevisionDraftRequestSchema(TypedDict):
+    expected_draft_version: int
+    expected_revision: int
+    markdown: str
+
 class SummaryRevisionRegenerationRequestSchema(TypedDict):
     expected_revision: int
 
@@ -350,6 +355,10 @@ class SummaryRevisionSchema(TypedDict):
     created_at: str
     decided_at: str | None
     diff_truncated: bool
+    draft_markdown: str | None
+    draft_sha256: str | None
+    draft_updated_at: str | None
+    draft_version: int
     revision_key: str
     speaker_rename_count: int
     status: SummaryRevisionStatus
@@ -508,6 +517,11 @@ class SummaryRevisionDecisionEnvelope(TypedDict):
     job: JobSchema
     revision: SummaryRevisionSchema
 
+class SummaryRevisionDraftEnvelope(TypedDict):
+    job: JobSchema
+    revision: SummaryRevisionSchema
+    saved: bool
+
 class SummaryRevisionListResponse(TypedDict):
     can_regenerate: bool
     current_version: int
@@ -626,6 +640,8 @@ __all__ = [
     "SpeakerLabelStatus",
     "SummaryRevisionDecisionEnvelope",
     "SummaryRevisionDecisionRequestSchema",
+    "SummaryRevisionDraftEnvelope",
+    "SummaryRevisionDraftRequestSchema",
     "SummaryRevisionListResponse",
     "SummaryRevisionRegenerationEnvelope",
     "SummaryRevisionRegenerationRequestSchema",

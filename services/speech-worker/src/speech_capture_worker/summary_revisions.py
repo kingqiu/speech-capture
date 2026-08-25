@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
@@ -34,6 +35,11 @@ class SummaryRevisionStatus(StrEnum):
     REJECTED = "rejected"
 
 
+SUMMARY_REVISION_DRAFT_STAGE = "summary_revision_drafts"
+SUMMARY_REVISION_DRAFT_SCHEMA_VERSION = "1.0.0"
+MAX_SUMMARY_DRAFT_CHARACTERS = 2_000_000
+
+
 @dataclass(frozen=True)
 class SummaryRevisionView:
     revision_key: str
@@ -49,6 +55,10 @@ class SummaryRevisionView:
     created_at: str
     decided_at: str | None
     artifact_manifest_sha256: str | None
+    draft_markdown: str | None
+    draft_version: int
+    draft_updated_at: str | None
+    draft_sha256: str | None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -76,6 +86,13 @@ class SummaryRevisionRegenerationResult:
     applied: bool
 
 
+@dataclass(frozen=True)
+class SummaryRevisionDraftResult:
+    revision: SummaryRevisionView
+    job: JobRecord
+    saved: bool
+
+
 def list_summary_revisions(
     store: JobStore,
     job_id: str,
@@ -95,6 +112,7 @@ def list_summary_revisions(
         decision = decisions.get(revision.checkpoint_key)
         status = _decision_status(decision.payload if decision is not None else None)
         candidate_version = _positive_int(payload.get("candidate_version"), index + 2)
+        draft = _latest_draft(store, job_id, revision.checkpoint_key)
         view = SummaryRevisionView(
             revision_key=revision.checkpoint_key,
             base_version=current_version,
@@ -116,6 +134,23 @@ def list_summary_revisions(
                 str(decision.payload.get("artifact_manifest_sha256"))
                 if decision is not None
                 and isinstance(decision.payload.get("artifact_manifest_sha256"), str)
+                else None
+            ),
+            draft_markdown=(
+                str(draft.payload.get("markdown"))
+                if draft is not None and isinstance(draft.payload.get("markdown"), str)
+                else None
+            ),
+            draft_version=(
+                _positive_int(draft.payload.get("draft_version"), 1)
+                if draft is not None
+                else 0
+            ),
+            draft_updated_at=(draft.updated_at if draft is not None else None),
+            draft_sha256=(
+                str(draft.payload.get("markdown_sha256"))
+                if draft is not None
+                and isinstance(draft.payload.get("markdown_sha256"), str)
                 else None
             ),
         )
@@ -282,7 +317,29 @@ def decide_summary_revision(
                 checkpoint_key=STRUCTURING_CHECKPOINT_KEY,
                 payload=after_checkpoint,
             )
-        artifact = ArtifactGenerator(store).generate(job_id, force=True)
+        draft = _latest_draft(store, job_id, revision_key)
+        draft_provenance = (
+            {
+                "source": "human_draft",
+                "summary_revision_key": revision_key,
+                "draft_version": _positive_int(draft.payload.get("draft_version"), 1),
+                "markdown_sha256": draft.payload.get("markdown_sha256"),
+                "updated_at": draft.updated_at,
+            }
+            if draft is not None
+            else None
+        )
+        generator = ArtifactGenerator(store)
+        artifact = (
+            generator.generate(
+                job_id,
+                force=True,
+                note_body_override=str(draft.payload["markdown"]),
+                note_revision_provenance=draft_provenance,
+            )
+            if draft is not None and isinstance(draft.payload.get("markdown"), str)
+            else generator.generate(job_id, force=True)
+        )
         manifest_sha256 = artifact.manifest_sha256
     else:
         if current_sha != before_sha:
@@ -321,6 +378,12 @@ def decide_summary_revision(
             "decided_at": datetime.now(UTC).isoformat(),
             "idempotency_key": idempotency_key,
             "artifact_manifest_sha256": manifest_sha256,
+            "draft_sha256": (
+                draft_provenance.get("markdown_sha256")
+                if decision is SummaryRevisionStatus.ACCEPTED
+                and draft_provenance is not None
+                else None
+            ),
         },
     )
     return SummaryRevisionDecisionResult(
@@ -330,11 +393,116 @@ def decide_summary_revision(
     )
 
 
+def save_summary_revision_draft(
+    store: JobStore,
+    job_id: str,
+    *,
+    revision_key: str,
+    markdown: str,
+    expected_revision: int,
+    expected_draft_version: int,
+    idempotency_key: str,
+) -> SummaryRevisionDraftResult:
+    validate_idempotency_key(idempotency_key)
+    job = store.get_job(job_id)
+    if job.revision != expected_revision:
+        raise RevisionConflict(
+            "The job changed after the candidate Note was loaded.",
+            details={
+                "job_id": job_id,
+                "expected_revision": expected_revision,
+                "current_revision": job.revision,
+            },
+        )
+    if job.state not in {JobState.PROCESSED, JobState.PUBLISHED}:
+        raise InvalidJobRequest("Candidate Note editing requires a processed or published job.")
+    revision = _checkpoint_by_key(
+        store.list_checkpoints(job_id, stage=SUMMARY_REVISION_STAGE),
+        revision_key,
+    )
+    if revision is None:
+        raise InvalidJobRequest("The requested summary revision does not exist.")
+    if _checkpoint_by_key(
+        store.list_checkpoints(job_id, stage=SUMMARY_REVISION_DECISION_STAGE),
+        revision_key,
+    ) is not None:
+        raise InvalidJobRequest("A decided summary revision can no longer be edited.")
+    normalized = markdown.strip()
+    if not normalized:
+        raise InvalidJobRequest("The candidate Note cannot be empty.")
+    if len(normalized) > MAX_SUMMARY_DRAFT_CHARACTERS:
+        raise InvalidJobRequest("The candidate Note is too large to save safely.")
+    if any(
+        line.strip() == MANUAL_SECTION_HEADING
+        for line in normalized.splitlines()
+    ):
+        raise InvalidJobRequest(
+            "Edit the protected manual section in the current Note, not in the candidate body."
+        )
+    latest = _latest_draft(store, job_id, revision_key)
+    current_version = (
+        _positive_int(latest.payload.get("draft_version"), 1) if latest is not None else 0
+    )
+    if current_version != expected_draft_version:
+        raise RevisionConflict(
+            "The candidate Note draft changed after it was loaded.",
+            details={
+                "expected_draft_version": expected_draft_version,
+                "current_draft_version": current_version,
+            },
+        )
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    if latest is not None and latest.payload.get("markdown_sha256") == digest:
+        return SummaryRevisionDraftResult(
+            revision=_view_by_key(store, job_id, revision_key),
+            job=job,
+            saved=False,
+        )
+    draft_version = current_version + 1
+    store.put_checkpoint(
+        job_id,
+        stage=SUMMARY_REVISION_DRAFT_STAGE,
+        checkpoint_key=f"{revision_key}_draft_{draft_version:08d}",
+        payload={
+            "schema_version": SUMMARY_REVISION_DRAFT_SCHEMA_VERSION,
+            "summary_revision_key": revision_key,
+            "draft_version": draft_version,
+            "markdown": normalized,
+            "markdown_sha256": digest,
+            "previous_markdown_sha256": (
+                latest.payload.get("markdown_sha256") if latest is not None else None
+            ),
+            "idempotency_key": idempotency_key,
+            "saved_at": datetime.now(UTC).isoformat(),
+        },
+    )
+    return SummaryRevisionDraftResult(
+        revision=_view_by_key(store, job_id, revision_key),
+        job=job,
+        saved=True,
+    )
+
+
 def _view_by_key(store: JobStore, job_id: str, revision_key: str) -> SummaryRevisionView:
     for revision in list_summary_revisions(store, job_id).revisions:
         if revision.revision_key == revision_key:
             return revision
     raise InvalidJobRequest("The requested summary revision does not exist.")
+
+
+def _latest_draft(store: JobStore, job_id: str, revision_key: str) -> Any | None:
+    prefix = f"{revision_key}_draft_"
+    candidates = [
+        item
+        for item in store.list_checkpoints(job_id, stage=SUMMARY_REVISION_DRAFT_STAGE)
+        if item.checkpoint_key.startswith(prefix)
+        and item.payload.get("summary_revision_key") == revision_key
+    ]
+    return max(
+        candidates,
+        key=lambda item: _positive_int(item.payload.get("draft_version"), 1),
+        default=None,
+    )
 
 
 def _checkpoint_by_key(checkpoints: list[Any], key: str) -> Any | None:

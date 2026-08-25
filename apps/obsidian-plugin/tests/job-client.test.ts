@@ -10,6 +10,7 @@ import {
   listJobSummaryRevisions,
   listJobs,
   regenerateJobSummary,
+  saveJobSummaryRevisionDraft,
   renameJobSpeakerDisplayName,
   reviewTranscriptSegment
 } from "../src/job-client";
@@ -249,7 +250,11 @@ describe("job client", () => {
       diff_truncated: false,
       created_at: "2026-08-08T00:00:00Z",
       decided_at: null,
-      artifact_manifest_sha256: null
+      artifact_manifest_sha256: null,
+      draft_markdown: null,
+      draft_version: 0,
+      draft_updated_at: null,
+      draft_sha256: null
     };
     const transport = new QueueTransport([
       response(200, {
@@ -310,7 +315,11 @@ describe("job client", () => {
       diff_truncated: false,
       created_at: "2026-08-08T00:00:00Z",
       decided_at: null,
-      artifact_manifest_sha256: null
+      artifact_manifest_sha256: null,
+      draft_markdown: null,
+      draft_version: 0,
+      draft_updated_at: null,
+      draft_sha256: null
     };
     const transport = new QueueTransport([
       response(200, { applied: true, job: JOB, revision })
@@ -332,6 +341,54 @@ describe("job client", () => {
       /^obsidian-[0-9a-f]{64}$/
     );
     expect(transport.requests[0]?.timeoutMs).toBe(60 * 60_000);
+  });
+
+  it("saves a version-bound human candidate Note draft", async () => {
+    const revision = {
+      revision_key: "summary_revision_draft",
+      base_version: 1,
+      candidate_version: 2,
+      status: "pending",
+      changed: true,
+      text_correction_count: 1,
+      speaker_rename_count: 0,
+      before_document: { summary: { text: "旧总览" } },
+      after_document: { summary: { text: "新总览" } },
+      diff_truncated: false,
+      created_at: "2026-08-08T00:00:00Z",
+      decided_at: null,
+      artifact_manifest_sha256: null,
+      draft_markdown: "# 人工定稿\n",
+      draft_version: 1,
+      draft_updated_at: "2026-08-08T00:01:00Z",
+      draft_sha256: "a".repeat(64)
+    };
+    const transport = new QueueTransport([
+      response(200, { saved: true, job: JOB, revision })
+    ]);
+
+    const result = await saveJobSummaryRevisionDraft(
+      transport,
+      WORKER,
+      "secret",
+      {
+        job: JOB,
+        revisionKey: revision.revision_key,
+        expectedDraftVersion: 0,
+        markdown: "# 人工定稿\n"
+      }
+    );
+
+    expect(result.revision.draft_version).toBe(1);
+    expect(transport.requests[0]).toMatchObject({
+      path: `/v1/jobs/${JOB.job_id}/summary-revisions/${revision.revision_key}/draft`,
+      timeoutMs: 30_000,
+      body: {
+        expected_revision: 4,
+        expected_draft_version: 0,
+        markdown: "# 人工定稿\n"
+      }
+    });
   });
 });
 

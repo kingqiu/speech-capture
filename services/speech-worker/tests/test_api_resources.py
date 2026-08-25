@@ -148,13 +148,20 @@ def _advance_to_processed_review_job(store: JobStore, job_id: str) -> None:
         )
 
 
-def _install_publication_package(store: JobStore, job_id: str) -> str:
+def _install_publication_package(
+    store: JobStore,
+    job_id: str,
+    *,
+    note_marker: str = "",
+) -> str:
     package_dir = store.get_job_stage_directory(job_id, stage=ARTIFACT_STAGE)
     speech_id = "sp_api_publication"
     contents = {
         name: (f"# {name}\n" if name.endswith(".md") else "{}\n").encode()
         for name in ARTIFACT_FILES
     }
+    if note_marker:
+        contents["note.md"] = f"# note.md\n\n{note_marker}\n".encode()
     contents["speech-record.json"] = (
         json.dumps(
             {
@@ -449,9 +456,13 @@ def test_summary_revision_is_private_listable_and_rejectable(tmp_path) -> None:
             "diff_truncated": False,
             "created_at": listed.json()["revisions"][0]["created_at"],
             "decided_at": None,
-            "artifact_manifest_sha256": None,
-        }
-    ]
+                "artifact_manifest_sha256": None,
+                "draft_markdown": None,
+                "draft_version": 0,
+                "draft_updated_at": None,
+                "draft_sha256": None,
+            }
+        ]
     assert rejected.status_code == 200, rejected.text
     assert rejected.json()["applied"] is True
     assert rejected.json()["revision"]["status"] == "rejected"
@@ -870,9 +881,31 @@ def test_publication_status_claim_release_and_acknowledgement(tmp_path) -> None:
             params={"output_root": "Work/Speech Notes"},
         )
 
+        replacement_manifest = _install_publication_package(
+            store,
+            job_id,
+            note_marker="人工确认后的新版 Note",
+        )
+        repaired_status = client.get(
+            f"/v1/jobs/{job_id}/publication",
+            headers=AUTHORIZATION,
+            params={"output_root": "Work/Speech Notes"},
+        )
+        archived_count = int(
+            store._connection.execute(  # noqa: SLF001 - persistence boundary assertion
+                "SELECT COUNT(*) FROM publication_receipt_history WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()[0]
+        )
+
     assert final_status.status_code == 200
     assert final_status.json()["active_lease"] is None
     assert final_status.json()["receipt"]["manifest_sha256"] == manifest_sha256
+    assert replacement_manifest != manifest_sha256
+    assert repaired_status.status_code == 200
+    assert repaired_status.json()["manifest_sha256"] == replacement_manifest
+    assert repaired_status.json()["receipt"] is None
+    assert archived_count == 1
 
 
 def test_artifact_listing_download_and_integrity_failure(tmp_path) -> None:

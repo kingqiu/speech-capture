@@ -22,6 +22,7 @@ from speech_capture_worker.summary_revisions import (
     decide_summary_revision,
     list_summary_revisions,
     regenerate_summary_revision,
+    save_summary_revision_draft,
 )
 from speech_capture_worker.transcript import SpeakerLabelStatus, TranscriptOutcome
 
@@ -203,6 +204,75 @@ def test_accept_regenerates_artifacts_before_recording_decision(tmp_path, monkey
     assert collection.current_version == 2
     assert collection.revisions[0].status is SummaryRevisionStatus.ACCEPTED
     assert collection.revisions[0].artifact_manifest_sha256 == "9" * 64
+
+
+def test_human_note_drafts_are_versioned_and_forwarded_on_accept(tmp_path, monkeypatch) -> None:
+    generated: list[dict] = []
+
+    class FakeArtifactGenerator:
+        def __init__(self, _store):
+            pass
+
+        def generate(self, job_id: str, **kwargs):
+            generated.append({"job_id": job_id, **kwargs})
+            return SimpleNamespace(manifest_sha256="8" * 64)
+
+    monkeypatch.setattr(
+        "speech_capture_worker.summary_revisions.ArtifactGenerator",
+        FakeArtifactGenerator,
+    )
+    with JobStore(tmp_path / "worker.sqlite3", source_probe=_probe) as store:
+        job = _processed_job(store)
+        revision_key = _seed_revision(store, job.job_id)
+        first = save_summary_revision_draft(
+            store,
+            job.job_id,
+            revision_key=revision_key,
+            markdown="# 人工定稿\n\n第一版。",
+            expected_revision=job.revision,
+            expected_draft_version=0,
+            idempotency_key="save-summary-draft-v1",
+        )
+        second = save_summary_revision_draft(
+            store,
+            job.job_id,
+            revision_key=revision_key,
+            markdown="# 人工定稿\n\n第二版。",
+            expected_revision=job.revision,
+            expected_draft_version=1,
+            idempotency_key="save-summary-draft-v2",
+        )
+        accepted = decide_summary_revision(
+            store,
+            job.job_id,
+            revision_key=revision_key,
+            decision=SummaryRevisionStatus.ACCEPTED,
+            expected_revision=job.revision,
+            idempotency_key="accept-human-summary-draft",
+        )
+
+    assert first.revision.draft_version == 1
+    assert second.revision.draft_version == 2
+    assert second.revision.draft_markdown == "# 人工定稿\n\n第二版。"
+    assert accepted.applied is True
+    assert generated[0]["note_body_override"] == "# 人工定稿\n\n第二版。"
+    assert generated[0]["note_revision_provenance"]["draft_version"] == 2
+
+
+def test_human_note_draft_cannot_replace_protected_manual_section(tmp_path) -> None:
+    with JobStore(tmp_path / "worker.sqlite3", source_probe=_probe) as store:
+        job = _processed_job(store)
+        revision_key = _seed_revision(store, job.job_id)
+        with pytest.raises(InvalidJobRequest, match="protected manual section"):
+            save_summary_revision_draft(
+                store,
+                job.job_id,
+                revision_key=revision_key,
+                markdown="# 候选\n\n## 我的补充\n\n不允许覆盖。",
+                expected_revision=job.revision,
+                expected_draft_version=0,
+                idempotency_key="invalid-protected-summary-draft",
+            )
 
 
 def test_regeneration_requires_new_corrections_and_replays_pending_candidate(tmp_path) -> None:
