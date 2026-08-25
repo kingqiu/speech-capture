@@ -2,7 +2,7 @@
 
 from typing import Final, Literal, NotRequired, TypeAlias, TypedDict
 
-OPENAPI_SHA256: Final = "041c30bf5f6b4b1edc3d6a0fbd53141cc86bb7c4ca7b1b803b2f45e9d09beb17"
+OPENAPI_SHA256: Final = "93fc203c416b163f81039f1bd1c3eca9dcff59b27f5c6649e2f7b7dd48310c90"
 OPENAPI_VERSION: Final = "3.1.0"
 PROTOCOL_VERSION: Final = "1.0.0"
 
@@ -183,17 +183,15 @@ class JobCreateSchema(TypedDict):
     recording_date: NotRequired[str | None]
     upload_id: str
 
-class JobProgressSchema(TypedDict):
-    diarization_status: DiarizationStatus
-    duration_ms: int
-    elapsed_seconds: float
-    estimated_remaining_seconds: float | None
-    generation: int
-    job_id: str
-    processed_ms: int
-    stage: JobState
-    stage_progress: float
-    updated_at: str
+class JobProgressDetailSchema(TypedDict):
+    cache_hits: int
+    completed_units: int
+    input_tokens: int | None
+    model_id: str | None
+    output_tokens: int | None
+    retry_attempt: int
+    substage: str
+    total_units: int
 
 class JobSchema(TypedDict):
     content_type_override: str | None
@@ -452,15 +450,18 @@ class JobEnvelope(TypedDict):
 class JobListResponse(TypedDict):
     jobs: list[JobSchema]
 
-class JobSnapshotResponse(TypedDict):
-    has_more_segments: bool
-    job: JobSchema
-    latest_event_sequence: int
-    next_after_segment_sequence: int
-    progress: JobProgressSchema | None
-    provisional: ProvisionalTranscriptSchema | None
-    resource_report: dict[str, object] | None
-    stable_segments: list[TranscriptSegmentSchema]
+class JobProgressSchema(TypedDict):
+    detail: JobProgressDetailSchema | None
+    diarization_status: DiarizationStatus
+    duration_ms: int
+    elapsed_seconds: float
+    estimated_remaining_seconds: float | None
+    generation: int
+    job_id: str
+    processed_ms: int
+    stage: JobState
+    stage_progress: float
+    updated_at: str
 
 class JobUpdatesResponse(TypedDict):
     has_more: bool
@@ -552,6 +553,16 @@ class WorkerReadinessResponse(TypedDict):
     worker_database_ok: bool
     worker_version: str
 
+class JobSnapshotResponse(TypedDict):
+    has_more_segments: bool
+    job: JobSchema
+    latest_event_sequence: int
+    next_after_segment_sequence: int
+    progress: JobProgressSchema | None
+    provisional: ProvisionalTranscriptSchema | None
+    resource_report: dict[str, object] | None
+    stable_segments: list[TranscriptSegmentSchema]
+
 __all__ = [
     "OPENAPI_SHA256",
     "OPENAPI_VERSION",
@@ -580,6 +591,7 @@ __all__ = [
     "JobCreateSchema",
     "JobEnvelope",
     "JobListResponse",
+    "JobProgressDetailSchema",
     "JobProgressSchema",
     "JobSchema",
     "JobSnapshotResponse",

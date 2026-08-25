@@ -739,9 +739,89 @@
         "title": "JobListResponse",
         "type": "object"
       },
+      "JobProgressDetailSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "cache_hits": {
+            "title": "Cache Hits",
+            "type": "integer"
+          },
+          "completed_units": {
+            "title": "Completed Units",
+            "type": "integer"
+          },
+          "input_tokens": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Input Tokens"
+          },
+          "model_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model Id"
+          },
+          "output_tokens": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Output Tokens"
+          },
+          "retry_attempt": {
+            "title": "Retry Attempt",
+            "type": "integer"
+          },
+          "substage": {
+            "title": "Substage",
+            "type": "string"
+          },
+          "total_units": {
+            "title": "Total Units",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "substage",
+          "completed_units",
+          "total_units",
+          "cache_hits",
+          "retry_attempt",
+          "model_id",
+          "input_tokens",
+          "output_tokens"
+        ],
+        "title": "JobProgressDetailSchema",
+        "type": "object"
+      },
       "JobProgressSchema": {
         "additionalProperties": false,
         "properties": {
+          "detail": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/JobProgressDetailSchema"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "diarization_status": {
             "$ref": "#/components/schemas/DiarizationStatus"
           },
@@ -799,6 +879,7 @@
           "elapsed_seconds",
           "estimated_remaining_seconds",
           "diarization_status",
+          "detail",
           "updated_at"
         ],
         "title": "JobProgressSchema",

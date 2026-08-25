@@ -472,7 +472,24 @@ function isProgress(value: unknown): boolean {
     typeof value.stage === "string" &&
     typeof value.stage_progress === "number" &&
     typeof value.duration_ms === "number" &&
-    typeof value.processed_ms === "number"
+    typeof value.processed_ms === "number" &&
+    (value.detail === undefined ||
+      value.detail === null ||
+      isProgressDetail(value.detail))
+  );
+}
+
+function isProgressDetail(value: unknown): boolean {
+  return (
+    isRecord(value) &&
+    typeof value.substage === "string" &&
+    typeof value.completed_units === "number" &&
+    typeof value.total_units === "number" &&
+    typeof value.cache_hits === "number" &&
+    typeof value.retry_attempt === "number" &&
+    (value.model_id === null || typeof value.model_id === "string") &&
+    (value.input_tokens === null || typeof value.input_tokens === "number") &&
+    (value.output_tokens === null || typeof value.output_tokens === "number")
   );
 }
 

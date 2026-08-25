@@ -84,6 +84,7 @@ from speech_capture_worker.recording_context import (
 from speech_capture_worker.transcript import (
     DiarizationStatus,
     JobProgress,
+    JobProgressDetail,
     JobSnapshot,
     JobUpdate,
     ProvisionalTranscript,
@@ -100,7 +101,7 @@ from speech_capture_worker.transcript import (
     validate_transcript_text,
 )
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 DEFAULT_UPLOAD_CHUNK_SIZE_BYTES = 8 * 1024 * 1024
 MAX_UPLOAD_CHUNK_SIZE_BYTES = 64 * 1024 * 1024
 MAX_UPLOAD_PARTS = 10_000
@@ -1453,6 +1454,7 @@ class JobStore:
         elapsed_seconds: float,
         estimated_remaining_seconds: float | None = None,
         diarization_status: DiarizationStatus = DiarizationStatus.NOT_STARTED,
+        detail: JobProgressDetail | None = None,
     ) -> tuple[JobProgress, bool]:
         """Persist one monotonic progress snapshot and emit a content-free update."""
 
@@ -1473,6 +1475,8 @@ class JobStore:
             )
         if not isinstance(diarization_status, DiarizationStatus):
             raise InvalidJobRequest("diarization_status is not supported.")
+        if detail is not None:
+            _validate_job_progress_detail(detail)
 
         with self._transaction():
             job = self._row_to_job(self._fetch_job_row(job_id))
@@ -1495,6 +1499,7 @@ class JobStore:
                     else None
                 ),
                 "diarization_status": diarization_status.value,
+                "detail": detail.to_dict() if detail is not None else None,
             }
             payload_json = _canonical_json(payload)
             payload_sha256 = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
@@ -1531,10 +1536,11 @@ class JobStore:
                     elapsed_seconds,
                     estimated_remaining_seconds,
                     diarization_status,
+                    detail_json,
                     payload_sha256,
                     updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(job_id) DO UPDATE SET
                     generation = excluded.generation,
                     stage = excluded.stage,
@@ -1544,6 +1550,7 @@ class JobStore:
                     elapsed_seconds = excluded.elapsed_seconds,
                     estimated_remaining_seconds = excluded.estimated_remaining_seconds,
                     diarization_status = excluded.diarization_status,
+                    detail_json = excluded.detail_json,
                     payload_sha256 = excluded.payload_sha256,
                     updated_at = excluded.updated_at
                 """,
@@ -1561,6 +1568,7 @@ class JobStore:
                         else None
                     ),
                     diarization_status.value,
+                    _canonical_json(detail.to_dict()) if detail is not None else None,
                     payload_sha256,
                     now,
                 ),
@@ -4075,6 +4083,24 @@ class JobStore:
                     if self._connection.in_transaction:
                         self._connection.execute("ROLLBACK")
                     raise
+                current = 8
+            if current == 8:
+                try:
+                    self._connection.executescript(
+                        """
+                    BEGIN IMMEDIATE;
+
+                    ALTER TABLE job_progress
+                    ADD COLUMN detail_json TEXT;
+
+                    PRAGMA user_version = 9;
+                    COMMIT;
+                    """
+                    )
+                except BaseException:
+                    if self._connection.in_transaction:
+                        self._connection.execute("ROLLBACK")
+                    raise
 
     @contextmanager
     def _transaction(self) -> Iterator[None]:
@@ -5248,6 +5274,8 @@ class JobStore:
 
     @staticmethod
     def _row_to_job_progress(row: sqlite3.Row) -> JobProgress:
+        raw_detail = row["detail_json"] if "detail_json" in row.keys() else None
+        detail_payload = json.loads(str(raw_detail)) if raw_detail is not None else None
         return JobProgress(
             job_id=str(row["job_id"]),
             generation=int(row["generation"]),
@@ -5262,6 +5290,32 @@ class JobStore:
                 else None
             ),
             diarization_status=DiarizationStatus(row["diarization_status"]),
+            detail=(
+                JobProgressDetail(
+                    substage=str(detail_payload["substage"]),
+                    completed_units=int(detail_payload["completed_units"]),
+                    total_units=int(detail_payload["total_units"]),
+                    cache_hits=int(detail_payload["cache_hits"]),
+                    retry_attempt=int(detail_payload["retry_attempt"]),
+                    model_id=(
+                        str(detail_payload["model_id"])
+                        if detail_payload.get("model_id") is not None
+                        else None
+                    ),
+                    input_tokens=(
+                        int(detail_payload["input_tokens"])
+                        if detail_payload.get("input_tokens") is not None
+                        else None
+                    ),
+                    output_tokens=(
+                        int(detail_payload["output_tokens"])
+                        if detail_payload.get("output_tokens") is not None
+                        else None
+                    ),
+                )
+                if isinstance(detail_payload, dict)
+                else None
+            ),
             updated_at=str(row["updated_at"]),
         )
 
@@ -5422,6 +5476,44 @@ def _validate_gap_review_key(value: str) -> None:
 def _validate_event_type(value: str) -> None:
     if not SAFE_IDENTIFIER_PATTERN.fullmatch(value):
         raise InvalidJobRequest("event_type contains unsupported characters.")
+
+
+def _validate_job_progress_detail(value: JobProgressDetail) -> None:
+    if (
+        not isinstance(value, JobProgressDetail)
+        or not isinstance(value.substage, str)
+        or not value.substage
+        or len(value.substage) > 80
+        or not SAFE_IDENTIFIER_PATTERN.fullmatch(value.substage)
+    ):
+        raise InvalidJobRequest("progress detail substage is invalid.")
+    for name, number in (
+        ("completed_units", value.completed_units),
+        ("total_units", value.total_units),
+        ("cache_hits", value.cache_hits),
+        ("retry_attempt", value.retry_attempt),
+    ):
+        if not isinstance(number, int) or isinstance(number, bool) or number < 0:
+            raise InvalidJobRequest(f"progress detail {name} must be zero or greater.")
+    if value.completed_units > value.total_units:
+        raise InvalidJobRequest("progress detail completed_units cannot exceed total_units.")
+    if value.cache_hits > value.completed_units:
+        raise InvalidJobRequest("progress detail cache_hits cannot exceed completed_units.")
+    if value.model_id is not None and (
+        not isinstance(value.model_id, str)
+        or not value.model_id
+        or len(value.model_id) > 200
+        or any(not character.isprintable() for character in value.model_id)
+    ):
+        raise InvalidJobRequest("progress detail model_id is invalid.")
+    for name, number in (
+        ("input_tokens", value.input_tokens),
+        ("output_tokens", value.output_tokens),
+    ):
+        if number is not None and (
+            not isinstance(number, int) or isinstance(number, bool) or number < 0
+        ):
+            raise InvalidJobRequest(f"progress detail {name} must be zero or greater.")
 
 
 def _validate_upload_id(value: str) -> None:

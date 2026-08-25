@@ -337,6 +337,17 @@ class JobListResponse(PublicSchema):
     jobs: tuple[JobSchema, ...]
 
 
+class JobProgressDetailSchema(PublicSchema):
+    substage: str
+    completed_units: int
+    total_units: int
+    cache_hits: int
+    retry_attempt: int
+    model_id: str | None
+    input_tokens: int | None
+    output_tokens: int | None
+
+
 class JobProgressSchema(PublicSchema):
     job_id: JobIdentifier
     generation: int
@@ -347,6 +358,7 @@ class JobProgressSchema(PublicSchema):
     elapsed_seconds: float
     estimated_remaining_seconds: float | None
     diarization_status: DiarizationStatus
+    detail: JobProgressDetailSchema | None
     updated_at: str
 
 

@@ -2186,9 +2186,12 @@ export class SpeechWorkbenchView extends ItemView {
     if (snapshot?.job.state === "structuring") {
       const presentation = structuringProgressPresentation(
         snapshot.progress?.stage ?? null,
-        snapshot.progress?.stage_progress ?? null
+        snapshot.progress?.stage_progress ?? null,
+        snapshot.progress?.detail ?? null
       );
-      const stageElapsed = formatElapsedSince(snapshot.job.updated_at);
+      const stageElapsed = snapshot.progress
+        ? formatProcessingElapsed(snapshot.progress.elapsed_seconds)
+        : formatElapsedSince(snapshot.job.updated_at);
       const progressAge =
         snapshot.progress?.stage === "structuring"
           ? formatRelativeAge(snapshot.progress.updated_at)
@@ -2198,7 +2201,12 @@ export class SpeechWorkbenchView extends ItemView {
         text: "正在提炼最终笔记"
       });
       card.createEl("p", {
-        text: `当前步骤：${presentation.step}`
+        text: `当前步骤：${[
+          presentation.step,
+          presentation.unitText,
+          presentation.cacheText,
+          presentation.retryText
+        ].filter((value): value is string => value !== null).join(" · ")}`
       });
       card.createEl("small", {
         cls: "speech-capture-processing-meta",
@@ -3847,6 +3855,18 @@ function formatElapsedSince(timestamp: string): string {
   }
   const hours = Math.floor(elapsedSeconds / 3_600);
   const minutes = Math.floor((elapsedSeconds % 3_600) / 60);
+  return hours > 0
+    ? `提炼已运行 ${hours.toString()} 小时 ${minutes.toString()} 分钟`
+    : `提炼已运行 ${minutes.toString()} 分钟`;
+}
+
+function formatProcessingElapsed(elapsedSeconds: number): string {
+  const safeSeconds = Math.max(0, Math.floor(elapsedSeconds));
+  if (safeSeconds < 60) {
+    return "提炼已运行不到 1 分钟";
+  }
+  const hours = Math.floor(safeSeconds / 3_600);
+  const minutes = Math.floor((safeSeconds % 3_600) / 60);
   return hours > 0
     ? `提炼已运行 ${hours.toString()} 小时 ${minutes.toString()} 分钟`
     : `提炼已运行 ${minutes.toString()} 分钟`;

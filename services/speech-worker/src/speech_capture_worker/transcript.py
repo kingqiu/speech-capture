@@ -97,6 +97,23 @@ class ProvisionalTranscript:
 
 
 @dataclass(frozen=True)
+class JobProgressDetail:
+    """Content-free detail for one long-running processing substage."""
+
+    substage: str
+    completed_units: int
+    total_units: int
+    cache_hits: int
+    retry_attempt: int
+    model_id: str | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
 class JobProgress:
     job_id: str
     generation: int
@@ -107,6 +124,7 @@ class JobProgress:
     elapsed_seconds: float
     estimated_remaining_seconds: float | None
     diarization_status: DiarizationStatus
+    detail: JobProgressDetail | None
     updated_at: str
 
     def to_dict(self) -> dict[str, Any]:

@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import threading
 import time
 import urllib.request
 from collections.abc import Callable
@@ -44,6 +45,7 @@ from speech_capture_worker.recording_context import (
 from speech_capture_worker.resources import GIB, ResourceReport, check_resource_preflight
 from speech_capture_worker.transcript import (
     DiarizationStatus,
+    JobProgressDetail,
     TranscriptSegment,
     chronological_segments,
 )
@@ -59,6 +61,13 @@ LEGACY_STRUCTURING_SCHEMA_VERSIONS = {
 }
 STRUCTURING_STAGE = "structuring"
 STRUCTURING_CHECKPOINT_KEY = "structuring_result"
+STRUCTURING_BATCH_STAGE = "structuring_batches"
+STRUCTURING_PACKET_STAGE = "structuring_packets"
+STRUCTURING_CANDIDATE_STAGE = "structuring_candidates"
+STRUCTURING_TELEMETRY_STAGE = "structuring_telemetry"
+STRUCTURING_CACHE_SCHEMA_VERSION = "1.0.0"
+STRUCTURING_TELEMETRY_SCHEMA_VERSION = "1.0.0"
+STRUCTURING_HEARTBEAT_SECONDS = 10.0
 SUMMARY_REVISION_STAGE = "summary_revisions"
 SUMMARY_REVISION_DECISION_STAGE = "summary_revision_decisions"
 SUMMARY_REVISION_SCHEMA_VERSION = "1.1.0"
@@ -608,9 +617,15 @@ class OllamaStructuringEngine:
         self.editor_model = editor_model.strip()
         self.model_id = f"ollama/{self.model};editor={self.editor_model}"
         self.recording_context: str | None = None
+        self._generation_metrics: list[dict[str, Any]] = []
 
     def set_recording_context(self, context: str | None) -> None:
         self.recording_context = normalize_recording_context(context)
+
+    def drain_generation_metrics(self) -> list[dict[str, Any]]:
+        metrics = list(self._generation_metrics)
+        self._generation_metrics.clear()
+        return metrics
 
     def classify(
         self,
@@ -753,6 +768,7 @@ class OllamaStructuringEngine:
             num_predict=6144,
             num_ctx=GLOBAL_SYNTHESIS_CONTEXT_TOKENS,
             timeout_seconds=1200,
+            retry_attempt=1,
         )
         return _parse_json_object(retry_response)
 
@@ -1168,6 +1184,7 @@ class OllamaStructuringEngine:
         num_predict: int,
         num_ctx: int = 16384,
         timeout_seconds: int = 600,
+        retry_attempt: int = 0,
     ) -> str:
         payload = json.dumps(
             {
@@ -1198,6 +1215,16 @@ class OllamaStructuringEngine:
                 details={"exception_type": type(exc).__name__},
             ) from exc
         value = body.get("response")
+        self._generation_metrics.append(
+            {
+                "model_id": str(body.get("model") or model or self.model),
+                "input_tokens": _nonnegative_integer(body.get("prompt_eval_count")),
+                "output_tokens": _nonnegative_integer(body.get("eval_count")),
+                "total_duration_ns": _nonnegative_integer(body.get("total_duration")),
+                "load_duration_ns": _nonnegative_integer(body.get("load_duration")),
+                "retry_attempt": _nonnegative_integer(retry_attempt),
+            }
+        )
         if not isinstance(value, str) or not value.strip():
             raise StructuringFailed("The local Ollama engine returned an empty response.")
         return value.strip()
@@ -1283,6 +1310,105 @@ class StructuringExecutor:
         self.engine.set_recording_context(context)
         return context
 
+    def _run_with_heartbeat(
+        self,
+        operation: Callable[[], Any],
+        *,
+        heartbeat: Callable[[], None],
+    ) -> Any:
+        """Keep content-free progress fresh while one local model call is blocking."""
+
+        stop = threading.Event()
+
+        def pulse() -> None:
+            while not stop.wait(STRUCTURING_HEARTBEAT_SECONDS):
+                try:
+                    heartbeat()
+                except Exception:
+                    return
+
+        thread = threading.Thread(
+            target=pulse,
+            name="speech-capture-structuring-heartbeat",
+            daemon=True,
+        )
+        thread.start()
+        try:
+            return operation()
+        finally:
+            stop.set()
+            thread.join(timeout=1.0)
+
+    def _drain_generation_metrics(self) -> list[dict[str, Any]]:
+        drain = getattr(self.engine, "drain_generation_metrics", None)
+        if not callable(drain):
+            return []
+        try:
+            raw_metrics = drain()
+        except Exception:
+            return []
+        if not isinstance(raw_metrics, list):
+            return []
+        metrics: list[dict[str, Any]] = []
+        for item in raw_metrics:
+            if not isinstance(item, dict):
+                continue
+            model_id = item.get("model_id")
+            if not isinstance(model_id, str) or not model_id or len(model_id) > 200:
+                continue
+            metrics.append(
+                {
+                    "model_id": model_id,
+                    "input_tokens": _nonnegative_integer(item.get("input_tokens")),
+                    "output_tokens": _nonnegative_integer(item.get("output_tokens")),
+                    "total_duration_ns": _nonnegative_integer(item.get("total_duration_ns")),
+                    "load_duration_ns": _nonnegative_integer(item.get("load_duration_ns")),
+                    "retry_attempt": _nonnegative_integer(item.get("retry_attempt")),
+                }
+            )
+        return metrics
+
+    def _cached_payload(
+        self,
+        checkpoints: dict[str, Any],
+        *,
+        checkpoint_key: str,
+        fingerprint: str,
+    ) -> dict[str, Any] | None:
+        checkpoint = checkpoints.get(checkpoint_key)
+        if checkpoint is None:
+            return None
+        payload = checkpoint.payload
+        if (
+            payload.get("schema_version") != STRUCTURING_CACHE_SCHEMA_VERSION
+            or payload.get("input_fingerprint") != fingerprint
+            or not isinstance(payload.get("result"), dict)
+        ):
+            return None
+        return payload["result"]
+
+    def _store_cached_payload(
+        self,
+        job_id: str,
+        *,
+        stage: str,
+        checkpoint_key: str,
+        fingerprint: str,
+        result: dict[str, Any],
+    ) -> None:
+        self.store.put_checkpoint(
+            job_id,
+            stage=stage,
+            checkpoint_key=checkpoint_key,
+            payload={
+                "schema_version": STRUCTURING_CACHE_SCHEMA_VERSION,
+                "input_fingerprint": fingerprint,
+                "model_id": self.engine.model_id,
+                "prompt_version": NOTE_PROMPT_VERSION,
+                "result": result,
+            },
+        )
+
     def _extract_batch_result(
         self,
         index: int,
@@ -1293,6 +1419,7 @@ class StructuringExecutor:
         valid_segment_ids: set[str],
     ) -> dict[str, Any]:
         batch_payload = _segment_payload(batch, transcript_edits=transcript_edit_map)
+        retry_attempt = 0
         try:
             findings = _validate_findings(
                 self.engine.extract_batch(batch_payload, content_type=content_type),
@@ -1300,6 +1427,7 @@ class StructuringExecutor:
             )
             error: str | None = None
         except Exception as exc:
+            retry_attempt = 1
             error = type(exc).__name__
             findings = ()
             if len(batch) > 1:
@@ -1329,6 +1457,7 @@ class StructuringExecutor:
             "segment_ids": [segment.segment_id for segment in batch],
             "findings": [finding.to_dict() for finding in findings],
             "unavailable_reason_code": error,
+            "retry_attempt": retry_attempt,
         }
 
     def _repair_scene_coverage(
@@ -1764,6 +1893,8 @@ class StructuringExecutor:
         segments = self._list_all_segments(job_id)
         segments_sha256 = _segments_identity_sha256(segments)
         transcribed = [segment for segment in segments if segment.text]
+        corrections = self.store.list_corrections(job_id)
+        corrections_digest = corrections_sha256(corrections)
         progress_snapshot = self.store.get_job_snapshot(job_id).progress
         progress_baseline_elapsed = (
             float(progress_snapshot.elapsed_seconds) if progress_snapshot is not None else 0.0
@@ -1779,23 +1910,91 @@ class StructuringExecutor:
             else DiarizationStatus.NOT_STARTED
         )
         progress_started = time.monotonic()
+        progress_lock = threading.RLock()
+        telemetry_records: list[dict[str, Any]] = []
+        total_input_tokens = 0
+        total_output_tokens = 0
 
-        def record_structuring_progress(stage_progress: float) -> None:
+        def record_structuring_progress(
+            stage_progress: float,
+            *,
+            substage: str = "preparing",
+            completed_units: int = 0,
+            total_units: int = 0,
+            cache_hits: int = 0,
+            retry_attempt: int = 0,
+        ) -> None:
             nonlocal progress_floor
             if job.state is not JobState.STRUCTURING:
                 return
-            progress_floor = max(progress_floor, stage_progress)
-            self.store.put_job_progress(
+            with progress_lock:
+                progress_floor = max(progress_floor, stage_progress)
+                self.store.put_job_progress(
+                    job_id,
+                    processed_ms=self.store.get_job_duration_ms(job_id),
+                    stage_progress=progress_floor,
+                    elapsed_seconds=(
+                        progress_baseline_elapsed + time.monotonic() - progress_started
+                    ),
+                    diarization_status=progress_diarization_status,
+                    detail=JobProgressDetail(
+                        substage=substage,
+                        completed_units=completed_units,
+                        total_units=total_units,
+                        cache_hits=cache_hits,
+                        retry_attempt=retry_attempt,
+                        model_id=self.engine.model_id,
+                        input_tokens=total_input_tokens,
+                        output_tokens=total_output_tokens,
+                    ),
+                )
+
+        def record_telemetry(
+            substage: str,
+            *,
+            started_at: float,
+            completed_units: int = 0,
+            total_units: int = 0,
+            cache_hit: bool = False,
+            retry_attempt: int = 0,
+        ) -> None:
+            nonlocal total_input_tokens, total_output_tokens
+            metrics = self._drain_generation_metrics()
+            input_tokens = sum(item["input_tokens"] for item in metrics)
+            output_tokens = sum(item["output_tokens"] for item in metrics)
+            total_input_tokens += input_tokens
+            total_output_tokens += output_tokens
+            observed_retry_attempt = max(
+                [retry_attempt, *(item["retry_attempt"] for item in metrics)]
+            )
+            telemetry_records.append(
+                {
+                    "substage": substage,
+                    "duration_seconds": round(max(0.0, time.monotonic() - started_at), 6),
+                    "completed_units": completed_units,
+                    "total_units": total_units,
+                    "cache_hit": cache_hit,
+                    "retry_attempt": observed_retry_attempt,
+                    "model_calls": len(metrics),
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "model_metrics": metrics,
+                }
+            )
+            self.store.put_checkpoint(
                 job_id,
-                processed_ms=self.store.get_job_duration_ms(job_id),
-                stage_progress=progress_floor,
-                elapsed_seconds=(
-                    progress_baseline_elapsed + time.monotonic() - progress_started
-                ),
-                diarization_status=progress_diarization_status,
+                stage=STRUCTURING_TELEMETRY_STAGE,
+                checkpoint_key="latest",
+                payload={
+                    "schema_version": STRUCTURING_TELEMETRY_SCHEMA_VERSION,
+                    "model_id": self.engine.model_id,
+                    "total_input_tokens": total_input_tokens,
+                    "total_output_tokens": total_output_tokens,
+                    "stages": telemetry_records,
+                },
             )
 
-        record_structuring_progress(0.01)
+        record_structuring_progress(0.01, substage="preparing")
         evidence = _checkpoint_by_key(
             self.store.list_checkpoints(job_id, stage=STRUCTURING_STAGE),
             STRUCTURING_CHECKPOINT_KEY,
@@ -1858,30 +2057,119 @@ class StructuringExecutor:
                 transcribed,
                 max_chars=DEFAULT_EDITOR_BATCH_MAX_CHARS,
             )
-            record_structuring_progress(0.04)
+            batch_checkpoints = {
+                checkpoint.checkpoint_key: checkpoint
+                for checkpoint in self.store.list_checkpoints(
+                    job_id,
+                    stage=STRUCTURING_BATCH_STAGE,
+                )
+            } if not force else {}
+            transcript_edit_cache_hits = 0
+            record_structuring_progress(
+                0.04,
+                substage="transcript_polish",
+                total_units=len(editor_batches),
+            )
             for index, batch in enumerate(editor_batches):
-                edit_error: str | None = None
-                try:
-                    transcript_edits = _validate_transcript_edits(
-                        self.engine.polish_transcript_batch(_segment_payload(batch)),
-                        expected_segment_ids={segment.segment_id for segment in batch},
-                    )
-                except Exception as exc:
-                    edit_error = type(exc).__name__
-                    unavailable_reasons.append(edit_error)
-                    transcript_edits = ()
-                transcript_edit_results.append(
+                edit_input = _segment_payload(batch)
+                edit_fingerprint = _structuring_cache_fingerprint(
                     {
+                        "kind": "transcript_edit",
+                        "model_id": self.engine.model_id,
+                        "prompt_version": NOTE_PROMPT_VERSION,
+                        "recording_context_sha256": recording_context_sha256(recording_context),
+                        "normalized_sha256": plan.normalized_sha256,
+                        "segments_sha256": segments_sha256,
+                        "manual_corrections_sha256": corrections_digest,
+                        "batch_max_chars": DEFAULT_EDITOR_BATCH_MAX_CHARS,
                         "batch_index": index,
-                        "segment_ids": [segment.segment_id for segment in batch],
-                        "transcript_edits": list(transcript_edits),
-                        "unavailable_reason_code": edit_error,
+                        "segments": edit_input,
                     }
                 )
+                checkpoint_key = f"transcript_edit_{index:05d}"
+                cached_edit = self._cached_payload(
+                    batch_checkpoints,
+                    checkpoint_key=checkpoint_key,
+                    fingerprint=edit_fingerprint,
+                )
+                edit_error: str | None = None
+                cached = False
+                transcript_edits: tuple[dict[str, str], ...] = ()
+                if cached_edit is not None:
+                    try:
+                        transcript_edits = _validate_transcript_edits(
+                            cached_edit.get("transcript_edits"),
+                            expected_segment_ids={segment.segment_id for segment in batch},
+                        )
+                        cached = cached_edit.get("segment_ids") == [
+                            segment.segment_id for segment in batch
+                        ]
+                    except Exception:
+                        cached = False
+                call_started = time.monotonic()
+                if cached:
+                    transcript_edit_cache_hits += 1
+                else:
+                    record_structuring_progress(
+                        0.04 + (0.18 * index / max(1, len(editor_batches))),
+                        substage="transcript_polish",
+                        completed_units=index,
+                        total_units=len(editor_batches),
+                        cache_hits=transcript_edit_cache_hits,
+                    )
+                    try:
+                        transcript_edits = _validate_transcript_edits(
+                            self._run_with_heartbeat(
+                                lambda: self.engine.polish_transcript_batch(edit_input),
+                                heartbeat=lambda: record_structuring_progress(
+                                    0.04 + (0.18 * index / max(1, len(editor_batches))),
+                                    substage="transcript_polish",
+                                    completed_units=index,
+                                    total_units=len(editor_batches),
+                                    cache_hits=transcript_edit_cache_hits,
+                                ),
+                            ),
+                            expected_segment_ids={segment.segment_id for segment in batch},
+                        )
+                    except Exception as exc:
+                        edit_error = type(exc).__name__
+                        unavailable_reasons.append(edit_error)
+                        transcript_edits = ()
+                edit_result = {
+                    "batch_index": index,
+                    "segment_ids": [segment.segment_id for segment in batch],
+                    "transcript_edits": list(transcript_edits),
+                    "unavailable_reason_code": edit_error,
+                }
+                transcript_edit_results.append(edit_result)
+                if edit_error is None and not cached:
+                    self._store_cached_payload(
+                        job_id,
+                        stage=STRUCTURING_BATCH_STAGE,
+                        checkpoint_key=checkpoint_key,
+                        fingerprint=edit_fingerprint,
+                        result=edit_result,
+                    )
+                record_telemetry(
+                    "transcript_polish",
+                    started_at=call_started,
+                    completed_units=index + 1,
+                    total_units=len(editor_batches),
+                    cache_hit=cached,
+                )
                 record_structuring_progress(
-                    0.04 + (0.18 * (index + 1) / max(1, len(editor_batches)))
+                    0.04 + (0.18 * (index + 1) / max(1, len(editor_batches))),
+                    substage="transcript_polish",
+                    completed_units=index + 1,
+                    total_units=len(editor_batches),
+                    cache_hits=transcript_edit_cache_hits,
                 )
             transcript_edit_map = _transcript_edit_map(transcript_edit_results)
+            transcript_edit_map = _apply_transcript_text_corrections(
+                transcribed,
+                transcript_edits=transcript_edit_map,
+                corrections=corrections,
+            )
             segment_payload = _segment_payload(
                 transcribed,
                 transcript_edits=transcript_edit_map,
@@ -1894,12 +2182,19 @@ class StructuringExecutor:
             segment_speakers = {segment.segment_id: segment.speaker_id for segment in transcribed}
             segment_starts = {segment.segment_id: segment.start_ms for segment in segments}
             speaker_count = len(speaker_ids)
-            record_structuring_progress(0.24)
+            record_structuring_progress(0.24, substage="classification")
+            classification_started = time.monotonic()
             try:
                 automatic_classification = _validate_classification(
-                    self.engine.classify(
-                        _classification_sample(segment_payload),
-                        speaker_count=speaker_count,
+                    self._run_with_heartbeat(
+                        lambda: self.engine.classify(
+                            _classification_sample(segment_payload),
+                            speaker_count=speaker_count,
+                        ),
+                        heartbeat=lambda: record_structuring_progress(
+                            0.24,
+                            substage="classification",
+                        ),
                     )
                 )
             except Exception as exc:
@@ -1909,7 +2204,8 @@ class StructuringExecutor:
                     traits=(),
                     confidence=0.0,
                 )
-            record_structuring_progress(0.29)
+            record_telemetry("classification", started_at=classification_started)
+            record_structuring_progress(0.29, substage="classification")
             classification, classification_source = _resolve_content_type(
                 automatic_classification,
                 job.content_type_override,
@@ -1920,19 +2216,107 @@ class StructuringExecutor:
             )
             batch_results: list[dict[str, Any]] = []
             valid_segment_ids = {segment.segment_id for segment in segments}
+            extraction_cache_hits = 0
             for index, batch in enumerate(batches):
-                batch_result = self._extract_batch_result(
-                    index,
+                extraction_input = _segment_payload(
                     batch,
-                    transcript_edit_map=transcript_edit_map,
-                    content_type=classification.type,
-                    valid_segment_ids=valid_segment_ids,
+                    transcript_edits=transcript_edit_map,
                 )
+                extraction_fingerprint = _structuring_cache_fingerprint(
+                    {
+                        "kind": "evidence_extraction",
+                        "model_id": self.engine.model_id,
+                        "prompt_version": NOTE_PROMPT_VERSION,
+                        "recording_context_sha256": recording_context_sha256(recording_context),
+                        "normalized_sha256": plan.normalized_sha256,
+                        "segments_sha256": segments_sha256,
+                        "manual_corrections_sha256": corrections_digest,
+                        "content_type": classification.type.value,
+                        "batch_max_chars": self._batch_max_chars,
+                        "batch_index": index,
+                        "segments": extraction_input,
+                    }
+                )
+                checkpoint_key = f"evidence_{index:05d}"
+                cached_result = self._cached_payload(
+                    batch_checkpoints,
+                    checkpoint_key=checkpoint_key,
+                    fingerprint=extraction_fingerprint,
+                )
+                batch_result: dict[str, Any] | None = None
+                cached = False
+                if cached_result is not None:
+                    try:
+                        cached_findings = _validate_findings(
+                            cached_result.get("findings"),
+                            segment_ids=valid_segment_ids,
+                        )
+                        cached = (
+                            cached_result.get("segment_ids")
+                            == [segment.segment_id for segment in batch]
+                            and cached_result.get("unavailable_reason_code") is None
+                        )
+                        if cached:
+                            batch_result = {
+                                **cached_result,
+                                "findings": [finding.to_dict() for finding in cached_findings],
+                            }
+                    except Exception:
+                        cached = False
+                call_started = time.monotonic()
+                if cached:
+                    extraction_cache_hits += 1
+                else:
+                    record_structuring_progress(
+                        0.30 + (0.25 * index / max(1, len(batches))),
+                        substage="evidence_extraction",
+                        completed_units=index,
+                        total_units=len(batches),
+                        cache_hits=extraction_cache_hits,
+                    )
+                    batch_result = self._run_with_heartbeat(
+                        lambda: self._extract_batch_result(
+                            index,
+                            batch,
+                            transcript_edit_map=transcript_edit_map,
+                            content_type=classification.type,
+                            valid_segment_ids=valid_segment_ids,
+                        ),
+                        heartbeat=lambda: record_structuring_progress(
+                            0.30 + (0.25 * index / max(1, len(batches))),
+                            substage="evidence_extraction",
+                            completed_units=index,
+                            total_units=len(batches),
+                            cache_hits=extraction_cache_hits,
+                        ),
+                    )
+                assert batch_result is not None
                 if batch_result["unavailable_reason_code"]:
                     unavailable_reasons.append(batch_result["unavailable_reason_code"])
+                elif not cached:
+                    self._store_cached_payload(
+                        job_id,
+                        stage=STRUCTURING_BATCH_STAGE,
+                        checkpoint_key=checkpoint_key,
+                        fingerprint=extraction_fingerprint,
+                        result=batch_result,
+                    )
                 batch_results.append(batch_result)
+                record_telemetry(
+                    "evidence_extraction",
+                    started_at=call_started,
+                    completed_units=index + 1,
+                    total_units=len(batches),
+                    cache_hit=cached,
+                    retry_attempt=int(batch_result.get("retry_attempt", 0) or 0),
+                )
                 record_structuring_progress(
-                    0.30 + (0.25 * (index + 1) / max(1, len(batches)))
+                    0.30 + (0.25 * (index + 1) / max(1, len(batches))),
+                    substage="evidence_extraction",
+                    completed_units=index + 1,
+                    total_units=len(batches),
+                    cache_hits=extraction_cache_hits,
+                    retry_attempt=int(batch_result.get("retry_attempt", 0) or 0),
                 )
             findings = _merge_findings(batch_results)
             document: dict[str, Any] | None = None
@@ -1944,62 +2328,285 @@ class StructuringExecutor:
             voice_memo_quality_repaired = False
             if transcribed:
                 try:
-                    record_structuring_progress(0.60)
-                    synthesis_payload, evidence_aliases = _synthesis_segment_payload(
-                        transcribed,
-                        transcript_edits=transcript_edit_map,
-                        batch_results=batch_results,
+                    record_structuring_progress(0.60, substage="document_synthesis")
+                    packet_fingerprint = _structuring_cache_fingerprint(
+                        {
+                            "kind": "synthesis_packet",
+                            "model_id": self.engine.model_id,
+                            "prompt_version": NOTE_PROMPT_VERSION,
+                            "recording_context_sha256": recording_context_sha256(
+                                recording_context
+                            ),
+                            "normalized_sha256": plan.normalized_sha256,
+                            "segments_sha256": segments_sha256,
+                            "manual_corrections_sha256": corrections_digest,
+                            "content_type": classification.type.value,
+                            "transcript_edit_results": transcript_edit_results,
+                            "batch_results": batch_results,
+                        }
                     )
-                    finding_payload = _synthesis_finding_payload(
-                        findings,
-                        aliases=evidence_aliases,
-                        batch_results=batch_results,
+                    packet_checkpoints = {
+                        checkpoint.checkpoint_key: checkpoint
+                        for checkpoint in self.store.list_checkpoints(
+                            job_id,
+                            stage=STRUCTURING_PACKET_STAGE,
+                        )
+                    } if not force else {}
+                    cached_packet = self._cached_payload(
+                        packet_checkpoints,
+                        checkpoint_key="global_reading_packet",
+                        fingerprint=packet_fingerprint,
                     )
-                    candidate = self._synthesize_document_with_speaker_coverage(
-                        finding_payload,
-                        synthesis_payload,
-                        content_type=classification.type,
+                    packet_started = time.monotonic()
+                    if (
+                        cached_packet is not None
+                        and isinstance(cached_packet.get("synthesis_payload"), list)
+                        and isinstance(cached_packet.get("evidence_aliases"), dict)
+                        and isinstance(cached_packet.get("finding_payload"), list)
+                    ):
+                        synthesis_payload = cached_packet["synthesis_payload"]
+                        evidence_aliases = cached_packet["evidence_aliases"]
+                        finding_payload = cached_packet["finding_payload"]
+                        packet_cached = True
+                    else:
+                        synthesis_payload, evidence_aliases = _synthesis_segment_payload(
+                            transcribed,
+                            transcript_edits=transcript_edit_map,
+                            batch_results=batch_results,
+                        )
+                        finding_payload = _synthesis_finding_payload(
+                            findings,
+                            aliases=evidence_aliases,
+                            batch_results=batch_results,
+                        )
+                        packet_cached = False
+                        self._store_cached_payload(
+                            job_id,
+                            stage=STRUCTURING_PACKET_STAGE,
+                            checkpoint_key="global_reading_packet",
+                            fingerprint=packet_fingerprint,
+                            result={
+                                "synthesis_payload": synthesis_payload,
+                                "evidence_aliases": evidence_aliases,
+                                "finding_payload": finding_payload,
+                            },
+                        )
+                    record_telemetry(
+                        "reading_packet",
+                        started_at=packet_started,
+                        completed_units=1,
+                        total_units=1,
+                        cache_hit=packet_cached,
                     )
-                    record_structuring_progress(0.70)
+                    candidate_fingerprint = _structuring_cache_fingerprint(
+                        {
+                            "kind": "document_candidate",
+                            "model_id": self.engine.model_id,
+                            "prompt_version": NOTE_PROMPT_VERSION,
+                            "packet_fingerprint": packet_fingerprint,
+                            "manual_corrections_sha256": corrections_digest,
+                            "content_type": classification.type.value,
+                        }
+                    )
+                    candidate_checkpoints = {
+                        checkpoint.checkpoint_key: checkpoint
+                        for checkpoint in self.store.list_checkpoints(
+                            job_id,
+                            stage=STRUCTURING_CANDIDATE_STAGE,
+                        )
+                    } if not force else {}
+                    cached_candidate = self._cached_payload(
+                        candidate_checkpoints,
+                        checkpoint_key="document_base",
+                        fingerprint=candidate_fingerprint,
+                    )
+                    candidate_started = time.monotonic()
+                    if cached_candidate is not None and isinstance(
+                        cached_candidate.get("document"),
+                        dict,
+                    ):
+                        candidate = cached_candidate["document"]
+                        candidate_cached = True
+                    else:
+                        candidate_cached = False
+                        candidate = self._run_with_heartbeat(
+                            lambda: self._synthesize_document_with_speaker_coverage(
+                                finding_payload,
+                                synthesis_payload,
+                                content_type=classification.type,
+                            ),
+                            heartbeat=lambda: record_structuring_progress(
+                                0.60,
+                                substage="document_synthesis",
+                            ),
+                        )
+                        if isinstance(candidate, dict):
+                            self._store_cached_payload(
+                                job_id,
+                                stage=STRUCTURING_CANDIDATE_STAGE,
+                                checkpoint_key="document_base",
+                                fingerprint=candidate_fingerprint,
+                                result={"document": candidate},
+                            )
+                    record_telemetry(
+                        "document_synthesis",
+                        started_at=candidate_started,
+                        completed_units=1,
+                        total_units=1,
+                        cache_hit=candidate_cached,
+                    )
+                    record_structuring_progress(
+                        0.70,
+                        substage="document_synthesis",
+                        completed_units=1,
+                        total_units=1,
+                        cache_hits=1 if candidate_cached else 0,
+                    )
                     if isinstance(candidate, dict):
                         document_candidate = candidate
                     base_document = _remap_document_evidence(
                         candidate,
                         aliases=evidence_aliases,
                     )
-                    repaired_document = self._repair_scene_coverage(
-                        base_document,
-                        findings,
-                        synthesis_payload,
-                        aliases=evidence_aliases,
-                        content_type=classification.type,
-                        segment_starts=segment_starts,
+                    scene_fingerprint = _structuring_cache_fingerprint(
+                        {
+                            "kind": "scene_coverage",
+                            "model_id": self.engine.model_id,
+                            "prompt_version": NOTE_PROMPT_VERSION,
+                            "repair_version": SCENE_COVERAGE_REPAIR_VERSION,
+                            "content_type": classification.type.value,
+                            "base_document": base_document,
+                            "packet_fingerprint": packet_fingerprint,
+                        }
                     )
-                    record_structuring_progress(0.78)
-                    quality_document = (
-                        self._repair_meeting_quality(
-                            repaired_document,
-                            synthesis_payload,
-                            aliases=evidence_aliases,
-                        )
-                        if classification.type is ContentType.MEETING
-                        else self._repair_interview_quality(
-                            repaired_document,
-                            synthesis_payload,
-                            aliases=evidence_aliases,
-                        )
-                        if classification.type is ContentType.INTERVIEW
-                        else (
-                            self._repair_voice_memo_quality(
-                                repaired_document,
+                    cached_scene = self._cached_payload(
+                        candidate_checkpoints,
+                        checkpoint_key="scene_coverage",
+                        fingerprint=scene_fingerprint,
+                    )
+                    scene_started = time.monotonic()
+                    if cached_scene is not None and isinstance(
+                        cached_scene.get("document"),
+                        dict,
+                    ):
+                        repaired_document = cached_scene["document"]
+                        scene_cached = True
+                    else:
+                        scene_cached = False
+                        repaired_document = self._run_with_heartbeat(
+                            lambda: self._repair_scene_coverage(
+                                base_document,
+                                findings,
                                 synthesis_payload,
                                 aliases=evidence_aliases,
-                            )
-                            if classification.type is ContentType.VOICE_MEMO
-                            else None
+                                content_type=classification.type,
+                                segment_starts=segment_starts,
+                            ),
+                            heartbeat=lambda: record_structuring_progress(
+                                0.70,
+                                substage="scene_coverage",
+                            ),
                         )
+                        self._store_cached_payload(
+                            job_id,
+                            stage=STRUCTURING_CANDIDATE_STAGE,
+                            checkpoint_key="scene_coverage",
+                            fingerprint=scene_fingerprint,
+                            result={"document": repaired_document},
+                        )
+                    record_telemetry(
+                        "scene_coverage",
+                        started_at=scene_started,
+                        completed_units=1,
+                        total_units=1,
+                        cache_hit=scene_cached,
                     )
-                    record_structuring_progress(0.88)
+                    record_structuring_progress(
+                        0.78,
+                        substage="scene_coverage",
+                        completed_units=1,
+                        total_units=1,
+                        cache_hits=1 if scene_cached else 0,
+                    )
+                    quality_fingerprint = _structuring_cache_fingerprint(
+                        {
+                            "kind": "quality_edit",
+                            "model_id": self.engine.model_id,
+                            "prompt_version": NOTE_PROMPT_VERSION,
+                            "meeting_quality_version": MEETING_QUALITY_REPAIR_VERSION,
+                            "interview_quality_version": INTERVIEW_QUALITY_REPAIR_VERSION,
+                            "voice_memo_quality_version": VOICE_MEMO_QUALITY_REPAIR_VERSION,
+                            "content_type": classification.type.value,
+                            "repaired_document": repaired_document,
+                            "packet_fingerprint": packet_fingerprint,
+                        }
+                    )
+                    cached_quality = self._cached_payload(
+                        candidate_checkpoints,
+                        checkpoint_key="quality_edit",
+                        fingerprint=quality_fingerprint,
+                    )
+                    quality_started = time.monotonic()
+                    if cached_quality is not None and isinstance(
+                        cached_quality.get("document"),
+                        dict,
+                    ):
+                        quality_document = cached_quality["document"]
+                        quality_cached = True
+                    else:
+                        quality_cached = False
+                        quality_document = self._run_with_heartbeat(
+                            lambda: (
+                                self._repair_meeting_quality(
+                                    repaired_document,
+                                    synthesis_payload,
+                                    aliases=evidence_aliases,
+                                )
+                                if classification.type is ContentType.MEETING
+                                else self._repair_interview_quality(
+                                    repaired_document,
+                                    synthesis_payload,
+                                    aliases=evidence_aliases,
+                                )
+                                if classification.type is ContentType.INTERVIEW
+                                else (
+                                    self._repair_voice_memo_quality(
+                                        repaired_document,
+                                        synthesis_payload,
+                                        aliases=evidence_aliases,
+                                    )
+                                    if classification.type is ContentType.VOICE_MEMO
+                                    else None
+                                )
+                            ),
+                            heartbeat=lambda: record_structuring_progress(
+                                0.78,
+                                substage="quality_edit",
+                            ),
+                        )
+                        if isinstance(quality_document, dict):
+                            self._store_cached_payload(
+                                job_id,
+                                stage=STRUCTURING_CANDIDATE_STAGE,
+                                checkpoint_key="quality_edit",
+                                fingerprint=quality_fingerprint,
+                                result={"document": quality_document},
+                            )
+                    record_telemetry(
+                        "quality_edit",
+                        started_at=quality_started,
+                        completed_units=1,
+                        total_units=1,
+                        cache_hit=quality_cached,
+                    )
+                    record_structuring_progress(
+                        0.88,
+                        substage="quality_edit",
+                        completed_units=1,
+                        total_units=1,
+                        cache_hits=1 if quality_cached else 0,
+                    )
+                    validation_started = time.monotonic()
                     try:
                         document = _validate_document(
                             quality_document or repaired_document,
@@ -2053,13 +2660,14 @@ class StructuringExecutor:
                                 segment_speakers=segment_speakers,
                                 segment_starts=segment_starts,
                             )
+                    record_telemetry("validation", started_at=validation_started)
                 except Exception as exc:
                     document_error = type(exc).__name__
                     document_validation_error = (
                         str(exc)[:500] if isinstance(exc, StructuringFailed) else None
                     )
                     unavailable_reasons.append(document_error)
-            record_structuring_progress(0.92)
+            record_structuring_progress(0.92, substage="validation")
             unavailable_reason = (
                 ",".join(dict.fromkeys(unavailable_reasons)) if unavailable_reasons else None
             )
@@ -2076,6 +2684,7 @@ class StructuringExecutor:
                 ),
                 "normalized_sha256": plan.normalized_sha256,
                 "segments_sha256": segments_sha256,
+                "manual_corrections_sha256": corrections_digest,
                 "unavailable_reason_code": unavailable_reason,
                 "classification": classification.to_dict(),
                 "classification_source": classification_source,
@@ -2113,7 +2722,7 @@ class StructuringExecutor:
                 raw_sha256=raw_sha256,
                 raw_bytes=raw_bytes,
             )
-            record_structuring_progress(0.95)
+            record_structuring_progress(0.95, substage="saving")
             evidence, _ = self.store.put_checkpoint(
                 job_id,
                 stage=STRUCTURING_STAGE,
@@ -2132,6 +2741,7 @@ class StructuringExecutor:
                     ),
                     "normalized_sha256": plan.normalized_sha256,
                     "segments_sha256": segments_sha256,
+                    "manual_corrections_sha256": corrections_digest,
                     "content_type": classification.type,
                     "content_type_source": classification_source,
                     "automatic_content_type": automatic_classification.type,
@@ -2158,7 +2768,7 @@ class StructuringExecutor:
                     "elapsed_seconds": round(elapsed_seconds, 6),
                 },
             )
-            record_structuring_progress(0.98)
+            record_structuring_progress(0.98, substage="saving")
             if document is None:
                 raise StructuringFailed(
                     "The final structured document is unavailable; "
@@ -2187,7 +2797,7 @@ class StructuringExecutor:
             )
 
         if job.state is JobState.STRUCTURING:
-            record_structuring_progress(1.0)
+            record_structuring_progress(1.0, substage="complete")
         current = self.store.get_job(job_id)
         if job.state is JobState.STRUCTURING:
             result_job = self.store.transition_job(
@@ -6614,6 +7224,24 @@ def _canonical_json(payload: Any) -> str:
         separators=(",", ":"),
         sort_keys=True,
     )
+
+
+def _structuring_cache_fingerprint(payload: dict[str, Any]) -> str:
+    envelope = {
+        "schema_version": STRUCTURING_CACHE_SCHEMA_VERSION,
+        "payload": payload,
+    }
+    return hashlib.sha256(_canonical_json(envelope).encode("utf-8")).hexdigest()
+
+
+def _nonnegative_integer(value: Any) -> int:
+    if isinstance(value, bool):
+        return 0
+    try:
+        parsed = int(value or 0)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    return max(0, parsed)
 
 
 def _canonical_json_value(value: Any) -> str:

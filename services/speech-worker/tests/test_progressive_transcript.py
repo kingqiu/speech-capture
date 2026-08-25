@@ -17,6 +17,7 @@ from speech_capture_worker.job_store import JobStore
 from speech_capture_worker.media_probe import MediaProbeResult
 from speech_capture_worker.transcript import (
     DiarizationStatus,
+    JobProgressDetail,
     SpeakerLabelStatus,
     TranscriptOutcome,
     TranscriptTimingStatus,
@@ -407,6 +408,16 @@ def test_progress_is_monotonic_idempotent_and_survives_reopen(tmp_path) -> None:
             stage_progress=0.1,
             elapsed_seconds=8,
             estimated_remaining_seconds=72,
+            detail=JobProgressDetail(
+                substage="evidence_extraction",
+                completed_units=2,
+                total_units=8,
+                cache_hits=1,
+                retry_attempt=0,
+                model_id="ollama/qwen3:8b",
+                input_tokens=1200,
+                output_tokens=180,
+            ),
         )
         repeated, repeated_changed = store.put_job_progress(
             job.job_id,
@@ -414,6 +425,16 @@ def test_progress_is_monotonic_idempotent_and_survives_reopen(tmp_path) -> None:
             stage_progress=0.1,
             elapsed_seconds=8,
             estimated_remaining_seconds=72,
+            detail=JobProgressDetail(
+                substage="evidence_extraction",
+                completed_units=2,
+                total_units=8,
+                cache_hits=1,
+                retry_attempt=0,
+                model_id="ollama/qwen3:8b",
+                input_tokens=1200,
+                output_tokens=180,
+            ),
         )
         second, second_changed = store.put_job_progress(
             job.job_id,
@@ -422,6 +443,16 @@ def test_progress_is_monotonic_idempotent_and_survives_reopen(tmp_path) -> None:
             elapsed_seconds=16,
             estimated_remaining_seconds=64,
             diarization_status=DiarizationStatus.NOT_STARTED,
+            detail=JobProgressDetail(
+                substage="evidence_extraction",
+                completed_units=4,
+                total_units=8,
+                cache_hits=2,
+                retry_attempt=0,
+                model_id="ollama/qwen3:8b",
+                input_tokens=2400,
+                output_tokens=360,
+            ),
         )
 
         with pytest.raises(InvalidJobRequest):
@@ -450,6 +481,11 @@ def test_progress_is_monotonic_idempotent_and_survives_reopen(tmp_path) -> None:
     assert snapshot.progress is not None
     assert snapshot.progress.processed_ms == 24_000
     assert snapshot.progress.duration_ms == 120_000
+    assert snapshot.progress.detail is not None
+    assert snapshot.progress.detail.substage == "evidence_extraction"
+    assert snapshot.progress.detail.completed_units == 4
+    assert snapshot.progress.detail.cache_hits == 2
+    assert snapshot.progress.detail.input_tokens == 2400
 
 
 def test_segments_must_commit_in_timeline_order(tmp_path) -> None:
@@ -631,3 +667,12 @@ def test_schema_three_migration_backfills_state_events_into_update_feed(tmp_path
         assert [update.event_type for update in updates] == ["job.created"]
         assert has_more is False
         assert migrated.quick_check() is True
+
+    connection = sqlite3.connect(database)
+    version = connection.execute("PRAGMA user_version").fetchone()[0]
+    progress_columns = {
+        row[1] for row in connection.execute("PRAGMA table_info(job_progress)").fetchall()
+    }
+    connection.close()
+    assert version == 9
+    assert "detail_json" in progress_columns

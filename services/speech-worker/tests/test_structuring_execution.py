@@ -6,6 +6,7 @@ import hashlib
 import io
 import json
 import shutil
+import time
 import wave
 from types import SimpleNamespace
 
@@ -351,6 +352,33 @@ class PartialBatchSpeakerStructuringEngine(FakeStructuringEngine):
             speaker_ids=requested,
             content_type=content_type,
         )
+
+
+class SimulatedProcessExit(BaseException):
+    pass
+
+
+class ExitAfterCandidateEngine(FakeStructuringEngine):
+    def refine_meeting_document(self, document, segments):
+        self.meeting_repair_calls += 1
+        raise SimulatedProcessExit()
+
+
+def test_structuring_heartbeat_pulses_during_a_blocking_model_call(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "speech_capture_worker.structuring_execution.STRUCTURING_HEARTBEAT_SECONDS",
+        0.01,
+    )
+    executor = object.__new__(StructuringExecutor)
+    pulses = []
+
+    result = executor._run_with_heartbeat(
+        lambda: (time.sleep(0.045), "done")[1],
+        heartbeat=lambda: pulses.append(time.monotonic()),
+    )
+
+    assert result == "done"
+    assert len(pulses) >= 2
 
 
 def test_speaker_supplement_retries_an_omitted_participant_individually() -> None:
@@ -895,6 +923,71 @@ def test_structuring_replaces_inherited_progress_before_first_model_call(tmp_pat
         assert completed is not None
         assert completed.stage is JobState.STRUCTURING
         assert completed.stage_progress == pytest.approx(1.0)
+        assert completed.detail is not None
+        assert completed.detail.substage == "complete"
+        telemetry = [
+            checkpoint
+            for checkpoint in store.list_checkpoints(job.job_id, stage="structuring_telemetry")
+            if checkpoint.checkpoint_key == "latest"
+        ]
+        assert len(telemetry) == 1
+        assert telemetry[0].payload["schema_version"] == "1.0.0"
+        assert any(
+            stage["substage"] == "evidence_extraction"
+            for stage in telemetry[0].payload["stages"]
+        )
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")
+def test_structuring_reuses_verified_batches_and_candidate_after_process_exit(tmp_path) -> None:
+    with JobStore(
+        tmp_path / "worker.sqlite3",
+        source_probe=source_probe_for(95),
+    ) as store:
+        job = create_structuring_job(
+            store,
+            duration_seconds=95,
+            suffix="checkpoint-resume",
+        )
+        interrupted_engine = ExitAfterCandidateEngine()
+        with pytest.raises(SimulatedProcessExit):
+            StructuringExecutor(
+                store,
+                interrupted_engine,
+                boundary_preflight=preflight(),
+            ).run(job.job_id)
+
+        assert interrupted_engine.polish_calls > 0
+        assert interrupted_engine.extract_calls > 0
+        assert interrupted_engine.synthesize_calls == 1
+        batch_checkpoints = store.list_checkpoints(job.job_id, stage="structuring_batches")
+        candidate_checkpoints = store.list_checkpoints(
+            job.job_id,
+            stage="structuring_candidates",
+        )
+        assert batch_checkpoints
+        assert any(
+            checkpoint.checkpoint_key == "document_base"
+            for checkpoint in candidate_checkpoints
+        )
+
+        resumed_engine = FakeStructuringEngine()
+        result = StructuringExecutor(
+            store,
+            resumed_engine,
+            boundary_preflight=preflight(),
+        ).run(job.job_id)
+
+        assert result.outcome is StructuringOutcome.COMPLETED
+        assert resumed_engine.polish_calls == 0
+        assert resumed_engine.extract_calls == 0
+        assert resumed_engine.synthesize_calls == 0
+        assert resumed_engine.classify_calls == 1
+        assert resumed_engine.meeting_repair_calls == 1
+        progress = store.get_job_snapshot(job.job_id).progress
+        assert progress is not None
+        assert progress.detail is not None
+        assert progress.detail.substage == "complete"
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")
@@ -1739,6 +1832,7 @@ def test_ollama_document_synthesis_retries_truncated_json(monkeypatch) -> None:
     assert len(requests) == 2
     assert requests[0]["num_predict"] == 4608
     assert requests[1]["num_predict"] == 6144
+    assert requests[1]["retry_attempt"] == 1
     assert "上一次输出未形成完整 JSON" in requests[1]["prompt"]
 
 

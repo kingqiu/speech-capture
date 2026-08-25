@@ -1,5 +1,5 @@
 // Generated Worker protocol wire types. Do not edit manually.
-export const OPENAPI_SHA256 = "041c30bf5f6b4b1edc3d6a0fbd53141cc86bb7c4ca7b1b803b2f45e9d09beb17" as const;
+export const OPENAPI_SHA256 = "93fc203c416b163f81039f1bd1c3eca9dcff59b27f5c6649e2f7b7dd48310c90" as const;
 export const OPENAPI_VERSION = "3.1.0" as const;
 export const PROTOCOL_VERSION = "1.0.0" as const;
 
@@ -161,7 +161,19 @@ export interface JobListResponse {
   readonly jobs: ReadonlyArray<JobSchema>;
 }
 
+export interface JobProgressDetailSchema {
+  readonly cache_hits: number;
+  readonly completed_units: number;
+  readonly input_tokens: number | null;
+  readonly model_id: string | null;
+  readonly output_tokens: number | null;
+  readonly retry_attempt: number;
+  readonly substage: string;
+  readonly total_units: number;
+}
+
 export interface JobProgressSchema {
+  readonly detail: JobProgressDetailSchema | null;
   readonly diarization_status: DiarizationStatus;
   readonly duration_ms: number;
   readonly elapsed_seconds: number;

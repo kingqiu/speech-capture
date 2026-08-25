@@ -32,15 +32,45 @@ describe("task state presentation", () => {
   it("does not reuse a previous stage's completed percentage for structuring", () => {
     expect(structuringProgressPresentation("diarizing", 1)).toEqual({
       step: "正在准备提炼上下文",
-      progressPercent: null
+      progressPercent: null,
+      unitText: null,
+      cacheText: null,
+      retryText: null
     });
     expect(structuringProgressPresentation("structuring", 0.42)).toEqual({
       step: "正在提取关键事实与证据",
-      progressPercent: 42
+      progressPercent: 42,
+      unitText: null,
+      cacheText: null,
+      retryText: null
     });
     expect(structuringProgressPresentation("structuring", 0.9)).toEqual({
       step: "正在校验笔记结构与证据",
-      progressPercent: 90
+      progressPercent: 90,
+      unitText: null,
+      cacheText: null,
+      retryText: null
+    });
+  });
+
+  it("shows the real structuring substage, batch checkpoint reuse and retry", () => {
+    expect(
+      structuringProgressPresentation("structuring", 0.41, {
+        substage: "evidence_extraction",
+        completed_units: 7,
+        total_units: 16,
+        cache_hits: 5,
+        retry_attempt: 1,
+        model_id: "ollama/qwen3:8b",
+        input_tokens: 12000,
+        output_tokens: 1800
+      })
+    ).toEqual({
+      step: "正在提取关键事实与证据",
+      progressPercent: 41,
+      unitText: "已完成 7/16",
+      cacheText: "已复用 5 项检查点",
+      retryText: "正在进行第 1 次重试"
     });
   });
 

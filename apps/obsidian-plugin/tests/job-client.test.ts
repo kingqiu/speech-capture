@@ -57,7 +57,17 @@ describe("job client", () => {
           stage: "transcribing",
           stage_progress: 0.44,
           duration_ms: 10000,
-          processed_ms: 4400
+          processed_ms: 4400,
+          detail: {
+            substage: "transcript_polish",
+            completed_units: 4,
+            total_units: 9,
+            cache_hits: 2,
+            retry_attempt: 0,
+            model_id: "qwen3:8b",
+            input_tokens: 1200,
+            output_tokens: 300
+          }
         }
       })
     ]);
@@ -73,6 +83,7 @@ describe("job client", () => {
     expect(transport.requests[0]?.path).toContain("vault_id=vault_one");
     expect(snapshot.stable_segments[0]?.text).toBe("合成稳定文字");
     expect(snapshot.provisional?.text).toBe("合成临时结果");
+    expect(snapshot.progress?.detail?.cache_hits).toBe(2);
   });
 
   it("sends revision-bound idempotent lifecycle actions", async () => {

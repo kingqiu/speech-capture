@@ -1,4 +1,5 @@
 import type {
+  JobProgressDetailSchema,
   JobSchema,
   JobState
 } from "../../../packages/protocol/generated/typescript/speech-capture-protocol";
@@ -29,6 +30,9 @@ export interface TaskStatePresentation {
 export interface StructuringProgressPresentation {
   readonly step: string;
   readonly progressPercent: number | null;
+  readonly unitText: string | null;
+  readonly cacheText: string | null;
+  readonly retryText: string | null;
 }
 
 export function jobStageIndex(
@@ -79,17 +83,22 @@ export function jobProgressLabel(
 
 export function structuringProgressPresentation(
   progressStage: JobState | null,
-  stageProgress: number | null
+  stageProgress: number | null,
+  detail: JobProgressDetailSchema | null = null
 ): StructuringProgressPresentation {
   if (progressStage !== "structuring" || stageProgress === null) {
     return {
       step: "正在准备提炼上下文",
-      progressPercent: null
+      progressPercent: null,
+      unitText: null,
+      cacheText: null,
+      retryText: null
     };
   }
   const progressPercent = Math.max(0, Math.min(100, Math.round(stageProgress * 100)));
-  const step =
-    progressPercent < 4
+  const step = detail
+    ? STRUCTURING_SUBSTAGE_LABELS[detail.substage] ?? "正在处理提炼任务"
+    : progressPercent < 4
       ? "正在准备提炼上下文"
       : progressPercent < 24
         ? "正在校订完整逐字稿"
@@ -106,8 +115,34 @@ export function structuringProgressPresentation(
                   : progressPercent < 95
                     ? "正在校验笔记结构与证据"
                     : "正在保存提炼结果";
-  return { step, progressPercent };
+  const unitText =
+    detail && detail.total_units > 0
+      ? `已完成 ${detail.completed_units.toString()}/${detail.total_units.toString()}`
+      : null;
+  const cacheText =
+    detail && detail.cache_hits > 0
+      ? `已复用 ${detail.cache_hits.toString()} 项检查点`
+      : null;
+  const retryText =
+    detail && detail.retry_attempt > 0
+      ? `正在进行第 ${detail.retry_attempt.toString()} 次重试`
+      : null;
+  return { step, progressPercent, unitText, cacheText, retryText };
 }
+
+const STRUCTURING_SUBSTAGE_LABELS: Readonly<Record<string, string>> = {
+  preparing: "正在准备提炼上下文",
+  transcript_polish: "正在校订完整逐字稿",
+  classification: "正在识别内容类型",
+  evidence_extraction: "正在提取关键事实与证据",
+  reading_packet: "正在整理完整阅读包",
+  document_synthesis: "正在生成笔记初稿并补全说话人观点",
+  scene_coverage: "正在核对内容覆盖与时间线",
+  quality_edit: "正在执行笔记质量修订",
+  validation: "正在校验笔记结构与证据",
+  saving: "正在保存提炼结果",
+  complete: "提炼阶段已完成"
+};
 
 export function taskStatePresentation(
   job: Pick<JobSchema, "state" | "last_error_code">,
