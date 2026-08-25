@@ -151,6 +151,7 @@ export async function regenerateJobSummary(
       method: "POST",
       body,
       bearerToken,
+      timeoutMs: 60 * 60_000,
       headers: { "Idempotency-Key": `obsidian-${idempotency}` }
     }
   );
@@ -324,6 +325,7 @@ export async function renameJobSpeakerDisplayName(
       method: "POST",
       body,
       bearerToken,
+      timeoutMs: 12_000,
       headers: { "Idempotency-Key": `obsidian-${idempotency}` }
     }
   );

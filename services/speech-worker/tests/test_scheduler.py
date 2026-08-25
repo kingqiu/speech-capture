@@ -278,7 +278,7 @@ def test_scheduler_claims_oldest_verified_job_and_then_reports_busy(tmp_path) ->
     assert busy.active_job_id == expected_first.job_id
     assert checkpoint.payload["status"] == "ready"
     assert calls[0]["model_profile"] is ModelProfile.ACCURACY
-    assert calls[0]["estimated_required_bytes"] > expected_first.source_size_bytes
+    assert calls[0]["estimated_required_bytes"] > 3 * GIB
 
 
 def test_blocked_preflight_safely_pauses_job_with_full_evidence(tmp_path) -> None:

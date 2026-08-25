@@ -101,7 +101,7 @@ from speech_capture_worker.transcript import (
     validate_transcript_text,
 )
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 DEFAULT_UPLOAD_CHUNK_SIZE_BYTES = 8 * 1024 * 1024
 MAX_UPLOAD_CHUNK_SIZE_BYTES = 64 * 1024 * 1024
 MAX_UPLOAD_PARTS = 10_000
@@ -546,8 +546,8 @@ class JobStore:
                         "current_revision": current.revision,
                     },
                 )
-            if current.state is not JobState.PROCESSED:
-                raise InvalidJobRequest("Corrections require a processed job.")
+            if current.state not in {JobState.PROCESSED, JobState.PUBLISHED}:
+                raise InvalidJobRequest("Corrections require a processed or published job.")
             self._validate_correction_target(
                 job_id=job_id,
                 field=field,
@@ -646,6 +646,30 @@ class JobStore:
                     now,
                 ),
             )
+            if current.state is JobState.PUBLISHED:
+                # The acknowledged Vault package is immutable historical output.
+                # Once a new correction exists it is no longer the acknowledgement
+                # for the current private job revision, so archive it atomically.
+                self._connection.execute(
+                    """
+                    INSERT INTO publication_receipt_history (
+                        job_id, lease_id, publisher_id, target_relative_path,
+                        manifest_sha256, published_at, archived_at,
+                        reason_code, triggering_revision, correction_id
+                    )
+                    SELECT
+                        job_id, lease_id, publisher_id, target_relative_path,
+                        manifest_sha256, published_at, ?,
+                        'job_correction_appended', ?, ?
+                    FROM publication_receipts
+                    WHERE job_id = ?
+                    """,
+                    (now, revision, correction_id, job_id),
+                )
+                self._connection.execute(
+                    "DELETE FROM publication_receipts WHERE job_id = ?",
+                    (job_id,),
+                )
             cursor = self._connection.execute(
                 """
                 UPDATE jobs SET revision = ?, updated_at = ?
@@ -761,8 +785,19 @@ class JobStore:
                     error_message=None,
                     event_type="publication.lease_expired",
                 )
-            if current.state is not JobState.PROCESSED:
-                raise InvalidJobRequest("Only a processed job can be claimed for publication.")
+            if current.state not in {JobState.PROCESSED, JobState.PUBLISHED}:
+                raise InvalidJobRequest(
+                    "Only a processed or revised published job can be claimed for publication."
+                )
+            if current.state is JobState.PUBLISHED:
+                receipt = self._connection.execute(
+                    "SELECT 1 FROM publication_receipts WHERE job_id = ?",
+                    (job_id,),
+                ).fetchone()
+                if receipt is not None:
+                    raise InvalidJobRequest(
+                        "The published package is already current for this job."
+                    )
             publishing = self._transition_in_transaction(
                 current=current,
                 target_state=JobState.PUBLISHING,
@@ -4094,6 +4129,39 @@ class JobStore:
                     ADD COLUMN detail_json TEXT;
 
                     PRAGMA user_version = 9;
+                    COMMIT;
+                    """
+                    )
+                except BaseException:
+                    if self._connection.in_transaction:
+                        self._connection.execute("ROLLBACK")
+                    raise
+                current = 9
+            if current == 9:
+                try:
+                    self._connection.executescript(
+                        """
+                    BEGIN IMMEDIATE;
+
+                    CREATE TABLE IF NOT EXISTS publication_receipt_history (
+                        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                        job_id TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+                        lease_id TEXT NOT NULL,
+                        publisher_id TEXT NOT NULL,
+                        target_relative_path TEXT NOT NULL,
+                        manifest_sha256 TEXT NOT NULL,
+                        published_at TEXT NOT NULL,
+                        archived_at TEXT NOT NULL,
+                        reason_code TEXT NOT NULL,
+                        triggering_revision INTEGER NOT NULL CHECK (triggering_revision > 0),
+                        correction_id TEXT REFERENCES corrections(correction_id),
+                        UNIQUE (job_id, lease_id)
+                    );
+
+                    CREATE INDEX IF NOT EXISTS publication_receipt_history_job_sequence_idx
+                    ON publication_receipt_history (job_id, sequence);
+
+                    PRAGMA user_version = 10;
                     COMMIT;
                     """
                     )

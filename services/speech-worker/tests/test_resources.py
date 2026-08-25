@@ -4,6 +4,7 @@ from speech_capture_worker.domain import ModelProfile, ResourceStatus
 from speech_capture_worker.errors import InvalidJobRequest, ResourceBlocked
 from speech_capture_worker.resources import (
     GIB,
+    PIPELINE_BOUNDARY_HEADROOM_BYTES,
     DiskSnapshot,
     MemorySnapshot,
     ResourcePolicy,
@@ -132,6 +133,7 @@ def test_disk_estimate_includes_staging_pcm_work_and_artifacts() -> None:
     estimated = estimate_job_disk_bytes(source_size_bytes=source_size, duration_sec=3600)
 
     assert estimated > source_size + 3600 * 16_000 * 2
+    assert estimated > source_size + PIPELINE_BOUNDARY_HEADROOM_BYTES
 
 
 def test_processing_estimate_does_not_count_already_staged_source_twice() -> None:

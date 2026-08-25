@@ -274,6 +274,70 @@ def test_segment_review_is_atomic_revision_guarded_and_listable(tmp_path) -> Non
     assert raw_segment.speaker_id == "speaker_0"
 
 
+def test_published_job_accepts_speaker_rename_and_archives_old_receipt(tmp_path) -> None:
+    with JobStore(
+        tmp_path / "worker.sqlite3",
+        upload_chunk_size_bytes=4,
+        source_probe=_probe,
+    ) as store:
+        client = TestClient(create_app(store=store, credential_verifier=_verifier("vault_primary")))
+        upload = _create_upload(client)
+        _complete_upload(client, upload)
+        created = _create_job(client, upload["upload"]["upload_id"])
+        job_id = created["job"]["job_id"]
+        _advance_to_processed_review_job(store, job_id)
+        processed = store.get_job(job_id)
+        lease, _, _ = store.claim_publication(
+            job_id,
+            publisher_id="vault_primary",
+            target_relative_path="Speech/2026/08/original",
+            manifest_sha256="a" * 64,
+            expected_revision=processed.revision,
+        )
+        _, published, _ = store.acknowledge_publication(
+            job_id,
+            lease_id=lease.lease_id,
+            publisher_id="vault_primary",
+            manifest_sha256="a" * 64,
+        )
+
+        renamed = client.post(
+            f"/v1/jobs/{job_id}/speaker-display-name",
+            headers={**AUTHORIZATION, "Idempotency-Key": "rename-published-speaker"},
+            json={
+                "expected_revision": published.revision,
+                "speaker_id": "speaker_0",
+                "before": "Speaker 0",
+                "after": "王总",
+                "author": "obsidian-user",
+            },
+        )
+        revised = store.get_job(job_id)
+        archived_count = int(
+            store._connection.execute(  # noqa: SLF001 - persistence boundary assertion
+                "SELECT COUNT(*) FROM publication_receipt_history WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()[0]
+        )
+        replacement_lease, publishing, replacement_created = store.claim_publication(
+            job_id,
+            publisher_id="vault_primary",
+            target_relative_path="Speech/2026/08/revised",
+            manifest_sha256="b" * 64,
+            expected_revision=revised.revision,
+        )
+        current_receipt = store.get_publication_receipt(job_id)
+
+    assert renamed.status_code == 200, renamed.text
+    assert renamed.json()["job"]["state"] == "published"
+    assert renamed.json()["correction"]["field"] == "speaker_display_name"
+    assert current_receipt is None
+    assert archived_count == 1
+    assert replacement_created is True
+    assert replacement_lease.generation == 2
+    assert publishing.state is JobState.PUBLISHING
+
+
 def test_summary_revision_is_private_listable_and_rejectable(tmp_path) -> None:
     with JobStore(
         tmp_path / "worker.sqlite3",

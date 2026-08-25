@@ -20,6 +20,7 @@ from speech_capture_worker.artifact_generation import (
     ArtifactGenerator,
     ArtifactOutcome,
     _apply_corrections,
+    _build_note_markdown,
     _filter_scene_actions,
     _read_manual_section,
 )
@@ -160,6 +161,77 @@ def test_first_explicit_speaker_rename_overrides_derived_display_name() -> None:
     assert effective.speaker_display_names == {"speaker_0": "王总"}
     assert effective.speaker_assignments == {segment.segment_id: "speaker_0"}
     assert effective.document["speaker_summaries"][0]["display_name"] == "王总"
+
+
+def test_note_uses_human_readable_fallback_for_anonymous_speaker() -> None:
+    segment = TranscriptSegment(
+        job_id="job_speaker_fallback",
+        segment_sequence=1,
+        segment_id="seg_speaker_fallback",
+        commit_key="speaker-fallback-segment",
+        revision=1,
+        start_ms=0,
+        end_ms=1_000,
+        outcome=TranscriptOutcome.TRANSCRIBED,
+        text="补充了数据来源和处理方式。",
+        language="zh",
+        confidence=0.9,
+        timing_status=TranscriptTimingStatus.ALIGNED,
+        speaker_id="speaker_03",
+        speaker_label_status=SpeakerLabelStatus.ANONYMOUS,
+        error_code=None,
+        created_at="2026-08-25T00:00:00Z",
+        updated_at="2026-08-25T00:00:00Z",
+    )
+    document = {
+        "title": "项目讨论",
+        "summary": {"text": "讨论了数据来源。", "evidence": [segment.segment_id]},
+        "context": [
+            {
+                "kind": "participant",
+                "title": "speaker_03",
+                "text": "speaker_03补充了数据来源。",
+                "evidence": [segment.segment_id],
+            }
+        ],
+        "highlights": [],
+        "topics": [],
+        "timeline_sections": [],
+        "scene_sections": [],
+        "discussion_threads": [],
+        "speaker_summaries": [
+            {
+                "speaker_id": "speaker_03",
+                "display_name": "",
+                "affiliation": "",
+                "role": "",
+                "summary": "补充了数据来源和处理方式。",
+                "evidence": [segment.segment_id],
+            }
+        ],
+        "decisions": [],
+        "actions": [],
+        "risks": [],
+        "open_questions": [],
+        "chapters": [],
+    }
+
+    note = _build_note_markdown(
+        job=SimpleNamespace(source_display_name="project.wav"),
+        speech_id="speech_fallback",
+        upload=SimpleNamespace(duration_seconds=1.0),
+        segments=[segment],
+        block_ids={segment.segment_id: "sp-fallback"},
+        findings=(),
+        classification={"type": "meeting"},
+        document=document,
+        alignment_report={"transcript_complete": True, "timeline_accounted": True},
+        include_evidence=False,
+    )
+
+    assert "### Speaker 3" in note
+    assert "speaker_03" not in note
+    assert "Speaker 3补充了数据来源" in note
 
 
 def test_manual_section_reader_rejects_symlink_and_invalid_utf8(tmp_path) -> None:
@@ -318,6 +390,10 @@ class FakeStructuringEngine:
                     "end_segment_id": segments[-1]["segment_id"],
                 }
             ],
+            "discussion_threads": self.synthesize_discussion_threads(
+                segments,
+                content_type=content_type,
+            ),
             "speaker_summaries": [],
             "decisions": decisions,
             "actions": actions,

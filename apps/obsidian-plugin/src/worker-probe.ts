@@ -43,6 +43,7 @@ export interface WorkerTransport {
       readonly bearerToken?: string;
       readonly headers?: Readonly<Record<string, string>>;
       readonly onUploadProgress?: (uploadedBytes: number) => void;
+      readonly timeoutMs?: number;
     }
   ): Promise<WorkerTransportResponse>;
 }

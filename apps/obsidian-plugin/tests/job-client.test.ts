@@ -232,6 +232,7 @@ describe("job client", () => {
     expect(transport.requests[0]?.headers?.["Idempotency-Key"]).toMatch(
       /^obsidian-[0-9a-f]{64}$/
     );
+    expect(transport.requests[0]?.timeoutMs).toBe(12_000);
   });
 
   it("lists candidate notes and sends a whole-version decision", async () => {
@@ -330,6 +331,7 @@ describe("job client", () => {
     expect(transport.requests[0]?.headers?.["Idempotency-Key"]).toMatch(
       /^obsidian-[0-9a-f]{64}$/
     );
+    expect(transport.requests[0]?.timeoutMs).toBe(60 * 60_000);
   });
 });
 
@@ -364,6 +366,7 @@ class QueueTransport implements WorkerTransport {
     path: string;
     body?: unknown;
     headers?: Readonly<Record<string, string>>;
+    timeoutMs?: number;
   }> = [];
 
   public constructor(private readonly responses: WorkerTransportResponse[]) {}
@@ -377,12 +380,14 @@ class QueueTransport implements WorkerTransport {
       readonly rawBody?: ArrayBuffer;
       readonly bearerToken?: string;
       readonly headers?: Readonly<Record<string, string>>;
+      readonly timeoutMs?: number;
     } = {}
   ): Promise<WorkerTransportResponse> {
     this.requests.push({
       path,
       ...(options.body === undefined ? {} : { body: options.body }),
-      ...(options.headers === undefined ? {} : { headers: options.headers })
+      ...(options.headers === undefined ? {} : { headers: options.headers }),
+      ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs })
     });
     const next = this.responses.shift();
     if (!next) {

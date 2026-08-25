@@ -46,6 +46,7 @@ export class ObsidianWorkerTransport implements WorkerTransport {
       readonly bearerToken?: string;
       readonly headers?: Readonly<Record<string, string>>;
       readonly onUploadProgress?: (uploadedBytes: number) => void;
+      readonly timeoutMs?: number;
     } = {}
   ): Promise<WorkerTransportResponse> {
     if (options.body !== undefined && options.rawBody !== undefined) {
@@ -190,6 +191,7 @@ async function requestJsonWithNodeHttps(
     readonly bearerToken?: string;
     readonly headers?: Readonly<Record<string, string>>;
     readonly onUploadProgress?: (uploadedBytes: number) => void;
+    readonly timeoutMs?: number;
   }
 ): Promise<WorkerTransportResponse> {
   try {
@@ -201,7 +203,9 @@ async function requestJsonWithNodeHttps(
           : undefined;
     const response = await requestWithNodeHttps(worker, path, {
       method: options.method ?? "GET",
-      timeoutMs: options.rawBody === undefined ? 30_000 : 15 * 60_000,
+      timeoutMs:
+        options.timeoutMs ??
+        (options.rawBody === undefined ? 30_000 : 15 * 60_000),
       ...(encodedBody === undefined ? {} : { body: encodedBody }),
       ...(options.onUploadProgress === undefined
         ? {}

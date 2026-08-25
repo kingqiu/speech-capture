@@ -73,6 +73,12 @@ import {
   taskStatePresentation
 } from "./task-state-presentation";
 import {
+  isCurrentTaskRequest,
+  isReviewableJobState,
+  taskSurface,
+  type TaskDetailMode
+} from "./task-view-routing";
+import {
   confirmPairingTicket,
   probeWorker,
   type WorkerProbeResult
@@ -110,6 +116,35 @@ const JOB_STAGES = Object.freeze([
   "质量检查"
 ] as const);
 
+const SCROLL_REGION_SELECTORS = Object.freeze([
+  ".speech-capture-task-panel",
+  ".speech-capture-intake",
+  ".speech-capture-confirmation",
+  ".speech-capture-active-task",
+  ".speech-capture-current-task",
+  ".speech-capture-review",
+  ".speech-capture-review-sidebar",
+  ".speech-capture-summary-diff",
+  ".speech-capture-summary-history",
+  ".speech-capture-summary-sidebar",
+  ".speech-capture-publication",
+  ".speech-capture-publication-sidebar"
+] as const);
+
+interface WorkbenchScrollState {
+  readonly root: number;
+  readonly regions: ReadonlyMap<string, number>;
+  readonly focus: WorkbenchFocusState | null;
+}
+
+interface WorkbenchFocusState {
+  readonly tagName: string;
+  readonly ariaLabel: string | null;
+  readonly segmentId: string | null;
+  readonly placeholder: string | null;
+  readonly text: string | null;
+}
+
 interface IntakeDraft {
   file: File | null;
   recordingDate: string;
@@ -141,11 +176,7 @@ type PublicationViewState =
 
 export class SpeechWorkbenchView extends ItemView {
   private viewMode: "intake" | "pairing" | "task" = "intake";
-  private taskDetailMode:
-    | "review"
-    | "summary"
-    | "history"
-    | "publication" = "review";
+  private taskDetailMode: TaskDetailMode = "review";
   private workerProbe: WorkerProbeResult | null = null;
   private probingWorker = false;
   private pairingTicket = "";
@@ -166,13 +197,29 @@ export class SpeechWorkbenchView extends ItemView {
   private selectedSummaryRevisionKey: string | null = null;
   private summaryDecisionSaving = false;
   private summaryRegenerating = false;
+  private summaryRegenerationStartedAt: number | null = null;
+  private summaryRegenerationTimer: number | null = null;
+  private summaryRegenerationFeedback:
+    | { readonly state: "working" | "error"; readonly message: string }
+    | null = null;
   private publicationState: PublicationViewState = { state: "idle" };
   private publicationBusy = false;
+  private taskSelectionEpoch = 0;
+  private refreshQueued = false;
+  private allowAutomaticPublicationView = true;
   private selectedSegmentId: string | null = null;
   private speakerFilterId: string | null = null;
   private speakerSearch = "";
   private reviewSaving = false;
   private speakerRenameSaving = false;
+  private speakerRenameFeedback:
+    | {
+        readonly state: "saving" | "slow" | "success" | "error";
+        readonly message: string;
+      }
+    | null = null;
+  private speakerRenameSlowTimer: number | null = null;
+  private reviewMutationEpoch = 0;
   private reviewAudioUrl: string | null = null;
   private readonly localAudioByJobId = new Map<string, File>();
   private readonly segmentReviewDrafts = new Map<string, SegmentReviewDraft>();
@@ -245,10 +292,14 @@ export class SpeechWorkbenchView extends ItemView {
       window.clearInterval(this.refreshTimer);
       this.refreshTimer = null;
     }
+    this.clearSpeakerRenameSlowTimer();
+    this.stopSummaryRegenerationTimer();
     this.releaseReviewAudioUrl();
   }
 
   public async onWorkerSettingsChanged(): Promise<void> {
+    this.stopSummaryRegenerationTimer();
+    this.taskSelectionEpoch += 1;
     this.workerProbe = null;
     this.probingWorker = false;
     this.pairingTicket = "";
@@ -258,6 +309,13 @@ export class SpeechWorkbenchView extends ItemView {
     this.selectedSnapshot = null;
     this.corrections = [];
     this.summaryRevisions = null;
+    this.summaryDecisionSaving = false;
+    this.summaryRegenerating = false;
+    this.summaryRegenerationStartedAt = null;
+    this.summaryRegenerationFeedback = null;
+    this.publicationState = { state: "idle" };
+    this.publicationBusy = false;
+    this.allowAutomaticPublicationView = true;
     this.connectionRecovery = null;
     this.viewMode = "intake";
     this.render();
@@ -265,6 +323,7 @@ export class SpeechWorkbenchView extends ItemView {
   }
 
   private render(): void {
+    const scrollState = this.captureScrollState();
     this.contentEl.empty();
     this.contentEl.addClass("speech-capture-view");
     const workbench = this.contentEl.createDiv({ cls: "speech-capture-workbench" });
@@ -289,14 +348,13 @@ export class SpeechWorkbenchView extends ItemView {
       this.renderPairingConfirmation(layout);
     } else if (this.viewMode === "task" && this.selectedJobId) {
       this.renderTaskSidebar(layout);
-      if (
-        this.taskDetailMode === "publication" ||
-        this.selectedSnapshot?.job.state === "publishing" ||
-        this.selectedSnapshot?.job.state === "published"
-      ) {
+      const selectedState =
+        this.selectedSnapshot?.job.state ?? this.selectedJob()?.state ?? null;
+      const surface = taskSurface(this.taskDetailMode, selectedState);
+      if (surface === "publication") {
         this.renderPublication(layout);
         this.renderPublicationSidebar(layout);
-      } else if (this.selectedSnapshot?.job.state === "processed") {
+      } else if (surface === "review") {
         if (this.taskDetailMode === "summary") {
           this.renderSummaryDiff(layout);
           this.renderSummaryDecisionSidebar(layout);
@@ -308,15 +366,78 @@ export class SpeechWorkbenchView extends ItemView {
           this.renderReviewSidebar(layout);
         }
       } else {
+        layout.addClass("is-merged-detail");
         this.renderActiveTask(layout);
-        this.renderCurrentTask(layout);
       }
       this.renderRestoreHandles(layout);
     } else {
+      layout.addClass("is-merged-detail");
       this.renderTaskSidebar(layout);
-      this.renderIntake(layout);
-      this.renderConfirmation(layout);
+      const intake = this.renderIntake(layout);
+      this.renderConfirmation(intake);
       this.renderRestoreHandles(layout);
+    }
+    this.restoreScrollState(scrollState);
+  }
+
+  private captureScrollState(): WorkbenchScrollState {
+    const regions = new Map<string, number>();
+    for (const selector of SCROLL_REGION_SELECTORS) {
+      const element = this.contentEl.querySelector<HTMLElement>(selector);
+      if (element) {
+        regions.set(selector, element.scrollTop);
+      }
+    }
+    return {
+      root: this.contentEl.scrollTop,
+      regions,
+      focus: this.captureFocusState()
+    };
+  }
+
+  private restoreScrollState(state: WorkbenchScrollState): void {
+    this.restoreFocusState(state.focus);
+    this.contentEl.scrollTop = state.root;
+    for (const [selector, scrollTop] of state.regions) {
+      const element = this.contentEl.querySelector<HTMLElement>(selector);
+      if (element) {
+        element.scrollTop = scrollTop;
+      }
+    }
+  }
+
+  private captureFocusState(): WorkbenchFocusState | null {
+    const active = document.activeElement;
+    if (!(active instanceof HTMLElement) || !this.contentEl.contains(active)) {
+      return null;
+    }
+    return {
+      tagName: active.tagName.toLowerCase(),
+      ariaLabel: active.getAttribute("aria-label"),
+      segmentId: active.getAttribute("data-segment-id"),
+      placeholder: active.getAttribute("placeholder"),
+      text:
+        active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement
+          ? null
+          : active.textContent?.trim() || null
+    };
+  }
+
+  private restoreFocusState(state: WorkbenchFocusState | null): void {
+    if (!state) {
+      return;
+    }
+    const candidates = this.contentEl.querySelectorAll<HTMLElement>(state.tagName);
+    for (const candidate of candidates) {
+      if (
+        candidate.getAttribute("aria-label") === state.ariaLabel &&
+        candidate.getAttribute("data-segment-id") === state.segmentId &&
+        candidate.getAttribute("placeholder") === state.placeholder &&
+        (state.text === null || candidate.textContent?.trim() === state.text)
+      ) {
+        candidate.focus({ preventScroll: true });
+        return;
+      }
     }
   }
 
@@ -425,6 +546,7 @@ export class SpeechWorkbenchView extends ItemView {
     this.renderResourceNotice(main, snapshot);
     this.renderTaskStateNotice(main, snapshot);
     this.renderTaskProgress(main, snapshot);
+    this.renderCurrentTask(main);
     this.renderTranscriptPreview(main, snapshot);
     if (this.connectionRecovery) {
       const error = main.createDiv({ cls: "speech-capture-inline-warning" });
@@ -482,7 +604,9 @@ export class SpeechWorkbenchView extends ItemView {
     } else if (this.summaryRevisions?.can_regenerate) {
       const regenerate = headingActions.createEl("button", {
         cls: "mod-cta",
-        text: this.summaryRegenerating ? "正在重新生成…" : "重新生成笔记",
+        text: this.summaryRegenerating
+          ? "正在生成候选…"
+          : "生成新版笔记候选",
         attr: { type: "button" }
       });
       regenerate.disabled = this.summaryRegenerating;
@@ -498,11 +622,38 @@ export class SpeechWorkbenchView extends ItemView {
         this.render();
       });
     }
+    if (snapshot.job.state === "published") {
+      const publication = headingActions.createEl("button", {
+        text:
+          this.summaryRevisions?.can_regenerate || pendingRevision
+            ? "查看当前已发布旧版"
+            : "查看发布结果",
+        attr: { type: "button" }
+      });
+      publication.addEventListener("click", () => {
+        this.taskDetailMode = "publication";
+        if (this.publicationState.state === "idle") {
+          void this.preparePublication(false, true);
+        } else {
+          this.render();
+        }
+      });
+    }
     headingActions.createEl("span", {
-      cls: "speech-capture-job-state is-good",
-      text: "处理完成 · 可复核"
+      cls: `speech-capture-job-state ${
+        snapshot.job.state === "published" && this.summaryRevisions?.can_regenerate
+          ? "is-warning"
+          : "is-good"
+      }`,
+      text:
+        snapshot.job.state === "published"
+          ? this.summaryRevisions?.can_regenerate
+            ? "已发布 · 修订待更新"
+            : "已发布 · 可复核"
+          : "处理完成 · 可复核"
     });
 
+    this.renderSummaryRegenerationStatus(main);
     this.renderReviewAudio(main, snapshot, selected);
     if (this.taskError) {
       main.createEl("p", {
@@ -592,6 +743,52 @@ export class SpeechWorkbenchView extends ItemView {
       if (narrow && segment.segment_id === selected?.segment_id) {
         this.renderSegmentEditor(rows, segment, true);
       }
+    }
+  }
+
+  private renderSummaryRegenerationStatus(parent: HTMLElement): void {
+    const feedback = this.summaryRegenerationFeedback;
+    if (!feedback) {
+      return;
+    }
+    const card = parent.createDiv({
+      cls: `speech-capture-summary-regeneration is-${feedback.state}`,
+      attr: {
+        role: feedback.state === "error" ? "alert" : "status",
+        "aria-live": "polite"
+      }
+    });
+    const icon = card.createSpan({
+      cls: "speech-capture-summary-regeneration__icon"
+    });
+    setIcon(icon, feedback.state === "working" ? "loader-circle" : "triangle-alert");
+    const copy = card.createDiv();
+    copy.createEl("strong", {
+      text:
+        feedback.state === "working"
+          ? "正在生成新版笔记候选"
+          : "候选笔记尚未生成"
+    });
+    copy.createEl("p", {
+      cls: "speech-capture-summary-regeneration__phase",
+      text:
+        feedback.state === "working"
+          ? this.summaryRegenerationPhase()
+          : feedback.message
+    });
+    if (feedback.state === "working") {
+      copy.createEl("p", {
+        cls: "speech-capture-summary-regeneration__elapsed",
+        text: `已用时 ${this.summaryRegenerationElapsed()}`
+      });
+      const progress = copy.createDiv({
+        cls: "speech-capture-progress is-indeterminate",
+        attr: { "aria-label": "正在生成候选笔记" }
+      });
+      progress.createDiv({ cls: "speech-capture-progress__fill" });
+      copy.createEl("small", {
+        text: "完成后会自动进入差异页；接受新版并重新发布前，当前 Vault Note 不会变化。"
+      });
     }
   }
 
@@ -912,10 +1109,31 @@ export class SpeechWorkbenchView extends ItemView {
       status.createEl("strong", {
         text:
           revision.status === "accepted"
-            ? `v${revision.candidate_version.toString()} 已成为当前笔记`
+            ? `v${revision.candidate_version.toString()} 已成为待发布笔记`
             : `已保留 v${revision.base_version.toString()} 作为当前笔记`
       });
-      status.createEl("p", { text: "此记录只读，原始证据仍然保留。" });
+      status.createEl("p", {
+        text:
+          revision.status === "accepted"
+            ? "Worker 中的新版已经确认；当前 Vault 旧版尚未变化，需要继续完成重新发布。"
+            : "此记录只读，当前 Vault Note 与原始证据均保持不变。"
+      });
+      if (revision.status === "accepted") {
+        const publish = status.createEl("button", {
+          cls: "mod-cta",
+          text: "继续到重新发布",
+          attr: { type: "button" }
+        });
+        publish.addEventListener("click", () => {
+          this.taskDetailMode = "publication";
+          this.allowAutomaticPublicationView = true;
+          if (this.publicationState.state === "idle") {
+            void this.preparePublication(false, true);
+          } else {
+            this.render();
+          }
+        });
+      }
     } else {
       const accept = panel.createEl("button", {
         cls: "mod-cta speech-capture-summary-decision__accept",
@@ -1072,12 +1290,24 @@ export class SpeechWorkbenchView extends ItemView {
       const result = card.createDiv();
       result.createEl("h3", { text: "已发布到 Obsidian" });
       result.createEl("p", { text: "完整产物包已经写入当前 Vault，并通过写入后校验。" });
-      const open = result.createEl("button", {
+      const actions = result.createDiv({
+        cls: "speech-capture-publication-result__actions"
+      });
+      const open = actions.createEl("button", {
         cls: "mod-cta",
         text: "打开 Note",
         attr: { type: "button" }
       });
       open.addEventListener("click", () => void this.openPublishedNote(state.targetRelativePath));
+      const review = actions.createEl("button", {
+        text: "查看完整逐字稿与证据",
+        attr: { type: "button" }
+      });
+      review.addEventListener("click", () => {
+        this.allowAutomaticPublicationView = false;
+        this.taskDetailMode = "review";
+        this.render();
+      });
       return;
     }
     if (state.state === "waiting_other_client") {
@@ -1448,6 +1678,25 @@ export class SpeechWorkbenchView extends ItemView {
     input.addEventListener("input", updateDisabled);
     loadSelectedName();
     updateDisabled();
+    if (this.speakerRenameFeedback) {
+      const feedback = editor.createEl("p", {
+        cls: `speech-capture-speaker-name-feedback is-${this.speakerRenameFeedback.state}`,
+        attr: {
+          role: this.speakerRenameFeedback.state === "error" ? "alert" : "status",
+          "aria-live": "polite"
+        }
+      });
+      if (
+        this.speakerRenameFeedback.state === "saving" ||
+        this.speakerRenameFeedback.state === "slow"
+      ) {
+        const icon = feedback.createSpan({
+          cls: "speech-capture-speaker-name-feedback__icon"
+        });
+        setIcon(icon, "loader-circle");
+      }
+      feedback.createSpan({ text: this.speakerRenameFeedback.message });
+    }
     save.addEventListener("click", () => {
       const current = effectiveSpeakerDisplayName(select.value, this.corrections);
       void this.saveSpeakerDisplayName(
@@ -1458,18 +1707,18 @@ export class SpeechWorkbenchView extends ItemView {
     });
   }
 
-  private renderCurrentTask(layout: HTMLElement): void {
-    const aside = layout.createEl("aside", {
-      cls: "speech-capture-panel speech-capture-current-task",
+  private renderCurrentTask(parent: HTMLElement): void {
+    const section = parent.createEl("section", {
+      cls: "speech-capture-current-task-inline",
       attr: { "aria-label": "当前任务" }
     });
-    const title = aside.createDiv({ cls: "speech-capture-panel__title" });
+    const title = section.createDiv({ cls: "speech-capture-panel__title" });
     title.createEl("h2", { text: "当前任务" });
-    title.appendChild(
-      this.collapseButton("right", "收起当前任务栏", "panel-right-close")
-    );
+    const body = section.createDiv({
+      cls: "speech-capture-current-task-inline__body"
+    });
     const job = this.selectedSnapshot?.job ?? this.selectedJob();
-    const facts = aside.createDiv({ cls: "speech-capture-task-facts" });
+    const facts = body.createDiv({ cls: "speech-capture-task-facts" });
     this.assurance(
       facts,
       "monitor",
@@ -1491,7 +1740,7 @@ export class SpeechWorkbenchView extends ItemView {
       this.assurance(facts, resource.icon, resource.shortText);
     }
 
-    const actions = aside.createDiv({ cls: "speech-capture-current-actions" });
+    const actions = body.createDiv({ cls: "speech-capture-current-actions" });
     actions.createEl("h3", { text: "当前可做" });
     const statePresentation = job
       ? taskStatePresentation(job, this.selectedSnapshot?.resource_report ?? null)
@@ -1567,7 +1816,7 @@ export class SpeechWorkbenchView extends ItemView {
     });
   }
 
-  private renderIntake(layout: HTMLElement): void {
+  private renderIntake(layout: HTMLElement): HTMLElement {
     const main = layout.createEl("main", {
       cls: "speech-capture-panel speech-capture-intake"
     });
@@ -1595,6 +1844,7 @@ export class SpeechWorkbenchView extends ItemView {
     select.addEventListener("change", () => {
       this.draft.contentType = select.value as IntakeDraft["contentType"];
     });
+    return main;
   }
 
   private renderSourceField(parent: HTMLElement): void {
@@ -1821,23 +2071,23 @@ export class SpeechWorkbenchView extends ItemView {
     speed.disabled = this.submissionState.state === "running";
   }
 
-  private renderConfirmation(layout: HTMLElement): void {
-    const aside = layout.createEl("aside", {
-      cls: "speech-capture-panel speech-capture-confirmation",
+  private renderConfirmation(parent: HTMLElement): void {
+    const section = parent.createEl("section", {
+      cls: "speech-capture-confirmation-inline",
       attr: { "aria-label": "提交前确认" }
     });
-    const title = aside.createDiv({ cls: "speech-capture-panel__title" });
-    title.appendChild(
-      this.collapseButton("right", "收起提交确认栏", "panel-right-close")
-    );
+    const title = section.createDiv({ cls: "speech-capture-panel__title" });
     title.createEl("h2", { text: "提交前确认" });
 
-    const assurances = aside.createDiv({ cls: "speech-capture-assurances" });
+    const body = section.createDiv({
+      cls: "speech-capture-confirmation-inline__body"
+    });
+    const assurances = body.createDiv({ cls: "speech-capture-assurances" });
     this.assurance(assurances, "shield-check", "原始音频不会被修改");
     this.assurance(assurances, "notebook-pen", "补充背景只作为参考");
     this.assurance(assurances, "cloud-upload", "上传完成后可关闭 Obsidian");
 
-    const facts = aside.createDiv({ cls: "speech-capture-facts" });
+    const facts = body.createDiv({ cls: "speech-capture-facts" });
     facts.createEl("h3", { text: "来源文件" });
     this.fact(facts, "文件名", this.draft.file?.name ?? "尚未选择");
     this.fact(
@@ -1872,10 +2122,10 @@ export class SpeechWorkbenchView extends ItemView {
     );
 
     if (this.submissionState.state !== "idle") {
-      this.renderSubmissionStatus(aside);
+      this.renderSubmissionStatus(section);
     }
 
-    const actions = aside.createDiv({ cls: "speech-capture-actions" });
+    const actions = section.createDiv({ cls: "speech-capture-actions" });
     const cancel = actions.createEl("button", {
       text: this.submissionState.state === "complete" ? "新建任务" : "取消",
       attr: { type: "button" }
@@ -2084,10 +2334,10 @@ export class SpeechWorkbenchView extends ItemView {
       this.taskDetailMode === "review" && this.hasUnsavedSelectedReviewDraft();
     const rightLabel =
       this.taskDetailMode === "publication" ||
-      this.selectedSnapshot?.job.state === "publishing" ||
-      this.selectedSnapshot?.job.state === "published"
+      this.selectedSnapshot?.job.state === "publishing"
         ? "展开发布目标栏"
-        : this.selectedSnapshot?.job.state === "processed"
+        : this.selectedSnapshot?.job.state &&
+            isReviewableJobState(this.selectedSnapshot.job.state)
         ? this.taskDetailMode === "review"
           ? "展开当前片段栏"
           : this.taskDetailMode === "summary"
@@ -2455,10 +2705,10 @@ export class SpeechWorkbenchView extends ItemView {
         ? ".speech-capture-task-panel .speech-capture-collapse-button"
         : this.viewMode === "task"
           ? this.taskDetailMode === "publication" ||
-            this.selectedSnapshot?.job.state === "publishing" ||
-            this.selectedSnapshot?.job.state === "published"
+            this.selectedSnapshot?.job.state === "publishing"
             ? ".speech-capture-publication-sidebar .speech-capture-collapse-button"
-            : this.selectedSnapshot?.job.state === "processed"
+            : this.selectedSnapshot?.job.state &&
+                isReviewableJobState(this.selectedSnapshot.job.state)
             ? this.taskDetailMode === "review"
               ? ".speech-capture-review-sidebar .speech-capture-collapse-button"
               : ".speech-capture-summary-sidebar .speech-capture-collapse-button"
@@ -2491,6 +2741,14 @@ export class SpeechWorkbenchView extends ItemView {
   }
 
   private async pollJobs(): Promise<void> {
+    if (
+      this.reviewSaving ||
+      this.speakerRenameSaving ||
+      this.summaryRegenerating ||
+      this.summaryDecisionSaving
+    ) {
+      return;
+    }
     const mode = nextConnectionAttempt(this.connectionRecovery, Date.now());
     if (mode !== null) {
       await this.refreshJobs(mode);
@@ -2501,6 +2759,13 @@ export class SpeechWorkbenchView extends ItemView {
     mode: ConnectionAttemptMode = "normal"
   ): Promise<void> {
     if (this.refreshingTasks) {
+      if (
+        mode === "manual" ||
+        (this.selectedJobId !== null &&
+          this.selectedSnapshot?.job.job_id !== this.selectedJobId)
+      ) {
+        this.refreshQueued = true;
+      }
       return;
     }
     const worker = this.plugin.preferredWorker();
@@ -2515,45 +2780,68 @@ export class SpeechWorkbenchView extends ItemView {
       return;
     }
     this.refreshingTasks = true;
+    const requestedJobId = this.selectedJobId;
+    const requestedSelectionEpoch = this.taskSelectionEpoch;
+    const requestedMutationEpoch = this.reviewMutationEpoch;
     const previousJobs = this.jobs;
     const hadTaskError = this.taskError !== null;
     const hadConnectionRecovery = this.connectionRecovery !== null;
-    const wasReviewingProcessed = this.selectedSnapshot?.job.state === "processed";
+    const wasReviewingResolved =
+      this.selectedSnapshot?.job.state !== undefined &&
+      isReviewableJobState(this.selectedSnapshot.job.state);
     const previousRevision = this.selectedSnapshot?.job.revision ?? null;
     const previousCorrectionSequence = this.corrections.at(-1)?.sequence ?? 0;
     const previousSummarySignature = this.summaryRevisionSignature();
     try {
-      this.jobs = await listJobs(
+      const jobs = await listJobs(
         new ObsidianWorkerTransport(),
         worker,
         token,
         vaultId
       );
-      if (this.selectedJobId) {
-        this.selectedSnapshot = await getJobSnapshot(
+      let selectedSnapshot: JobSnapshotResponse | null = null;
+      let corrections: readonly CorrectionSchema[] = [];
+      let summaryRevisions: SummaryRevisionListResponse | null = null;
+      if (requestedJobId) {
+        selectedSnapshot = await getJobSnapshot(
           new ObsidianWorkerTransport(),
           worker,
           token,
-          this.selectedJobId
+          requestedJobId
         );
-        this.corrections =
-          this.selectedSnapshot.job.state === "processed"
+        const reviewable = isReviewableJobState(selectedSnapshot.job.state);
+        corrections =
+          reviewable
             ? await listJobCorrections(
                 new ObsidianWorkerTransport(),
                 worker,
                 token,
-                this.selectedJobId
+                requestedJobId
               )
             : [];
-        this.summaryRevisions =
-          this.selectedSnapshot.job.state === "processed"
+        summaryRevisions =
+          reviewable
             ? await listJobSummaryRevisions(
                 new ObsidianWorkerTransport(),
                 worker,
                 token,
-                this.selectedJobId
+                requestedJobId
               )
             : null;
+      }
+      this.jobs = jobs;
+      if (
+        this.selectedJobId !== requestedJobId ||
+        this.taskSelectionEpoch !== requestedSelectionEpoch ||
+        this.reviewMutationEpoch !== requestedMutationEpoch
+      ) {
+        this.refreshQueued = true;
+        return;
+      }
+      this.selectedSnapshot = selectedSnapshot;
+      this.corrections = corrections;
+      this.summaryRevisions = summaryRevisions;
+      if (this.selectedSnapshot) {
         if (
           this.selectedSummaryRevisionKey &&
           !this.summaryRevisions?.revisions.some(
@@ -2582,14 +2870,17 @@ export class SpeechWorkbenchView extends ItemView {
         !this.selectedJobId &&
         !hadTaskError &&
         !hadConnectionRecovery &&
-        sameJobListPresentation(previousJobs, this.jobs)
+        sameJobListPresentation(previousJobs, jobs)
       ) {
         return;
       }
       if (
         mode === "normal" &&
-        wasReviewingProcessed &&
-        this.selectedSnapshot?.job.state === "processed" &&
+        wasReviewingResolved &&
+        !hadTaskError &&
+        !hadConnectionRecovery &&
+        this.selectedSnapshot?.job.state !== undefined &&
+        isReviewableJobState(this.selectedSnapshot.job.state) &&
         this.selectedSnapshot.job.revision === previousRevision &&
         (this.corrections.at(-1)?.sequence ?? 0) === previousCorrectionSequence &&
         this.summaryRevisionSignature() === previousSummarySignature
@@ -2597,11 +2888,18 @@ export class SpeechWorkbenchView extends ItemView {
         return;
       }
       const selectedState = this.selectedSnapshot?.job.state;
+      const hasUnappliedReviewChanges = this.summaryRevisions?.can_regenerate === true;
       const shouldPreparePublication =
-        (selectedState === "processed" && this.pendingSummaryRevision() === null) ||
+        (selectedState === "processed" &&
+          this.pendingSummaryRevision() === null &&
+          !hasUnappliedReviewChanges) ||
         selectedState === "publishing" ||
-        selectedState === "published";
-      if (shouldPreparePublication && this.publicationState.state === "idle") {
+        (selectedState === "published" && !hasUnappliedReviewChanges);
+      if (
+        shouldPreparePublication &&
+        this.publicationState.state === "idle" &&
+        this.allowAutomaticPublicationView
+      ) {
         this.taskDetailMode = "publication";
       }
       this.render();
@@ -2610,7 +2908,8 @@ export class SpeechWorkbenchView extends ItemView {
         (this.publicationState.state === "idle" ||
           this.publicationState.state === "waiting_other_client")
       ) {
-        window.setTimeout(() => void this.preparePublication(false), 0);
+        const reveal = this.allowAutomaticPublicationView;
+        window.setTimeout(() => void this.preparePublication(false, reveal), 0);
       }
     } catch (error) {
       if (error instanceof JobClientError && error.code === "unavailable") {
@@ -2629,21 +2928,36 @@ export class SpeechWorkbenchView extends ItemView {
       }
     } finally {
       this.refreshingTasks = false;
+      if (this.refreshQueued) {
+        this.refreshQueued = false;
+        window.setTimeout(() => void this.refreshJobs("normal"), 0);
+      }
     }
   }
 
   private async selectJob(jobId: string): Promise<void> {
+    this.clearSpeakerRenameSlowTimer();
+    this.stopSummaryRegenerationTimer();
+    this.taskSelectionEpoch += 1;
     this.selectedJobId = jobId;
     this.selectedSnapshot = null;
     this.corrections = [];
     this.summaryRevisions = null;
     this.selectedSummaryRevisionKey = null;
+    this.summaryDecisionSaving = false;
+    this.summaryRegenerating = false;
+    this.summaryRegenerationStartedAt = null;
+    this.summaryRegenerationFeedback = null;
     this.taskDetailMode = "review";
+    this.allowAutomaticPublicationView =
+      this.jobs.find((job) => job.job_id === jobId)?.state !== "published";
     this.publicationState = { state: "idle" };
     this.publicationBusy = false;
     this.selectedSegmentId = null;
     this.speakerFilterId = null;
     this.speakerSearch = "";
+    this.speakerRenameSaving = false;
+    this.speakerRenameFeedback = null;
     this.taskError = null;
     this.connectionRecovery = null;
     this.viewMode = "task";
@@ -2652,18 +2966,28 @@ export class SpeechWorkbenchView extends ItemView {
   }
 
   private openIntake(): void {
+    this.clearSpeakerRenameSlowTimer();
+    this.stopSummaryRegenerationTimer();
     this.releaseReviewAudioUrl();
+    this.taskSelectionEpoch += 1;
     this.viewMode = "intake";
     this.selectedJobId = null;
     this.selectedSnapshot = null;
     this.corrections = [];
     this.summaryRevisions = null;
     this.selectedSummaryRevisionKey = null;
+    this.summaryDecisionSaving = false;
+    this.summaryRegenerating = false;
+    this.summaryRegenerationStartedAt = null;
+    this.summaryRegenerationFeedback = null;
     this.taskDetailMode = "review";
+    this.allowAutomaticPublicationView = true;
     this.publicationState = { state: "idle" };
     this.publicationBusy = false;
     this.selectedSegmentId = null;
     this.speakerFilterId = null;
+    this.speakerRenameSaving = false;
+    this.speakerRenameFeedback = null;
     this.taskError = null;
     this.connectionRecovery = null;
     this.render();
@@ -2870,29 +3194,84 @@ export class SpeechWorkbenchView extends ItemView {
     if (!worker || !token || !job || this.speakerRenameSaving || !after) {
       return;
     }
+    this.reviewMutationEpoch += 1;
     this.speakerRenameSaving = true;
+    this.speakerRenameFeedback = {
+      state: "saving",
+      message: `正在保存到 ${worker.displayName}，通常几秒内完成。`
+    };
     this.taskError = null;
     this.render();
+    this.clearSpeakerRenameSlowTimer();
+    this.speakerRenameSlowTimer = window.setTimeout(() => {
+      if (!this.speakerRenameSaving) {
+        return;
+      }
+      this.speakerRenameFeedback = {
+        state: "slow",
+        message: `${worker.displayName} 响应较慢，仍在等待；最多等待 12 秒。`
+      };
+      this.render();
+    }, 4_000);
     try {
-      await renameJobSpeakerDisplayName(
+      const saved = await renameJobSpeakerDisplayName(
         new ObsidianWorkerTransport(),
         worker,
         token,
         { job, speakerId, before, after }
       );
+      this.reviewMutationEpoch += 1;
+      this.applySpeakerDisplayNameResult(saved);
       this.speakerRenameSaving = false;
-      await this.refreshJobs();
+      this.speakerRenameFeedback = {
+        state: "success",
+        message: saved.created ? "显示名已保存。" : "这项显示名修改已经保存过。"
+      };
+      this.render();
+      void this.refreshJobs("manual");
     } catch (error) {
+      this.reviewMutationEpoch += 1;
       this.speakerRenameSaving = false;
-      this.taskError =
-        error instanceof JobClientError
-          ? error.message
-          : "说话人显示名未能保存，请重新读取后再试。";
-      if (error instanceof JobClientError && error.code === "conflict") {
-        await this.refreshJobs();
-      } else {
-        this.render();
-      }
+      this.speakerRenameFeedback = {
+        state: "error",
+        message:
+          error instanceof JobClientError && error.code === "conflict"
+            ? "任务内容刚刚发生了变化，正在重新读取；请确认显示名后再保存。"
+            : "12 秒内未收到保存确认，正在重新读取 Worker；若显示名没有变化，可以再次保存。"
+      };
+      this.render();
+      void this.refreshJobs("manual");
+    } finally {
+      this.clearSpeakerRenameSlowTimer();
+      this.speakerRenameSaving = false;
+      this.render();
+    }
+  }
+
+  private applySpeakerDisplayNameResult(
+    saved: Awaited<ReturnType<typeof renameJobSpeakerDisplayName>>
+  ): void {
+    this.jobs = this.jobs.map((item) =>
+      item.job_id === saved.job.job_id ? saved.job : item
+    );
+    if (this.selectedSnapshot?.job.job_id === saved.job.job_id) {
+      this.selectedSnapshot = { ...this.selectedSnapshot, job: saved.job };
+    }
+    if (
+      !this.corrections.some(
+        (correction) => correction.correction_id === saved.correction.correction_id
+      )
+    ) {
+      this.corrections = [...this.corrections, saved.correction].sort(
+        (left, right) => left.sequence - right.sequence
+      );
+    }
+  }
+
+  private clearSpeakerRenameSlowTimer(): void {
+    if (this.speakerRenameSlowTimer !== null) {
+      window.clearTimeout(this.speakerRenameSlowTimer);
+      this.speakerRenameSlowTimer = null;
     }
   }
 
@@ -2906,11 +3285,13 @@ export class SpeechWorkbenchView extends ItemView {
     if (!worker || !token || !job || this.summaryDecisionSaving) {
       return;
     }
+    const requestEpoch = this.taskSelectionEpoch;
+    this.reviewMutationEpoch += 1;
     this.summaryDecisionSaving = true;
     this.taskError = null;
     this.render();
     try {
-      await decideJobSummaryRevision(
+      const result = await decideJobSummaryRevision(
         new ObsidianWorkerTransport(),
         worker,
         token,
@@ -2920,20 +3301,66 @@ export class SpeechWorkbenchView extends ItemView {
           decision
         }
       );
+      if (!this.isCurrentTaskRequest(job.job_id, requestEpoch)) {
+        this.jobs = this.jobs.map((item) =>
+          item.job_id === result.job.job_id ? result.job : item
+        );
+        return;
+      }
+      this.reviewMutationEpoch += 1;
+      this.applySummaryDecisionResult(result);
       this.summaryDecisionSaving = false;
-      await this.refreshJobs();
+      this.render();
+      void this.refreshJobs("manual");
     } catch (error) {
+      if (!this.isCurrentTaskRequest(job.job_id, requestEpoch)) {
+        return;
+      }
+      this.reviewMutationEpoch += 1;
       this.summaryDecisionSaving = false;
       this.taskError =
         error instanceof JobClientError
           ? error.message
           : "笔记版本未能保存，请重新读取后再试。";
       if (error instanceof JobClientError && error.code === "conflict") {
-        await this.refreshJobs();
+        void this.refreshJobs("manual");
       } else {
         this.render();
       }
+    } finally {
+      if (this.isCurrentTaskRequest(job.job_id, requestEpoch)) {
+        this.summaryDecisionSaving = false;
+        this.render();
+      }
     }
+  }
+
+  private applySummaryDecisionResult(
+    result: Awaited<ReturnType<typeof decideJobSummaryRevision>>
+  ): void {
+    this.jobs = this.jobs.map((item) =>
+      item.job_id === result.job.job_id ? result.job : item
+    );
+    if (this.selectedSnapshot?.job.job_id === result.job.job_id) {
+      this.selectedSnapshot = { ...this.selectedSnapshot, job: result.job };
+    }
+    const existing = this.summaryRevisions;
+    if (!existing) {
+      return;
+    }
+    this.summaryRevisions = {
+      ...existing,
+      revisions: existing.revisions.map((revision) =>
+        revision.revision_key === result.revision.revision_key
+          ? result.revision
+          : revision
+      ),
+      current_version:
+        result.revision.status === "accepted"
+          ? result.revision.candidate_version
+          : existing.current_version,
+      can_regenerate: false
+    };
   }
 
   private async regenerateSummary(): Promise<void> {
@@ -2943,7 +3370,15 @@ export class SpeechWorkbenchView extends ItemView {
     if (!worker || !token || !job || this.summaryRegenerating) {
       return;
     }
+    const requestEpoch = this.taskSelectionEpoch;
+    this.reviewMutationEpoch += 1;
     this.summaryRegenerating = true;
+    this.summaryRegenerationStartedAt = Date.now();
+    this.summaryRegenerationFeedback = {
+      state: "working",
+      message: "正在生成新版笔记候选。"
+    };
+    this.startSummaryRegenerationTimer();
     this.taskError = null;
     this.render();
     try {
@@ -2953,25 +3388,121 @@ export class SpeechWorkbenchView extends ItemView {
         token,
         job
       );
+      if (!this.isCurrentTaskRequest(job.job_id, requestEpoch)) {
+        this.jobs = this.jobs.map((item) =>
+          item.job_id === result.job.job_id ? result.job : item
+        );
+        return;
+      }
+      this.reviewMutationEpoch += 1;
+      this.applySummaryRegenerationResult(result);
       this.selectedSummaryRevisionKey = result.revision.revision_key;
       this.taskDetailMode = "summary";
       this.summaryRegenerating = false;
-      await this.refreshJobs();
+      this.summaryRegenerationFeedback = null;
+      this.stopSummaryRegenerationTimer();
+      this.render();
+      void this.refreshJobs("manual");
     } catch (error) {
+      if (!this.isCurrentTaskRequest(job.job_id, requestEpoch)) {
+        return;
+      }
+      this.reviewMutationEpoch += 1;
       this.summaryRegenerating = false;
-      this.taskError =
-        error instanceof JobClientError
-          ? error.message
-          : "笔记未能重新生成，当前 Note 保持不变。";
-      if (error instanceof JobClientError && error.code === "conflict") {
-        await this.refreshJobs();
-      } else {
-        this.render();
+      this.summaryRegenerationFeedback = {
+        state: "error",
+        message:
+          error instanceof JobClientError && error.code === "conflict"
+            ? "任务刚刚发生了新的修订，已重新读取；请再次生成候选笔记。"
+            : "未收到候选笔记完成确认，当前已发布 Note 保持不变；已重新读取 Worker。"
+      };
+      this.stopSummaryRegenerationTimer();
+      this.render();
+      void this.refreshJobs("manual");
+    } finally {
+      if (this.isCurrentTaskRequest(job.job_id, requestEpoch)) {
+        this.summaryRegenerating = false;
+        this.stopSummaryRegenerationTimer();
       }
     }
   }
 
-  private async preparePublication(force: boolean): Promise<void> {
+  private applySummaryRegenerationResult(
+    result: Awaited<ReturnType<typeof regenerateJobSummary>>
+  ): void {
+    this.jobs = this.jobs.map((item) =>
+      item.job_id === result.job.job_id ? result.job : item
+    );
+    if (this.selectedSnapshot?.job.job_id === result.job.job_id) {
+      this.selectedSnapshot = { ...this.selectedSnapshot, job: result.job };
+    }
+    const existing = this.summaryRevisions;
+    const revisions = [
+      ...(existing?.revisions ?? []).filter(
+        (revision) => revision.revision_key !== result.revision.revision_key
+      ),
+      result.revision
+    ];
+    this.summaryRevisions = {
+      revisions,
+      current_version: existing?.current_version ?? result.revision.base_version,
+      manual_section_markdown: existing?.manual_section_markdown ?? "",
+      can_regenerate: false
+    };
+  }
+
+  private startSummaryRegenerationTimer(): void {
+    this.stopSummaryRegenerationTimer();
+    this.summaryRegenerationTimer = window.setInterval(() => {
+      const elapsed = this.contentEl.querySelector<HTMLElement>(
+        ".speech-capture-summary-regeneration__elapsed"
+      );
+      if (elapsed) {
+        elapsed.textContent = `已用时 ${this.summaryRegenerationElapsed()}`;
+      }
+      const phase = this.contentEl.querySelector<HTMLElement>(
+        ".speech-capture-summary-regeneration__phase"
+      );
+      if (phase) {
+        phase.textContent = this.summaryRegenerationPhase();
+      }
+    }, 1_000);
+  }
+
+  private stopSummaryRegenerationTimer(): void {
+    if (this.summaryRegenerationTimer !== null) {
+      window.clearInterval(this.summaryRegenerationTimer);
+      this.summaryRegenerationTimer = null;
+    }
+  }
+
+  private summaryRegenerationElapsed(): string {
+    return formatDuration(
+      Math.max(0, Date.now() - (this.summaryRegenerationStartedAt ?? Date.now()))
+    );
+  }
+
+  private summaryRegenerationPhase(): string {
+    const elapsed = Math.max(
+      0,
+      Date.now() - (this.summaryRegenerationStartedAt ?? Date.now())
+    );
+    if (elapsed < 5_000) {
+      return "请求已发送，正在等待 Worker 开始生成。";
+    }
+    if (elapsed < 30_000) {
+      return "Worker 正在生成候选；当前接口不提供可靠百分比。";
+    }
+    if (elapsed < 3 * 60_000) {
+      return "仍在生成候选；已保存的文字与说话人修订会纳入结果。";
+    }
+    return "仍在处理长录音；页面会持续计时，最多等待 1 小时后明确失败。";
+  }
+
+  private async preparePublication(
+    force: boolean,
+    revealView = true
+  ): Promise<void> {
     const worker = this.plugin.preferredWorker();
     const token = worker ? this.plugin.credentials.get(worker.id) : null;
     const job = this.selectedSnapshot?.job;
@@ -2981,10 +3512,14 @@ export class SpeechWorkbenchView extends ItemView {
     if (!force && this.publicationState.state === "conflict") {
       return;
     }
+    const requestEpoch = this.taskSelectionEpoch;
+    const jobId = job.job_id;
     const keepWaitingView =
       !force && this.publicationState.state === "waiting_other_client";
     this.publicationBusy = true;
-    this.taskDetailMode = "publication";
+    if (revealView) {
+      this.taskDetailMode = "publication";
+    }
     if (!keepWaitingView) {
       this.publicationState = { state: "loading" };
       this.render();
@@ -2998,7 +3533,10 @@ export class SpeechWorkbenchView extends ItemView {
         job.job_id,
         this.plugin.settings.outputFolder
       );
-      if (status.receipt || status.job.state === "published") {
+      if (!this.isCurrentTaskRequest(jobId, requestEpoch)) {
+        return;
+      }
+      if (status.receipt) {
         const target = status.receipt?.target_relative_path ?? status.suggested_target_relative_path;
         this.publicationState = { state: "published", targetRelativePath: target };
         this.publicationBusy = false;
@@ -3020,6 +3558,9 @@ export class SpeechWorkbenchView extends ItemView {
         token,
         job.job_id
       );
+      if (!this.isCurrentTaskRequest(jobId, requestEpoch)) {
+        return;
+      }
       if (packageData.manifestSha256 !== status.manifest_sha256) {
         throw new VaultPublicationError("verification", "Worker 发布清单已发生变化。");
       }
@@ -3030,6 +3571,9 @@ export class SpeechWorkbenchView extends ItemView {
         target,
         packageData
       );
+      if (!this.isCurrentTaskRequest(jobId, requestEpoch)) {
+        return;
+      }
       if (inspection.kind === "conflict") {
         this.publicationState = {
           state: "conflict",
@@ -3046,9 +3590,13 @@ export class SpeechWorkbenchView extends ItemView {
         status,
         packageData,
         target,
-        status.active_lease?.lease_id ?? null
+        status.active_lease?.lease_id ?? null,
+        requestEpoch
       );
     } catch (error) {
+      if (!this.isCurrentTaskRequest(jobId, requestEpoch)) {
+        return;
+      }
       this.publicationBusy = false;
       if (error instanceof PublicationClientError && error.kind === "lease") {
         this.publicationState = {
@@ -3072,7 +3620,8 @@ export class SpeechWorkbenchView extends ItemView {
     status: PublicationStatusResponse,
     packageData: DownloadedPublicationPackage,
     targetRelativePath: string,
-    existingLeaseId: string | null
+    existingLeaseId: string | null,
+    requestEpoch: number
   ): Promise<void> {
     const worker = this.plugin.preferredWorker();
     const token = worker ? this.plugin.credentials.get(worker.id) : null;
@@ -3090,8 +3639,14 @@ export class SpeechWorkbenchView extends ItemView {
         });
         leaseId = claim.lease.lease_id;
       }
-      this.publicationState = { state: "publishing", targetRelativePath };
-      this.render();
+      const currentRequest = this.isCurrentTaskRequest(
+        status.job.job_id,
+        requestEpoch
+      );
+      if (currentRequest) {
+        this.publicationState = { state: "publishing", targetRelativePath };
+        this.render();
+      }
       await writePublicationPackage(this.app.vault.adapter, {
         targetRelativePath,
         leaseId,
@@ -3102,15 +3657,17 @@ export class SpeechWorkbenchView extends ItemView {
         leaseId,
         manifestSha256: packageData.manifestSha256
       });
-      if (this.selectedSnapshot) {
-        this.selectedSnapshot = { ...this.selectedSnapshot, job: acknowledged.job };
-      }
       this.jobs = this.jobs.map((item) =>
         item.job_id === acknowledged.job.job_id ? acknowledged.job : item
       );
-      this.publicationState = { state: "published", targetRelativePath };
-      this.publicationBusy = false;
-      this.render();
+      if (this.isCurrentTaskRequest(status.job.job_id, requestEpoch)) {
+        if (this.selectedSnapshot) {
+          this.selectedSnapshot = { ...this.selectedSnapshot, job: acknowledged.job };
+        }
+        this.publicationState = { state: "published", targetRelativePath };
+        this.publicationBusy = false;
+        this.render();
+      }
     } catch (error) {
       if (leaseId) {
         try {
@@ -3133,7 +3690,8 @@ export class SpeechWorkbenchView extends ItemView {
         );
         if (
           targetRelativePath === status.suggested_target_relative_path &&
-          inspection.kind === "conflict"
+          inspection.kind === "conflict" &&
+          this.isCurrentTaskRequest(status.job.job_id, requestEpoch)
         ) {
           this.publicationState = {
             state: "conflict",
@@ -3160,6 +3718,7 @@ export class SpeechWorkbenchView extends ItemView {
     if (!worker || !token || !job || this.publicationBusy) {
       return;
     }
+    const requestEpoch = this.taskSelectionEpoch;
     this.publicationBusy = true;
     this.render();
     try {
@@ -3178,8 +3737,17 @@ export class SpeechWorkbenchView extends ItemView {
         this.app.vault.adapter,
         conflict.status.suggested_target_relative_path
       );
-      await this.publishPreparedPackage(status, conflict.packageData, target, null);
+      await this.publishPreparedPackage(
+        status,
+        conflict.packageData,
+        target,
+        null,
+        requestEpoch
+      );
     } catch (error) {
+      if (!this.isCurrentTaskRequest(job.job_id, requestEpoch)) {
+        return;
+      }
       this.publicationBusy = false;
       this.publicationState = {
         state: "error",
@@ -3195,6 +3763,15 @@ export class SpeechWorkbenchView extends ItemView {
   private async openPublishedNote(targetRelativePath: string): Promise<void> {
     const notePath = `${targetRelativePath}/note.md`;
     await this.app.workspace.openLinkText(notePath, "", false);
+  }
+
+  private isCurrentTaskRequest(jobId: string, requestEpoch: number): boolean {
+    return isCurrentTaskRequest(
+      this.selectedJobId,
+      this.taskSelectionEpoch,
+      jobId,
+      requestEpoch
+    );
   }
 
   private async playReviewSegment(

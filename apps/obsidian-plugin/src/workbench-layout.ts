@@ -4,8 +4,8 @@ export function workbenchLayoutSize(width: number): WorkbenchLayoutSize {
   if (!Number.isFinite(width) || width <= 0) {
     return "wide";
   }
-  if (width <= 860) {
+  if (width <= 1_040) {
     return "narrow";
   }
-  return width <= 1480 ? "compact" : "wide";
+  return width <= 1_280 ? "compact" : "wide";
 }

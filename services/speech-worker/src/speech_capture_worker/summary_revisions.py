@@ -170,8 +170,8 @@ def regenerate_summary_revision(
                 "current_revision": job.revision,
             },
         )
-    if job.state is not JobState.PROCESSED:
-        raise InvalidJobRequest("Summary regeneration requires a processed job.")
+    if job.state not in {JobState.PROCESSED, JobState.PUBLISHED}:
+        raise InvalidJobRequest("Summary regeneration requires a processed or published job.")
     collection = list_summary_revisions(store, job_id)
     pending = next(
         (
@@ -233,8 +233,8 @@ def decide_summary_revision(
                 "current_revision": job.revision,
             },
         )
-    if job.state is not JobState.PROCESSED:
-        raise InvalidJobRequest("Summary decisions require a processed job.")
+    if job.state not in {JobState.PROCESSED, JobState.PUBLISHED}:
+        raise InvalidJobRequest("Summary decisions require a processed or published job.")
 
     revision = _checkpoint_by_key(
         store.list_checkpoints(job_id, stage=SUMMARY_REVISION_STAGE),
@@ -292,6 +292,24 @@ def decide_summary_revision(
                 checkpoint_key=STRUCTURING_CHECKPOINT_KEY,
                 payload=before_checkpoint,
             )
+        # Rejecting the Note candidate still keeps real transcript and speaker
+        # corrections. Regenerate the package with the prior structured Note so
+        # those accepted transcript-layer changes are not silently discarded.
+        # Synthetic/legacy candidates without an append-only correction ledger
+        # retain the historical no-regeneration behavior.
+        relevant_corrections = [
+            correction
+            for correction in store.list_corrections(job_id)
+            if correction.field
+            in {
+                CorrectionField.TRANSCRIPT_TEXT,
+                CorrectionField.SEGMENT_REVIEW,
+                CorrectionField.SPEAKER_DISPLAY_NAME,
+            }
+        ]
+        if relevant_corrections:
+            artifact = ArtifactGenerator(store).generate(job_id, force=True)
+            manifest_sha256 = artifact.manifest_sha256
 
     store.put_checkpoint(
         job_id,

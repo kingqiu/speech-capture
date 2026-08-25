@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-NOTE_PROMPT_VERSION = "2026-08-02.9"
+NOTE_PROMPT_VERSION = "2026-08-25.1"
 
 _COMMON_SALIENCE = """
 信息优先级不是由发言长度、措辞宏大或出现顺序决定。请依次判断：

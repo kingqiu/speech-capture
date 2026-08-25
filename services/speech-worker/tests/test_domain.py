@@ -55,8 +55,8 @@ def test_invalid_state_jump_is_rejected() -> None:
     assert caught.value.code == "INVALID_JOB_TRANSITION"
 
 
-def test_terminal_states_have_no_outgoing_transition() -> None:
-    assert ALLOWED_TRANSITIONS[JobState.PUBLISHED] == frozenset()
+def test_terminal_states_have_only_explicit_revision_or_no_outgoing_transition() -> None:
+    assert ALLOWED_TRANSITIONS[JobState.PUBLISHED] == frozenset({JobState.PUBLISHING})
     assert ALLOWED_TRANSITIONS[JobState.CANCELLED] == frozenset()
 
 

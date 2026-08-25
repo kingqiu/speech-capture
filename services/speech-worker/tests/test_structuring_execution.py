@@ -23,7 +23,7 @@ from speech_capture_worker.domain import JobState, ResourceStatus, UploadCreateR
 from speech_capture_worker.errors import InvalidJobRequest, StructuringFailed
 from speech_capture_worker.job_store import JobStore
 from speech_capture_worker.media_probe import MediaProbeResult
-from speech_capture_worker.note_prompt_profiles import synthesis_guidance
+from speech_capture_worker.note_prompt_profiles import NOTE_PROMPT_VERSION, synthesis_guidance
 from speech_capture_worker.resources import (
     GIB,
     DiskSnapshot,
@@ -32,19 +32,34 @@ from speech_capture_worker.resources import (
     ResourceReport,
 )
 from speech_capture_worker.structuring_execution import (
+    DEFAULT_BATCH_MAX_CHARS,
+    DEFAULT_BATCH_TARGET_TOKENS,
+    MIN_SUBSTANTIVE_SPEAKER_CHARACTERS,
     ContentType,
     FindingKind,
     OllamaStructuringEngine,
     StructuringExecutor,
     StructuringOutcome,
+    _bounded_speaker_evidence_packet,
+    _build_batches,
+    _compact_model_text,
     _dedupe_document_categories,
     _document_json_schema,
+    _estimate_text_tokens,
     _is_substantive_finding_text,
+    _meeting_highlight_is_question,
+    _meeting_question_is_covered_by_action,
+    _meeting_question_remains_open,
+    _promote_meeting_actionable_highlights,
+    _remove_unsupported_decision_claims,
+    _remove_unsupported_open_question_claims,
+    _remove_unsupported_speaker_host_claim,
     _repair_speaker_supplement_evidence,
     _sanitize_quality_evidence_references,
     _synthesis_segment_payload,
     _timeline_window_boundaries,
     _validate_document,
+    _validate_transcript_edits,
 )
 
 
@@ -171,6 +186,8 @@ class FakeStructuringEngine:
         self.meeting_repair_calls = 0
         self.interview_repair_calls = 0
         self.voice_memo_repair_calls = 0
+        self.discussion_thread_calls = 0
+        self.decision_reconcile_calls = 0
         self.extract_inputs = []
         self.synthesize_inputs = []
         self.recording_context = None
@@ -317,9 +334,11 @@ class FakeStructuringEngine:
         return dict(document)
 
     def synthesize_discussion_threads(self, segments, *, content_type):
+        self.discussion_thread_calls += 1
         return []
 
     def reconcile_decisions(self, document, segments, *, content_type):
+        self.decision_reconcile_calls += 1
         return list(document.get("decisions", []))
 
     def polish_transcript_batch(self, segments):
@@ -381,6 +400,72 @@ def test_structuring_heartbeat_pulses_during_a_blocking_model_call(monkeypatch) 
     assert len(pulses) >= 2
 
 
+def test_token_budget_batches_reduce_calls_without_splitting_segments() -> None:
+    segments = [
+        SimpleNamespace(
+            segment_id=f"segment-{index:04d}",
+            text=("数据治理方案需要明确范围、责任、接口和验收标准。" * 4),
+        )
+        for index in range(180)
+    ]
+
+    legacy = _build_batches(segments, max_chars=2200, max_segments=120)
+    optimized = _build_batches(
+        segments,
+        max_chars=DEFAULT_BATCH_MAX_CHARS,
+        target_tokens=DEFAULT_BATCH_TARGET_TOKENS,
+        max_segments=180,
+    )
+
+    assert len(optimized) <= len(legacy) * 0.7
+    assert [item.segment_id for batch in optimized for item in batch] == [
+        item.segment_id for item in segments
+    ]
+    assert all(
+        sum(_estimate_text_tokens(item.text) + 20 for item in batch)
+        <= DEFAULT_BATCH_TARGET_TOKENS
+        for batch in optimized
+    )
+    override_batches = _build_batches(
+        segments[:2],
+        max_chars=DEFAULT_BATCH_MAX_CHARS,
+        target_tokens=100,
+        text_overrides={segments[0].segment_id: "校订后扩展内容" * 30},
+    )
+    assert len(override_batches) == 2
+
+
+def test_model_text_compaction_changes_only_representation_whitespace() -> None:
+    assert _compact_model_text("  项目\t范围  不变\n\n\n下一项  ") == (
+        "项目 范围 不变\n\n下一项"
+    )
+
+
+def test_missing_speaker_packet_is_bounded_and_keeps_chronological_coverage() -> None:
+    segments = [
+        {
+            "segment_id": f"segment-{index:03d}",
+            "start_ms": index * 1000,
+            "speaker_id": "speaker_01" if index % 2 == 0 else "speaker_02",
+            "text": f"第 {index} 段关于项目范围和交付要求的实质陈述。" * 3,
+        }
+        for index in range(80)
+    ]
+
+    packet = _bounded_speaker_evidence_packet(segments, speaker_ids={"speaker_02"})
+
+    assert packet
+    assert {item["speaker_id"] for item in packet} == {"speaker_02"}
+    assert [item["start_ms"] for item in packet] == sorted(
+        item["start_ms"] for item in packet
+    )
+    assert packet[0]["segment_id"] == "segment-001"
+    assert packet[-1]["segment_id"] == "segment-079"
+    assert sum(
+        _estimate_text_tokens(item["text"]) + 20 for item in packet
+    ) <= 1100
+
+
 def test_speaker_supplement_retries_an_omitted_participant_individually() -> None:
     engine = PartialBatchSpeakerStructuringEngine()
     executor = object.__new__(StructuringExecutor)
@@ -394,8 +479,8 @@ def test_speaker_supplement_retries_an_omitted_participant_individually() -> Non
         for index, speaker_id in enumerate(("speaker_01", "speaker_02", "speaker_03"), start=1)
     ]
 
-    document = executor._synthesize_document_with_speaker_coverage(
-        [],
+    document = executor._repair_speaker_summary_coverage(
+        {"speaker_summaries": []},
         segments,
         content_type=ContentType.MEETING,
     )
@@ -693,18 +778,17 @@ def test_synthesis_packet_retains_every_substantive_speakers_own_words() -> None
                 text="主要发言" * 50,
             )
         )
-    for part in range(6):
-        sequence += 1
-        segments.append(
-            SimpleNamespace(
-                segment_id=f"seg_lower_volume_{part}",
-                segment_sequence=sequence,
-                start_ms=sequence * 1_000,
-                end_ms=sequence * 1_000 + 900,
-                speaker_id="speaker_05",
-                text="补充观点" * 25,
-            )
+    sequence += 1
+    segments.append(
+        SimpleNamespace(
+            segment_id="seg_lower_volume",
+            segment_sequence=sequence,
+            start_ms=sequence * 1_000,
+            end_ms=sequence * 1_000 + 900,
+            speaker_id="speaker_05",
+            text="补充观点" * 20,
         )
+    )
     batch_results = [
         {
             "batch_index": 0,
@@ -720,7 +804,7 @@ def test_synthesis_packet_retains_every_substantive_speakers_own_words() -> None
         if item["speaker_id"] == "speaker_05"
     )
 
-    assert retained_lower_volume_characters >= 500
+    assert retained_lower_volume_characters >= MIN_SUBSTANTIVE_SPEAKER_CHARACTERS
 
 
 def test_meeting_validation_accepts_nine_grounded_speaker_summaries() -> None:
@@ -868,6 +952,10 @@ def test_structuring_classifies_and_extracts_evidence_linked_findings(tmp_path) 
         assert engine.classify_calls == 1
         assert engine.extract_calls >= 1
         assert engine.synthesize_calls == 1
+        assert engine.meeting_repair_calls == 1
+        assert engine.discussion_thread_calls == 0
+        assert engine.decision_reconcile_calls == 0
+        assert engine.speaker_supplement_calls == 0
         assert engine.polish_calls >= 1
         assert all(item["text"].endswith("。") for batch in engine.extract_inputs for item in batch)
         assert len(engine.synthesize_inputs[0]) < len(
@@ -881,7 +969,7 @@ def test_structuring_classifies_and_extracts_evidence_linked_findings(tmp_path) 
         }
         assert all(item["segment_id"].startswith("s") for item in engine.synthesize_inputs[0])
         assert all(item["text"].endswith("。") for item in engine.synthesize_inputs[0])
-        assert raw["prompt_version"] == "2026-08-02.9"
+        assert raw["prompt_version"] == NOTE_PROMPT_VERSION
         assert raw["document"]["title"] == "结构提炼测试会议"
         assert sum(
             len(batch["transcript_edits"]) for batch in raw["transcript_edit_results"]
@@ -1836,6 +1924,41 @@ def test_ollama_document_synthesis_retries_truncated_json(monkeypatch) -> None:
     assert "上一次输出未形成完整 JSON" in requests[1]["prompt"]
 
 
+def test_meeting_quality_editor_uses_one_unified_full_document_call(monkeypatch) -> None:
+    engine = OllamaStructuringEngine(model="qwen3:14b", editor_model="qwen3:8b")
+    document = FakeStructuringEngine().synthesize_document(
+        [],
+        [{"segment_id": "seg_1", "speaker_id": "speaker_1", "text": "项目范围。"}],
+        content_type=ContentType.MEETING,
+    )
+    document["discussion_threads"] = []
+    requests = []
+
+    def generate(prompt, **kwargs):
+        requests.append({"prompt": prompt, **kwargs})
+        return json.dumps(document, ensure_ascii=False)
+
+    monkeypatch.setattr(engine, "_generate", generate)
+    result = engine.refine_meeting_document(
+        document,
+        [{"segment_id": "seg_1", "speaker_id": "speaker_1", "text": "项目范围。"}],
+    )
+
+    assert result["title"] == document["title"]
+    assert len(requests) == 1
+    assert requests[0]["num_ctx"] == 65_536
+    assert requests[0]["num_predict"] == 6144
+    assert "一次质量编辑" in requests[0]["prompt"]
+    assert {
+        "discussion_threads",
+        "speaker_summaries",
+        "decisions",
+        "actions",
+        "risks",
+        "open_questions",
+    }.issubset(requests[0]["format_schema"]["required"])
+
+
 @pytest.mark.parametrize(
     ("content_type", "kind", "label"),
     [
@@ -1903,15 +2026,18 @@ def test_meeting_profile_preserves_approved_document_contract() -> None:
     assert "timeline_sections" in schema["required"]
 
 
-def test_meeting_quality_repair_preserves_dedicated_timeline_and_discussion_sections() -> None:
+def test_meeting_quality_repair_preserves_timeline_and_accepts_unified_discussion_edit() -> None:
     class MeetingEditor:
         model_id = "meeting-editor"
 
         def refine_meeting_document(self, document, segments):
             return {
-                key: value
-                for key, value in document.items()
-                if key not in {"discussion_threads", "timeline_sections"}
+                **{
+                    key: value
+                    for key, value in document.items()
+                    if key not in {"discussion_threads", "timeline_sections"}
+                },
+                "discussion_threads": [{"title": "质量编辑后的方案选择"}],
             }
 
     executor = object.__new__(StructuringExecutor)
@@ -1925,7 +2051,7 @@ def test_meeting_quality_repair_preserves_dedicated_timeline_and_discussion_sect
     repaired = executor._repair_meeting_quality(document, [], aliases={})
 
     assert repaired["timeline_sections"] == document["timeline_sections"]
-    assert repaired["discussion_threads"] == document["discussion_threads"]
+    assert repaired["discussion_threads"] == [{"title": "质量编辑后的方案选择"}]
 
 
 def test_quality_repair_sanitizes_unknown_and_excess_evidence_references() -> None:
@@ -1971,6 +2097,121 @@ def test_quality_repair_deduplicates_items_across_note_categories() -> None:
     assert [item["task"] for item in repaired["actions"]] == ["整理清单"]
     assert [item["text"] for item in repaired["risks"]] == ["容量不足"]
     assert [item["text"] for item in repaired["open_questions"]] == ["何时复核？"]
+
+
+def test_quality_repair_merges_semantically_duplicate_actions() -> None:
+    repaired = _dedupe_document_categories(
+        {
+            "actions": [
+                {
+                    "task": "提供多仓数据表",
+                    "owner": "",
+                    "deadline": "",
+                    "evidence": ["seg_1"],
+                },
+                {
+                    "task": "提供产线工序数据和多仓表数据",
+                    "owner": "数据团队",
+                    "deadline": "",
+                    "evidence": ["seg_2"],
+                },
+            ]
+        }
+    )
+
+    assert repaired["actions"] == [
+        {
+            "task": "提供产线工序数据和多仓表数据",
+            "owner": "数据团队",
+            "deadline": "",
+            "evidence": ["seg_2", "seg_1"],
+        }
+    ]
+
+
+def test_meeting_question_is_removed_when_action_already_owns_it() -> None:
+    assert _meeting_question_is_covered_by_action(
+        "如何确保数据与周计划时间点对齐？",
+        [
+            {
+                "task": "确认数据导出时间与周计划时间点对齐",
+                "owner": "",
+                "deadline": "",
+                "evidence": ["seg_1"],
+            }
+        ],
+    )
+
+
+def test_meeting_question_is_removed_when_later_transcript_answers_it() -> None:
+    assert not _meeting_question_remains_open(
+        ["seg_question"],
+        segment_texts={
+            "seg_question": "是不是不需要一直更新？",
+            "seg_answer": "到后面再匹配就行了。",
+        },
+        segment_starts={"seg_question": 1_000, "seg_answer": 5_000},
+    )
+
+
+def test_unsupported_speaker_host_role_is_removed() -> None:
+    assert _remove_unsupported_speaker_host_claim(
+        "会议主持人，提出了数据完整性问题。",
+        ["seg_1"],
+        {"seg_1": "先看一下数据是不是完整。"},
+    ) == "提出了数据完整性问题。"
+
+
+def test_embedded_question_is_not_allowed_as_meeting_risk_or_highlight() -> None:
+    assert _meeting_highlight_is_question("数据导出后是否需要人工干预")
+    assert not _meeting_highlight_is_question("明确是否采用实时更新机制")
+
+
+def test_summary_drops_unresolved_claim_when_no_open_question_survives() -> None:
+    assert _remove_unsupported_open_question_claims(
+        "会议明确了数据处理任务。部分议题仍存在分歧，如是否持续更新数据。"
+    ) == "会议明确了数据处理任务。"
+
+
+def test_time_bound_highlight_is_promoted_to_action_without_duplication() -> None:
+    actions = _promote_meeting_actionable_highlights(
+        [
+            {
+                "text": "今日内完成数据导出和计划跑通",
+                "evidence": ["seg_1"],
+            }
+        ],
+        actions=[],
+        segment_texts={"seg_1": "今天把数据给我之后，再重新跑插件。"},
+    )
+
+    assert actions == [
+        {
+            "task": "完成数据导出和计划跑通",
+            "owner": "",
+            "deadline": "今天",
+            "evidence": ["seg_1"],
+        }
+    ]
+
+
+def test_empty_decisions_remove_generic_decision_claim_from_summary() -> None:
+    assert _remove_unsupported_decision_claims("会议最终达成若干决定。") == (
+        "会议未形成可由逐字稿明确确认的决定。"
+    )
+
+
+def test_transcript_editor_accepts_sparse_changes_and_drops_unchanged_items() -> None:
+    edits = _validate_transcript_edits(
+        [
+            {"segment_id": "seg_1", "text": "原文一。"},
+            {"segment_id": "seg_2", "text": "校订后的原文二。"},
+        ],
+        expected_segment_ids={"seg_1", "seg_2", "seg_3"},
+        source_texts={"seg_1": "原文一。", "seg_2": "原文二。", "seg_3": "原文三。"},
+    )
+
+    assert edits == ({"segment_id": "seg_2", "text": "校订后的原文二。"},)
 
 
 def test_timeline_sections_must_cover_corrected_transcript_continuously() -> None:

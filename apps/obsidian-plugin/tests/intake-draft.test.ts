@@ -71,8 +71,8 @@ describe("intake draft helpers", () => {
       estimateJobDiskBytes(486 * 1024 * 1024, 42 * 60 + 18)
     ).toEqual({
       uploadPeakBytes: 1_019_215_872,
-      workingBytes: 512_083_456,
-      totalBytes: 1_021_691_392
+      workingBytes: 3_733_308_928,
+      totalBytes: 4_242_916_864
     });
   });
 });

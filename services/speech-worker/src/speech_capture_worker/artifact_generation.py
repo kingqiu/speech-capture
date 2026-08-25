@@ -230,9 +230,13 @@ class ArtifactGenerator:
                     package_relative_path=checkpoint.payload["package_relative_path"],
                 )
             regenerating_processed = True
-        if job.state not in {JobState.QUALITY_CHECK, JobState.PROCESSED}:
+        if job.state not in {
+            JobState.QUALITY_CHECK,
+            JobState.PROCESSED,
+            JobState.PUBLISHED,
+        }:
             raise InvalidJobRequest(
-                "Artifact generation requires a quality-check or processed job."
+                "Artifact generation requires a quality-check, processed, or published job."
             )
 
         alignment_checkpoint = _checkpoint_by_key(
@@ -983,6 +987,10 @@ def _build_note_markdown(
         findings=supported,
         content_type=content_type,
     )
+    structured = _humanize_document_speaker_references(
+        structured,
+        speaker_display_names=speaker_display_names,
+    )
     headings = render_headings(content_type)
     title = structured["title"]
     lines: list[str] = []
@@ -1133,7 +1141,11 @@ def _build_note_markdown(
     if structured["speaker_summaries"]:
         lines.extend([f"## {headings['speakers']}", ""])
         for speaker in structured["speaker_summaries"]:
-            identity = speaker["display_name"] or speaker["speaker_id"]
+            identity = (
+                speaker["display_name"]
+                or speaker_display_names.get(speaker["speaker_id"])
+                or _default_speaker_name(speaker["speaker_id"])
+            )
             descriptors = [value for value in (speaker["affiliation"], speaker["role"]) if value]
             if descriptors:
                 identity += f"（{' · '.join(descriptors)}）"
@@ -1683,6 +1695,44 @@ def _default_speaker_name(speaker_id: str | None) -> str:
         return "Speaker ?"
     suffix = speaker_id.rsplit("_", 1)[-1]
     return f"Speaker {int(suffix)}" if suffix.isdigit() else speaker_id
+
+
+def _humanize_document_speaker_references(
+    value: Any,
+    *,
+    speaker_display_names: dict[str, str],
+    field: str | None = None,
+) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _humanize_document_speaker_references(
+                item,
+                speaker_display_names=speaker_display_names,
+                field=key,
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [
+            _humanize_document_speaker_references(
+                item,
+                speaker_display_names=speaker_display_names,
+                field=field,
+            )
+            for item in value
+        ]
+    if not isinstance(value, str) or field in {
+        "speaker_id",
+        "start_segment_id",
+        "end_segment_id",
+    }:
+        return value
+    return re.sub(
+        r"speaker_\d+",
+        lambda match: speaker_display_names.get(match.group(0))
+        or _default_speaker_name(match.group(0)),
+        value,
+    )
 
 
 def _format_range(start_ms: int, end_ms: int) -> str:

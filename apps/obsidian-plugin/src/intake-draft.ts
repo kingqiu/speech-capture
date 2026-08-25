@@ -135,7 +135,9 @@ export function estimateJobDiskBytes(
     256 * 1024 * 1024,
     Math.ceil(sourceSizeBytes * 0.1)
   );
-  const workingBytes = workingAudioBytes + artifactHeadroomBytes;
+  const pipelineBoundaryHeadroomBytes = 3 * 1024 * 1024 * 1024;
+  const workingBytes =
+    workingAudioBytes + artifactHeadroomBytes + pipelineBoundaryHeadroomBytes;
   const uploadPeakBytes = sourceSizeBytes * 2;
   return {
     uploadPeakBytes,

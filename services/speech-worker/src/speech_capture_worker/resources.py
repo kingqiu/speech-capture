@@ -15,6 +15,7 @@ from speech_capture_worker.errors import InvalidJobRequest, ResourceBlocked
 
 GIB = 1024**3
 MIB = 1024**2
+PIPELINE_BOUNDARY_HEADROOM_BYTES = 3 * GIB
 
 
 @dataclass(frozen=True)
@@ -295,7 +296,12 @@ def estimate_job_disk_bytes(
     working_audio_bytes = pcm_bytes * 3
     artifact_headroom_bytes = max(256 * MIB, math.ceil(source_size_bytes * 0.10))
     source_staging_bytes = source_size_bytes if include_source_staging else 0
-    return source_staging_bytes + working_audio_bytes + artifact_headroom_bytes
+    return (
+        source_staging_bytes
+        + working_audio_bytes
+        + artifact_headroom_bytes
+        + PIPELINE_BOUNDARY_HEADROOM_BYTES
+    )
 
 
 def snapshot_disk(path: Path) -> DiskSnapshot:

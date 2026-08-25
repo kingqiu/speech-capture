@@ -65,22 +65,29 @@ STRUCTURING_BATCH_STAGE = "structuring_batches"
 STRUCTURING_PACKET_STAGE = "structuring_packets"
 STRUCTURING_CANDIDATE_STAGE = "structuring_candidates"
 STRUCTURING_TELEMETRY_STAGE = "structuring_telemetry"
-STRUCTURING_CACHE_SCHEMA_VERSION = "1.0.0"
+STRUCTURING_CACHE_SCHEMA_VERSION = "2.0.0"
 STRUCTURING_TELEMETRY_SCHEMA_VERSION = "1.0.0"
+TRANSCRIPT_EDIT_PROMPT_VERSION = "2026-08-25.2"
 STRUCTURING_HEARTBEAT_SECONDS = 10.0
 SUMMARY_REVISION_STAGE = "summary_revisions"
 SUMMARY_REVISION_DECISION_STAGE = "summary_revision_decisions"
 SUMMARY_REVISION_SCHEMA_VERSION = "1.1.0"
 STRUCTURING_HEADROOM_BYTES = GIB
-DEFAULT_BATCH_MAX_CHARS = 2200
-DEFAULT_EDITOR_BATCH_MAX_CHARS = 1800
-DEFAULT_BATCH_MAX_SEGMENTS = 120
+STRUCTURING_BATCHING_VERSION = "2026-08-25.1"
+DEFAULT_BATCH_TARGET_TOKENS = 4800
+DEFAULT_EDITOR_BATCH_TARGET_TOKENS = 3600
+DEFAULT_BATCH_MAX_CHARS = 7200
+DEFAULT_EDITOR_BATCH_MAX_CHARS = 5400
+DEFAULT_BATCH_MAX_SEGMENTS = 180
+SPEAKER_EVIDENCE_TARGET_TOKENS = 1000
+SPEAKER_GROUP_TARGET_TOKENS = 7000
+SPEAKER_GROUP_MAX_SPEAKERS = 6
 GLOBAL_SYNTHESIS_CONTEXT_TOKENS = 65_536
 MAX_SYNTHESIS_FINDINGS_PER_BATCH = 10
 SCENE_COVERAGE_REPAIR_VERSION = "2026-08-02.4"
-MEETING_QUALITY_REPAIR_VERSION = "2026-08-10.3"
+MEETING_QUALITY_REPAIR_VERSION = "2026-08-25.3"
 MEETING_OUTCOME_REPAIR_VERSION = "2026-08-10.3"
-INTERVIEW_QUALITY_REPAIR_VERSION = "2026-08-02.1"
+INTERVIEW_QUALITY_REPAIR_VERSION = "2026-08-25.1"
 VOICE_MEMO_QUALITY_REPAIR_VERSION = "2026-08-02.2"
 MAX_FINDING_TEXT_CHARACTERS = 2000
 MAX_TRAIT_COUNT = 20
@@ -89,6 +96,7 @@ MAX_DOCUMENT_TEXT_CHARACTERS = 3000
 MAX_DOCUMENT_EVIDENCE_ITEMS = 3
 MIN_RICH_MEETING_CONTEXT_CHARACTERS = 80
 MAX_SPEAKER_SUMMARIES = 16
+MIN_SUBSTANTIVE_SPEAKER_CHARACTERS = 80
 
 
 class ContentType(StrEnum):
@@ -276,7 +284,7 @@ DOCUMENT_JSON_SCHEMA = {
                     "details": {
                         "type": "array",
                         "items": EVIDENCE_TEXT_JSON_SCHEMA,
-                        "maxItems": 2,
+                        "maxItems": 4,
                     },
                     "evidence": {
                         "type": "array",
@@ -541,6 +549,13 @@ class StructuringEngine(Protocol):
         segments: list[dict[str, Any]],
     ) -> dict[str, Any]: ...
 
+    def synthesize_meeting_topics(
+        self,
+        segments: list[dict[str, Any]],
+        *,
+        existing_topics: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]: ...
+
     def refine_meeting_outcomes(
         self,
         document: dict[str, Any],
@@ -739,7 +754,8 @@ class OllamaStructuringEngine:
             + json.dumps(findings, ensure_ascii=False)
             + "\n"
             f"内容类型：{content_type.value}\n"
-            "说话人发言量统计（characters >= 500 的 speaker 必须进入 speaker_summaries）：\n"
+            f"说话人发言量统计（characters >= {MIN_SUBSTANTIVE_SPEAKER_CHARACTERS} 的 "
+            "speaker 必须进入 speaker_summaries；短但有明确业务贡献的发言也不能遗漏）：\n"
             + json.dumps(speaker_stats, ensure_ascii=False)
             + "\n"
             "完整逐字稿的分层阅读包：\n" + json.dumps(segments, ensure_ascii=False)
@@ -864,60 +880,71 @@ class OllamaStructuringEngine:
         segments: list[dict[str, Any]],
     ) -> dict[str, Any]:
         quality_segments = _meeting_quality_segments(segments)
-        core_fields = ("title", "summary", "context", "highlights", "topics")
-        core_schema = {
-            "type": "object",
-            "properties": {
-                key: json.loads(json.dumps(DOCUMENT_JSON_SCHEMA["properties"][key]))
-                for key in core_fields
-            },
-            "required": list(core_fields),
-            "additionalProperties": False,
-        }
-        core_prompt = (
-            "你是中文会议纪要主编。只返回 schema 要求的 JSON，不要解释。根据校订逐字稿重新组织"
-            "会议主线，不沿用旧笔记的空泛表述。title 必须点明具体项目和会议目的。summary 用一段"
-            "话交代参与方、讨论对象、范围、推进方式和会议实际落点。context 只写会议目的、项目"
-            "背景、参与方关系和明确约束，不按人复述观点。highlights 只保留最影响理解和后续工作的"
-            "具体结论。topics 按互不重复的具体议题组织，每项 summary 和 details 必须保留原文中的"
-            "系统数量、阶段、时间、指标、技术原则、交付物或范围边界；不要写‘深入讨论’‘确保顺利"
-            "推进’等套话，不得为了条数填充。每项 evidence 只使用下方 segment_id。\n"
+        prompt = (
+            "你是中文会议纪要主编。只返回符合 schema 的完整 JSON 文档，不要解释。现有文档已经"
+            "完成全局综合；请在一次质量编辑中同时修复会议主线、讨论演变、说话人观点和结果事项，"
+            "不得再次拆成多个相互覆盖的摘要。title 必须点明具体项目和会议目的。summary 用一段话"
+            "交代参与方、讨论对象、范围、推进方式和会议实际落点。context 只写会议目的、项目背景、"
+            "参与方关系和明确约束，不按人复述观点。highlights 只保留最影响理解和后续工作的具体"
+            "结论，不得收录问句、待确认事项或与 actions 重复的内容。topics 按互不重复的具体议题"
+            "组织；数据来源与映射、更新同步机制、系统配置与业务流程等不同问题必须分开，不得"
+            "压缩成一个笼统主题。保留系统数量、阶段、时间、指标、技术原则、"
+            "交付物和范围边界，不写‘深入讨论’‘确保顺利推进’等套话。discussion_threads 只保留"
+            "确实发生观点变化的议题，按时间写清初始方案、变化和会议结束时方向；没有真实演变就"
+            "返回空数组。speaker_summaries 必须覆盖下方逐字稿中所有实质发言者，每项至少引用该"
+            "speaker_id 自己的一段发言，不复制其他人的观点。decisions 只写会上明确确认且会议"
+            "结束时仍成立的范围、机制、时间或取舍；actions 只写会后可验收动作，只有原文明示时"
+            "填写 owner 和 deadline；risks 只写明确风险或依赖；open_questions 只写会议结束时仍"
+            "未回答且没有责任动作的问题。口头语、笑声、脏话、输入法闲聊、普通问句、现场随口"
+            "指令和指代不明碎片不得进入任何结果栏目。没有可靠内容的栏目返回空数组，禁止凑数。"
+            "每项 evidence 只能使用下方 segment_id。\n"
             + synthesis_guidance(ContentType.MEETING.value)
             + _recording_context_prompt(self.recording_context)
-            + "\n已验证的顺序摘要仅用于检查覆盖：\n"
-            + json.dumps(document.get("timeline_sections", []), ensure_ascii=False)
-            + "\n校订逐字稿（已去除口头承接）：\n"
+            + "\n现有会议文档（只作为待校验候选）：\n"
+            + json.dumps(document, ensure_ascii=False)
+            + "\n统一校订阅读包（已去除纯口头承接，仍保持时间顺序和所有实质发言者）：\n"
             + json.dumps(quality_segments, ensure_ascii=False)
         )
-        core = _parse_json_object(
+        return _parse_json_object(
             self._generate(
-                core_prompt,
-                format_schema=core_schema,
+                prompt,
+                format_schema=_document_json_schema(ContentType.MEETING),
                 model=self.editor_model,
-                num_predict=3072,
+                num_predict=6144,
                 num_ctx=GLOBAL_SYNTHESIS_CONTEXT_TOKENS,
                 timeout_seconds=1200,
             )
         )
 
-        outcomes = self.refine_meeting_outcomes(document, quality_segments)
-
-        substantive_speakers = sorted(_substantive_speaker_ids_from_payload(segments))
-        speaker_summaries = (
-            self.synthesize_speaker_summaries(
-                quality_segments,
-                speaker_ids=substantive_speakers,
-                content_type=ContentType.MEETING,
-            )
-            if substantive_speakers
-            else []
+    def synthesize_meeting_topics(
+        self,
+        segments: list[dict[str, Any]],
+        *,
+        existing_topics: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        prompt = (
+            "你是中文会议纪要正文编辑。只返回 topics JSON 数组，不要解释。现有主题为空或过于"
+            "笼统，请根据完整校订逐字稿补回可直接阅读的议题正文。按实际业务问题组织 1-6 个互不"
+            "重复的具体主题；数据来源与字段映射、更新同步机制、系统配置、业务流程、排产规则等"
+            "独立问题应分别成章，但不要为凑数量拆分同一问题。每个主题包含具体 title、连贯"
+            "summary、1-4 条有信息量的 details 和 1-3 条最直接 evidence。不得收录寒暄、口头语、"
+            "输入法闲聊、待办清单复述或 Meta 描述；不得添加逐字稿没有的信息。evidence 只能使用"
+            "下方 segment_id。\n"
+            + _recording_context_prompt(self.recording_context)
+            + "\n现有主题候选：\n"
+            + json.dumps(existing_topics, ensure_ascii=False)
+            + "\n完整校订逐字稿：\n"
+            + json.dumps(_meeting_quality_segments(segments), ensure_ascii=False)
         )
-        return {
-            **document,
-            **core,
-            **outcomes,
-            "speaker_summaries": speaker_summaries,
-        }
+        response = self._generate(
+            prompt,
+            format_schema=DOCUMENT_JSON_SCHEMA["properties"]["topics"],
+            model=self.editor_model,
+            num_predict=2304,
+            num_ctx=GLOBAL_SYNTHESIS_CONTEXT_TOKENS,
+            timeout_seconds=1200,
+        )
+        return _parse_json_list(response)
 
     def refine_meeting_outcomes(
         self,
@@ -1160,8 +1187,9 @@ class OllamaStructuringEngine:
         segments: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
         prompt = (
-            "你是中文逐字稿校订员。只返回 JSON 数组，不要解释。每项只包含 segment_id 和 text，"
-            "必须与输入逐项对应，不能漏项、增项或改变 segment_id。请补全标点和自然分句，清理明显"
+            "你是中文逐字稿校订员。只返回 JSON 数组，不要解释。只返回确实需要修改的段落；完全"
+            "不需要修改时返回空数组。每项只包含 segment_id 和修改后的完整 text，不得增添输入中"
+            "不存在的 segment_id。请补全标点和自然分句，清理明显"
             "的口吃式重复与无意义语气词，并仅在上下文明确时修正同音错词。不得概括、删减有效信息、"
             "改变数字、人名、专有名词或说话含义。输入：\n"
             + _recording_context_prompt(self.recording_context)
@@ -1284,6 +1312,7 @@ class StructuringExecutor:
         preprocessor: AudioPreprocessor | None = None,
         boundary_preflight: BoundaryPreflight = check_resource_preflight,
         batch_max_chars: int = DEFAULT_BATCH_MAX_CHARS,
+        batch_target_tokens: int = DEFAULT_BATCH_TARGET_TOKENS,
     ) -> None:
         if (
             not isinstance(engine.model_id, str)
@@ -1299,11 +1328,19 @@ class StructuringExecutor:
             or batch_max_chars > 50_000
         ):
             raise InvalidJobRequest("batch_max_chars must be between 1000 and 50000.")
+        if (
+            not isinstance(batch_target_tokens, int)
+            or isinstance(batch_target_tokens, bool)
+            or batch_target_tokens < 1000
+            or batch_target_tokens > 12_000
+        ):
+            raise InvalidJobRequest("batch_target_tokens must be between 1000 and 12000.")
         self.store = store
         self.engine = engine
         self.preprocessor = preprocessor or AudioPreprocessor(store)
         self._boundary_preflight = boundary_preflight
         self._batch_max_chars = batch_max_chars
+        self._batch_target_tokens = batch_target_tokens
 
     def _configure_recording_context(self, job: JobRecord) -> str | None:
         context = recording_context_from_options(job.options)
@@ -1531,6 +1568,11 @@ class StructuringExecutor:
         if not isinstance(repaired, dict):
             return None
         repaired["discussion_threads"] = []
+        repaired = self._repair_speaker_summary_coverage(
+            repaired,
+            segments,
+            content_type=ContentType.INTERVIEW,
+        )
         return _remap_document_evidence(repaired, aliases=aliases)
 
     def _repair_meeting_quality(
@@ -1548,6 +1590,15 @@ class StructuringExecutor:
         repaired = self.engine.refine_meeting_document(prompt_document, segments)
         if not isinstance(repaired, dict):
             raise StructuringFailed("The meeting quality editor did not return a document.")
+        if _meeting_topics_need_repair(repaired.get("topics"), segments):
+            repaired["topics"] = self.engine.synthesize_meeting_topics(
+                segments,
+                existing_topics=(
+                    repaired.get("topics") if isinstance(repaired.get("topics"), list) else []
+                ),
+            )
+        if _meeting_topics_need_repair(repaired.get("topics"), segments):
+            raise StructuringFailed("The meeting quality editor omitted substantive topic detail.")
         repaired = _sanitize_quality_evidence_references(
             repaired,
             fallback=prompt_document,
@@ -1563,13 +1614,12 @@ class StructuringExecutor:
             segments,
             content_type=ContentType.MEETING,
         )
-        # The quality editor may be upgraded independently from an already
-        # accepted document. Keep the chronological digest and discussion
-        # evolution owned by their dedicated synthesis passes instead of
-        # allowing a formatting omission in the editor response to discard
-        # either section.
+        # The deterministic timeline coverage repair owns chronological
+        # boundaries. Discussion evolution is intentionally part of the one
+        # unified quality edit so the same reading packet is not read again.
         repaired["timeline_sections"] = prompt_document.get("timeline_sections", [])
-        repaired["discussion_threads"] = prompt_document.get("discussion_threads", [])
+        if not isinstance(repaired.get("discussion_threads"), list):
+            repaired["discussion_threads"] = prompt_document.get("discussion_threads", [])
         return _remap_document_evidence(repaired, aliases=aliases)
 
     def _repair_meeting_outcomes(
@@ -1649,23 +1699,8 @@ class StructuringExecutor:
         if content_type not in {ContentType.INTERVIEW, ContentType.MEETING}:
             result["discussion_threads"] = []
             return result
-        result = self._repair_speaker_summary_coverage(
-            result,
-            segments,
-            content_type=content_type,
-        )
         if content_type is ContentType.INTERVIEW:
             result["discussion_threads"] = []
-            return result
-        result["discussion_threads"] = self.engine.synthesize_discussion_threads(
-            segments,
-            content_type=content_type,
-        )
-        result["decisions"] = self.engine.reconcile_decisions(
-            result,
-            segments,
-            content_type=content_type,
-        )
         return result
 
     def _repair_speaker_summary_coverage(
@@ -1706,34 +1741,36 @@ class StructuringExecutor:
         }
         missing = sorted(substantive - present)
         if missing:
-            relevant = [
-                segment
-                for index, segment in enumerate(segments)
-                if index < 8 or segment.get("speaker_id") in missing
-            ]
-            supplements = self.engine.synthesize_speaker_summaries(
-                relevant,
-                speaker_ids=missing,
-                content_type=content_type,
-            )
-            supplements = _repair_speaker_supplement_evidence(
-                supplements,
-                expected_speaker_ids=set(missing),
-                segments=segments,
-            )
-            supplements_by_id = _grounded_speaker_summaries(
-                supplements,
-                expected_speaker_ids=set(missing),
-                segment_speakers=segment_speakers,
-            )
+            supplements_by_id: dict[str, dict[str, Any]] = {}
+            for requested in _speaker_summary_request_groups(segments, missing):
+                relevant = _bounded_speaker_evidence_packet(
+                    segments,
+                    speaker_ids=set(requested),
+                )
+                supplements = self.engine.synthesize_speaker_summaries(
+                    relevant,
+                    speaker_ids=requested,
+                    content_type=content_type,
+                )
+                supplements = _repair_speaker_supplement_evidence(
+                    supplements,
+                    expected_speaker_ids=set(requested),
+                    segments=relevant,
+                )
+                supplements_by_id.update(
+                    _grounded_speaker_summaries(
+                        supplements,
+                        expected_speaker_ids=set(requested),
+                        segment_speakers=segment_speakers,
+                    )
+                )
             for speaker_id in missing:
                 if speaker_id in supplements_by_id:
                     continue
-                speaker_segments = [
-                    segment
-                    for index, segment in enumerate(segments)
-                    if index < 8 or segment.get("speaker_id") == speaker_id
-                ]
+                speaker_segments = _bounded_speaker_evidence_packet(
+                    segments,
+                    speaker_ids={speaker_id},
+                )
                 individual = self.engine.synthesize_speaker_summaries(
                     speaker_segments,
                     speaker_ids=[speaker_id],
@@ -1818,29 +1855,6 @@ class StructuringExecutor:
             content_type=content_type,
         )
         return upgraded
-
-    def _refresh_document_discussion_state(
-        self,
-        document: Any,
-        segments: list[dict[str, Any]],
-        *,
-        content_type: ContentType,
-    ) -> dict[str, Any] | None:
-        """Refresh only discussion-sensitive fields of an accepted main document."""
-
-        if not isinstance(document, dict):
-            return None
-        refreshed = {key: value for key, value in document.items() if key != "chapters"}
-        refreshed["discussion_threads"] = self.engine.synthesize_discussion_threads(
-            segments,
-            content_type=content_type,
-        )
-        refreshed["decisions"] = self.engine.reconcile_decisions(
-            refreshed,
-            segments,
-            content_type=content_type,
-        )
-        return refreshed
 
     def _load_artifact_document_fallback(
         self,
@@ -2056,6 +2070,7 @@ class StructuringExecutor:
             editor_batches = _build_batches(
                 transcribed,
                 max_chars=DEFAULT_EDITOR_BATCH_MAX_CHARS,
+                target_tokens=DEFAULT_EDITOR_BATCH_TARGET_TOKENS,
             )
             batch_checkpoints = {
                 checkpoint.checkpoint_key: checkpoint
@@ -2076,12 +2091,14 @@ class StructuringExecutor:
                     {
                         "kind": "transcript_edit",
                         "model_id": self.engine.model_id,
-                        "prompt_version": NOTE_PROMPT_VERSION,
+                        "prompt_version": TRANSCRIPT_EDIT_PROMPT_VERSION,
                         "recording_context_sha256": recording_context_sha256(recording_context),
                         "normalized_sha256": plan.normalized_sha256,
                         "segments_sha256": segments_sha256,
                         "manual_corrections_sha256": corrections_digest,
+                        "batching_version": STRUCTURING_BATCHING_VERSION,
                         "batch_max_chars": DEFAULT_EDITOR_BATCH_MAX_CHARS,
+                        "batch_target_tokens": DEFAULT_EDITOR_BATCH_TARGET_TOKENS,
                         "batch_index": index,
                         "segments": edit_input,
                     }
@@ -2100,6 +2117,9 @@ class StructuringExecutor:
                         transcript_edits = _validate_transcript_edits(
                             cached_edit.get("transcript_edits"),
                             expected_segment_ids={segment.segment_id for segment in batch},
+                            source_texts={
+                                segment.segment_id: segment.text or "" for segment in batch
+                            },
                         )
                         cached = cached_edit.get("segment_ids") == [
                             segment.segment_id for segment in batch
@@ -2130,6 +2150,9 @@ class StructuringExecutor:
                                 ),
                             ),
                             expected_segment_ids={segment.segment_id for segment in batch},
+                            source_texts={
+                                segment.segment_id: segment.text or "" for segment in batch
+                            },
                         )
                     except Exception as exc:
                         edit_error = type(exc).__name__
@@ -2213,6 +2236,8 @@ class StructuringExecutor:
             batches = _build_batches(
                 transcribed,
                 max_chars=self._batch_max_chars,
+                target_tokens=self._batch_target_tokens,
+                text_overrides=transcript_edit_map,
             )
             batch_results: list[dict[str, Any]] = []
             valid_segment_ids = {segment.segment_id for segment in segments}
@@ -2232,7 +2257,9 @@ class StructuringExecutor:
                         "segments_sha256": segments_sha256,
                         "manual_corrections_sha256": corrections_digest,
                         "content_type": classification.type.value,
+                        "batching_version": STRUCTURING_BATCHING_VERSION,
                         "batch_max_chars": self._batch_max_chars,
+                        "batch_target_tokens": self._batch_target_tokens,
                         "batch_index": index,
                         "segments": extraction_input,
                     }
@@ -2691,7 +2718,9 @@ class StructuringExecutor:
                 "automatic_classification": automatic_classification.to_dict(),
                 "extraction_content_type": classification.type,
                 "extraction_prompt_version": NOTE_PROMPT_VERSION,
+                "extraction_batching_version": STRUCTURING_BATCHING_VERSION,
                 "extraction_batch_max_chars": self._batch_max_chars,
+                "extraction_batch_target_tokens": self._batch_target_tokens,
                 "scene_coverage_repair_version": (
                     SCENE_COVERAGE_REPAIR_VERSION
                     if classification.type is not ContentType.MEETING
@@ -2835,9 +2864,11 @@ class StructuringExecutor:
             JobState.STRUCTURING,
             JobState.QUALITY_CHECK,
             JobState.PROCESSED,
+            JobState.PUBLISHED,
         }:
             raise InvalidJobRequest(
-                "Document re-synthesis requires a structuring, quality-check, or processed job."
+                "Document re-synthesis requires a structuring, quality-check, processed, "
+                "or published job."
             )
         plan = self.preprocessor.get_plan(job_id)
         segments = self._list_all_segments(job_id)
@@ -2944,13 +2975,22 @@ class StructuringExecutor:
         extraction_type_changed = (
             raw_payload.get("extraction_content_type") != classification.type
             or raw_payload.get("extraction_batch_max_chars") != self._batch_max_chars
+            or raw_payload.get("extraction_batch_target_tokens")
+            != self._batch_target_tokens
+            or raw_payload.get("extraction_batching_version")
+            != STRUCTURING_BATCHING_VERSION
         )
         extraction_retry_required = any(
             isinstance(result, dict) and result.get("unavailable_reason_code")
             for result in raw_payload["batch_results"]
         )
         if extraction_type_changed:
-            batches = _build_batches(transcribed, max_chars=self._batch_max_chars)
+            batches = _build_batches(
+                transcribed,
+                max_chars=self._batch_max_chars,
+                target_tokens=self._batch_target_tokens,
+                text_overrides=transcript_edit_map,
+            )
             valid_segment_ids = {segment.segment_id for segment in segments}
             raw_payload["batch_results"] = [
                 self._extract_batch_result(
@@ -2964,7 +3004,9 @@ class StructuringExecutor:
             ]
             raw_payload["extraction_content_type"] = classification.type
             raw_payload["extraction_prompt_version"] = NOTE_PROMPT_VERSION
+            raw_payload["extraction_batching_version"] = STRUCTURING_BATCHING_VERSION
             raw_payload["extraction_batch_max_chars"] = self._batch_max_chars
+            raw_payload["extraction_batch_target_tokens"] = self._batch_target_tokens
         elif extraction_retry_required:
             segment_map = {segment.segment_id: segment for segment in transcribed}
             valid_segment_ids = {segment.segment_id for segment in segments}
@@ -3087,12 +3129,12 @@ class StructuringExecutor:
                 }
             elif raw_payload.get("prompt_version") != NOTE_PROMPT_VERSION:
                 candidate = (
-                    self._refresh_document_discussion_state(
-                        raw_payload.get("document"),
-                        synthesis_payload,
-                        content_type=classification.type,
-                    )
-                    if classification.type is ContentType.MEETING
+                    {
+                        key: value
+                        for key, value in raw_payload["document"].items()
+                        if key != "chapters"
+                    }
+                    if isinstance(raw_payload.get("document"), dict)
                     else None
                 )
             else:
@@ -3253,7 +3295,9 @@ class StructuringExecutor:
         raw_payload["classification_source"] = classification_source
         raw_payload["automatic_classification"] = automatic_classification.to_dict()
         raw_payload["extraction_content_type"] = classification.type
+        raw_payload["extraction_batching_version"] = STRUCTURING_BATCHING_VERSION
         raw_payload["extraction_batch_max_chars"] = self._batch_max_chars
+        raw_payload["extraction_batch_target_tokens"] = self._batch_target_tokens
         raw_payload["scene_coverage_repair_version"] = (
             SCENE_COVERAGE_REPAIR_VERSION
             if classification.type is not ContentType.MEETING
@@ -3685,6 +3729,7 @@ class StructuringExecutor:
                 edits = _validate_transcript_edits(
                     self.engine.polish_transcript_batch(_segment_payload(batch)),
                     expected_segment_ids={segment.segment_id for segment in batch},
+                    source_texts={segment.segment_id: segment.text or "" for segment in batch},
                 )
             except Exception as exc:
                 edit_error = type(exc).__name__
@@ -3926,7 +3971,7 @@ def _segment_payload(
             "start_ms": segment.start_ms,
             "end_ms": segment.end_ms,
             "speaker_id": segment.speaker_id,
-            "text": edits.get(segment.segment_id, segment.text),
+            "text": _compact_model_text(edits.get(segment.segment_id, segment.text)),
         }
         for segment in segments
     ]
@@ -4037,7 +4082,7 @@ def _synthesis_segment_payload(
             }
 
         # The final meeting validator requires a viewpoint for every speaker
-        # who contributed at least 500 characters in the complete transcript.
+        # who made a substantive contribution in the complete transcript.
         # Batch-local representatives alone can under-sample a lower-volume
         # participant, so retain enough of each substantive speaker's own
         # longest utterances to preserve that same coverage after reduction.
@@ -4046,7 +4091,10 @@ def _synthesis_segment_payload(
             if segment.speaker_id:
                 segments_by_speaker.setdefault(segment.speaker_id, []).append(segment)
         for speaker_segments in segments_by_speaker.values():
-            if sum(len(segment.text or "") for segment in speaker_segments) < 500:
+            if (
+                sum(len(segment.text or "") for segment in speaker_segments)
+                < MIN_SUBSTANTIVE_SPEAKER_CHARACTERS
+            ):
                 continue
             retained_characters = sum(
                 len(segment_by_id[segment_id].text or "")
@@ -4058,7 +4106,7 @@ def _synthesis_segment_payload(
                 key=lambda item: len(item.text or ""),
                 reverse=True,
             ):
-                if retained_characters >= 500:
+                if retained_characters >= MIN_SUBSTANTIVE_SPEAKER_CHARACTERS:
                     break
                 if segment.segment_id in retained_ids:
                     continue
@@ -4072,7 +4120,7 @@ def _synthesis_segment_payload(
             "segment_id": stable_to_alias[segment.segment_id],
             "start_ms": segment.start_ms,
             "speaker_id": segment.speaker_id,
-            "text": edits.get(segment.segment_id, segment.text),
+            "text": _compact_model_text(edits.get(segment.segment_id, segment.text)),
         }
         if segment.segment_id in ranges_by_start:
             item["batch_range"] = ranges_by_start[segment.segment_id]
@@ -4134,12 +4182,31 @@ def _meeting_quality_segments(segments: list[dict[str, Any]]) -> list[dict[str, 
         "继续",
         "谢谢",
     }
+    concrete_short_markers = (
+        "同意",
+        "确认",
+        "确定",
+        "暂缓",
+        "后置",
+        "本周",
+        "下周",
+        "负责",
+        "截止",
+    )
     retained: list[dict[str, Any]] = []
+    previous_signature: tuple[Any, str] | None = None
     for segment in segments:
-        text = str(segment.get("text") or "").strip(" ，。！？!?\t\n")
+        text = _compact_model_text(segment.get("text")).strip(" ，。！？!?")
         if not text or text in filler:
             continue
-        if len(text) < 6 and not any(character.isdigit() for character in text):
+        if (
+            len(text) < 6
+            and not any(character.isdigit() for character in text)
+            and not any(marker in text for marker in concrete_short_markers)
+        ):
+            continue
+        signature = (segment.get("speaker_id"), text.casefold())
+        if signature == previous_signature:
             continue
         retained.append(
             {
@@ -4149,7 +4216,100 @@ def _meeting_quality_segments(segments: list[dict[str, Any]]) -> list[dict[str, 
                 "text": text,
             }
         )
+        previous_signature = signature
     return retained
+
+
+def _bounded_speaker_evidence_packet(
+    segments: list[dict[str, Any]],
+    *,
+    speaker_ids: set[str],
+) -> list[dict[str, Any]]:
+    """Keep a chronological, bounded evidence sample for only requested speakers."""
+
+    selected_ids: set[str] = set()
+    for speaker_id in sorted(speaker_ids):
+        own_segments = [
+            segment
+            for segment in segments
+            if segment.get("speaker_id") == speaker_id
+            and isinstance(segment.get("segment_id"), str)
+            and _compact_model_text(segment.get("text"))
+        ]
+        if not own_segments:
+            continue
+        candidate_indices = {0, len(own_segments) - 1}
+        for numerator in range(1, 6):
+            candidate_indices.add((len(own_segments) - 1) * numerator // 6)
+        ranked = [own_segments[index] for index in sorted(candidate_indices)]
+        ranked.extend(
+            sorted(
+                own_segments,
+                key=lambda item: _estimate_text_tokens(
+                    _compact_model_text(item.get("text"))
+                ),
+                reverse=True,
+            )
+        )
+        used_tokens = 0
+        speaker_selected = 0
+        for segment in ranked:
+            segment_id = str(segment["segment_id"])
+            if segment_id in selected_ids:
+                continue
+            segment_tokens = _estimate_text_tokens(
+                _compact_model_text(segment.get("text"))
+            ) + 20
+            if (
+                speaker_selected > 0
+                and used_tokens + segment_tokens > SPEAKER_EVIDENCE_TARGET_TOKENS
+            ):
+                continue
+            selected_ids.add(segment_id)
+            used_tokens += segment_tokens
+            speaker_selected += 1
+            if used_tokens >= SPEAKER_EVIDENCE_TARGET_TOKENS:
+                break
+
+    return [
+        {
+            "segment_id": segment.get("segment_id"),
+            "start_ms": segment.get("start_ms"),
+            "speaker_id": segment.get("speaker_id"),
+            "text": _compact_model_text(segment.get("text")),
+        }
+        for segment in segments
+        if segment.get("segment_id") in selected_ids
+    ]
+
+
+def _speaker_summary_request_groups(
+    segments: list[dict[str, Any]],
+    speaker_ids: list[str],
+) -> list[list[str]]:
+    """Bound each missing-speaker model request without introducing concurrency."""
+
+    groups: list[list[str]] = []
+    current: list[str] = []
+    current_tokens = 0
+    for speaker_id in speaker_ids:
+        packet = _bounded_speaker_evidence_packet(segments, speaker_ids={speaker_id})
+        packet_tokens = sum(
+            _estimate_text_tokens(str(item.get("text") or "")) + 20
+            for item in packet
+        )
+        if current and (
+            len(current) >= SPEAKER_GROUP_MAX_SPEAKERS
+            or current_tokens + packet_tokens > SPEAKER_GROUP_TARGET_TOKENS
+        ):
+            groups.append(current)
+            current = []
+            current_tokens = 0
+        current.append(speaker_id)
+        current_tokens += packet_tokens
+    if current:
+        groups.append(current)
+    return groups
 
 
 def _meeting_outcome_segments(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -4223,8 +4383,26 @@ def _substantive_speaker_ids_from_payload(
     return {
         speaker_id
         for speaker_id, character_count in character_counts.items()
-        if character_count >= 500
+        if character_count >= MIN_SUBSTANTIVE_SPEAKER_CHARACTERS
     }
+
+
+def _meeting_topics_need_repair(
+    value: Any,
+    segments: list[dict[str, Any]],
+) -> bool:
+    substantive_characters = sum(
+        len(str(segment.get("text") or ""))
+        for segment in _meeting_quality_segments(segments)
+    )
+    if substantive_characters < 200:
+        return False
+    if not isinstance(value, list) or not value:
+        return True
+    if substantive_characters < 1_500 or len(value) >= 2:
+        return False
+    first = value[0]
+    return not isinstance(first, dict) or len(first.get("details") or []) < 3
 
 
 def _grounded_speaker_summaries(
@@ -4616,24 +4794,65 @@ def _build_batches(
     segments: list[TranscriptSegment],
     *,
     max_chars: int,
+    target_tokens: int | None = None,
     max_segments: int = DEFAULT_BATCH_MAX_SEGMENTS,
+    text_overrides: dict[str, str] | None = None,
 ) -> tuple[tuple[TranscriptSegment, ...], ...]:
     batches: list[tuple[TranscriptSegment, ...]] = []
     current: list[TranscriptSegment] = []
     current_chars = 0
+    current_tokens = 0
+    overrides = text_overrides or {}
     for segment in segments:
-        length = len(segment.text or "")
+        text = _compact_model_text(overrides.get(segment.segment_id, segment.text))
+        length = len(text)
+        token_count = _estimate_text_tokens(text) + 20
         if current and (
-            current_chars + length > max_chars or len(current) >= max_segments
+            current_chars + length > max_chars
+            or (
+                target_tokens is not None
+                and current_tokens + token_count > target_tokens
+            )
+            or len(current) >= max_segments
         ):
             batches.append(tuple(current))
             current = []
             current_chars = 0
+            current_tokens = 0
         current.append(segment)
         current_chars += length
+        current_tokens += token_count
     if current:
         batches.append(tuple(current))
     return tuple(batches)
+
+
+def _compact_model_text(value: Any) -> str:
+    """Remove representation-only whitespace without deleting spoken content."""
+
+    text = str(value or "").replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"[\t\u00a0 ]+", " ", text)
+    text = re.sub(r" *\n *", "\n", text)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+def _estimate_text_tokens(value: str) -> int:
+    """Conservative dependency-free estimate for mixed Chinese/ASCII prompts."""
+
+    tokens = 0
+    ascii_run = 0
+    for character in value:
+        if character.isascii() and character.isalnum():
+            ascii_run += 1
+            continue
+        if ascii_run:
+            tokens += (ascii_run + 3) // 4
+            ascii_run = 0
+        if not character.isspace():
+            tokens += 1
+    if ascii_run:
+        tokens += (ascii_run + 3) // 4
+    return max(tokens, 1) if value else 0
 
 
 def _validate_classification(raw: Any) -> ContentClassification:
@@ -4786,9 +5005,10 @@ def _validate_transcript_edits(
     raw: Any,
     *,
     expected_segment_ids: set[str],
+    source_texts: dict[str, str],
 ) -> tuple[dict[str, str], ...]:
-    if not isinstance(raw, list) or len(raw) != len(expected_segment_ids):
-        raise StructuringFailed("The transcript editor returned an incomplete segment list.")
+    if not isinstance(raw, list) or len(raw) > len(expected_segment_ids):
+        raise StructuringFailed("The transcript editor returned an invalid correction list.")
     edits: list[dict[str, str]] = []
     seen: set[str] = set()
     for index, item in enumerate(raw):
@@ -4812,9 +5032,9 @@ def _validate_transcript_edits(
                 details={"segment_index": index},
             )
         seen.add(segment_id)
-        edits.append({"segment_id": segment_id, "text": text.strip()})
-    if seen != expected_segment_ids:
-        raise StructuringFailed("The transcript editor changed the segment identity set.")
+        normalized_text = text.strip()
+        if normalized_text != source_texts.get(segment_id, "").strip():
+            edits.append({"segment_id": segment_id, "text": normalized_text})
     return tuple(edits)
 
 
@@ -4962,6 +5182,8 @@ def _validate_document(
     risks = _validate_evidence_text_list(
         raw.get("risks"), segment_ids=segment_ids, field="risks", maximum=10
     )
+    if content_type is ContentType.MEETING:
+        risks = [risk for risk in risks if not _meeting_highlight_is_question(risk["text"])]
     if content_type is ContentType.INTERVIEW:
         risks = [
             risk
@@ -5011,7 +5233,7 @@ def _validate_document(
                     item.get("details"),
                     segment_ids=segment_ids,
                     field=f"topics[{index}].details",
-                    maximum=2,
+                    maximum=4,
                 ),
                 "evidence": _validate_evidence(
                     item.get("evidence"),
@@ -5336,6 +5558,18 @@ def _validate_document(
                 "evidence": speaker_evidence,
             }
         )
+    if content_type is ContentType.MEETING:
+        speaker_summaries = [
+            {
+                **item,
+                "summary": _remove_unsupported_speaker_host_claim(
+                    item["summary"],
+                    item["evidence"],
+                    segment_texts,
+                ),
+            }
+            for item in speaker_summaries
+        ]
     if content_type is ContentType.INTERVIEW:
         speaker_summaries = [
             {
@@ -5368,7 +5602,7 @@ def _validate_document(
         substantive_speakers = {
             speaker_id
             for speaker_id, character_count in speaker_character_counts.items()
-            if character_count >= 500
+            if character_count >= MIN_SUBSTANTIVE_SPEAKER_CHARACTERS
         }
         if not substantive_speakers.issubset(seen_speakers):
             raise StructuringFailed(
@@ -5427,6 +5661,13 @@ def _validate_document(
                 "evidence": action_evidence,
             }
         )
+    if content_type is ContentType.MEETING:
+        actions = _merge_semantically_duplicate_actions(actions)
+        actions = _promote_meeting_actionable_highlights(
+            highlights,
+            actions=actions,
+            segment_texts=segment_texts,
+        )
     if content_type is ContentType.VOICE_MEMO and not actions:
         actions = _derive_voice_memo_actions(
             segment_texts=segment_texts,
@@ -5437,7 +5678,26 @@ def _validate_document(
             question
             for question in open_questions
             if not _meeting_question_is_covered_by_action(question["text"], actions)
+            and _meeting_question_remains_open(
+                question["evidence"],
+                segment_texts=segment_texts,
+                segment_starts=segment_starts,
+            )
         ]
+        highlights = [
+            highlight
+            for highlight in highlights
+            if not _meeting_highlight_is_question(highlight["text"])
+            and not _meeting_highlight_duplicates_outcome(
+                highlight["text"],
+                decisions=decisions,
+                actions=actions,
+                risks=risks,
+                open_questions=open_questions,
+            )
+        ]
+        if not open_questions:
+            summary["text"] = _remove_unsupported_open_question_claims(summary["text"])
 
     if content_type is ContentType.GENERIC:
         title = _normalize_generic_title(title)
@@ -5664,10 +5924,23 @@ def _remove_unsupported_meeting_host_claim(
     return re.sub(r"^本次会议由[^，。]+主持[，。]", "本次会议", summary, count=1)
 
 
+def _remove_unsupported_speaker_host_claim(
+    summary: str,
+    evidence: list[str],
+    segment_texts: dict[str, str],
+) -> str:
+    evidence_text = "".join(segment_texts.get(segment_id, "") for segment_id in evidence)
+    if "主持" in evidence_text:
+        return summary
+    return re.sub(r"^(?:本次)?会议主持人[，,:：]?", "", summary, count=1).lstrip()
+
+
 def _dedupe_document_categories(document: dict[str, Any]) -> dict[str, Any]:
     """Keep one copy when the editor repeats an item across Note categories."""
 
     result = dict(document)
+    if isinstance(result.get("actions"), list):
+        result["actions"] = _merge_semantically_duplicate_actions(result["actions"])
     seen: set[str] = set()
     for category, text_key in (
         ("decisions", "text"),
@@ -5749,10 +6022,157 @@ def _meeting_question_is_covered_by_action(
     if len(core) < 4:
         return False
     return any(
-        core in _normalized_document_item(action["task"])
-        or _normalized_document_item(action["task"]) in core
+        _document_items_semantically_overlap(core, action["task"])
         for action in actions
     )
+
+
+def _meeting_question_remains_open(
+    evidence: list[str],
+    *,
+    segment_texts: dict[str, str],
+    segment_starts: dict[str, int],
+) -> bool:
+    evidence_starts = [segment_starts[item] for item in evidence if item in segment_starts]
+    if not evidence_starts:
+        return True
+    question_start = min(evidence_starts)
+    response_text = "".join(
+        segment_texts[segment_id]
+        for segment_id in sorted(segment_texts, key=segment_starts.__getitem__)
+        if question_start < segment_starts[segment_id] <= question_start + 30_000
+    )
+    answer_markers = (
+        "不需要",
+        "不用",
+        "就行",
+        "就可以",
+        "可以的",
+        "是的",
+        "对的",
+        "确定掉",
+        "先不改",
+        "再匹配",
+    )
+    return not any(marker in response_text for marker in answer_markers)
+
+
+def _document_semantic_core(value: str) -> str:
+    normalized = _normalized_document_item(value)
+    normalized = re.sub(
+        r"^(?:关于|请|需要|应当|应该|计划|安排|准备|负责|确认|明确|提供|发送|整理|"
+        r"建立|创建|如何|怎么|怎样|是否|能否|可否|要不要|有没有|确保)+",
+        "",
+        normalized,
+    )
+    return re.sub(r"(?:相关|一下|问题|事项)$", "", normalized)
+
+
+def _character_bigrams(value: str) -> set[str]:
+    return {value[index : index + 2] for index in range(max(0, len(value) - 1))}
+
+
+def _document_items_semantically_overlap(left: str, right: str) -> bool:
+    left_core = _document_semantic_core(left)
+    right_core = _document_semantic_core(right)
+    if min(len(left_core), len(right_core)) < 4:
+        return False
+    if left_core in right_core or right_core in left_core:
+        return True
+    left_bigrams = _character_bigrams(left_core)
+    right_bigrams = _character_bigrams(right_core)
+    shared = left_bigrams & right_bigrams
+    return len(shared) >= 2 and len(shared) / min(
+        len(left_bigrams), len(right_bigrams)
+    ) >= 0.5
+
+
+def _merge_semantically_duplicate_actions(items: list[Any]) -> list[Any]:
+    retained: list[Any] = []
+    for item in items:
+        if not isinstance(item, dict) or not isinstance(item.get("task"), str):
+            retained.append(item)
+            continue
+        duplicate_index: int | None = None
+        for index, current in enumerate(retained):
+            if not isinstance(current, dict) or not isinstance(current.get("task"), str):
+                continue
+            conflicting_owner = bool(
+                item.get("owner")
+                and current.get("owner")
+                and item.get("owner") != current.get("owner")
+            )
+            conflicting_deadline = bool(
+                item.get("deadline")
+                and current.get("deadline")
+                and item.get("deadline") != current.get("deadline")
+            )
+            if not conflicting_owner and not conflicting_deadline and (
+                _document_items_semantically_overlap(item["task"], current["task"])
+            ):
+                duplicate_index = index
+                break
+        if duplicate_index is None:
+            retained.append(item)
+            continue
+        current = retained[duplicate_index]
+        preferred = item if len(item["task"]) > len(current["task"]) else current
+        other = current if preferred is item else item
+        merged = dict(preferred)
+        merged["owner"] = merged.get("owner") or other.get("owner") or ""
+        merged["deadline"] = merged.get("deadline") or other.get("deadline") or ""
+        merged["evidence"] = list(
+            dict.fromkeys([*preferred.get("evidence", []), *other.get("evidence", [])])
+        )[:MAX_DOCUMENT_EVIDENCE_ITEMS]
+        retained[duplicate_index] = merged
+    return retained
+
+
+def _meeting_highlight_is_question(text: str) -> bool:
+    normalized = text.strip()
+    if normalized.endswith(("?", "？")):
+        return True
+    if any(marker in normalized for marker in ("是否", "能否", "可否", "要不要", "有没有")):
+        return not normalized.startswith(("明确", "确认", "确定"))
+    return bool(
+        re.match(
+            r"^(?:关于)?(?:如何|怎么|怎样|是否|能否|可否|要不要|有没有|谁|何时|哪里)",
+            normalized,
+        )
+    )
+
+
+def _remove_unsupported_open_question_claims(text: str) -> str:
+    sentences = re.split(r"(?<=[。！？!?])", text)
+    retained = [
+        sentence
+        for sentence in sentences
+        if not (
+            "仍" in sentence
+            and any(
+                marker in sentence
+                for marker in ("是否", "能否", "如何", "怎么", "未决", "待确认", "分歧")
+            )
+        )
+    ]
+    return "".join(retained).strip() or text
+
+
+def _meeting_highlight_duplicates_outcome(
+    text: str,
+    *,
+    decisions: list[dict[str, Any]],
+    actions: list[dict[str, Any]],
+    risks: list[dict[str, Any]],
+    open_questions: list[dict[str, Any]],
+) -> bool:
+    outcome_texts = [
+        *(item["text"] for item in decisions),
+        *(item["task"] for item in actions),
+        *(item["text"] for item in risks),
+        *(item["text"] for item in open_questions),
+    ]
+    return any(_document_items_semantically_overlap(text, item) for item in outcome_texts)
 
 
 def _meeting_action_is_concrete(task: str) -> bool:
@@ -5779,8 +6199,63 @@ def _meeting_action_is_concrete(task: str) -> bool:
             "邀请",
             "召开",
             "复盘",
+            "完成",
+            "跑通",
         )
     )
+
+
+def _promote_meeting_actionable_highlights(
+    highlights: list[dict[str, Any]],
+    *,
+    actions: list[dict[str, Any]],
+    segment_texts: dict[str, str],
+) -> list[dict[str, Any]]:
+    promoted = list(actions)
+    time_pattern = re.compile(
+        r"^(?P<deadline>今日内|今天内|今天|明天|本周内|本周|下周|周[一二三四五六日天])"
+    )
+    for highlight in highlights:
+        text = highlight["text"].strip()
+        match = time_pattern.match(text)
+        if (
+            match is None
+            or not _meeting_action_is_concrete(text)
+            or any(
+                _document_items_semantically_overlap(text, action["task"])
+                for action in promoted
+            )
+            or len(promoted) >= 10
+        ):
+            continue
+        evidence = list(highlight["evidence"])
+        deadline = next(
+            (
+                candidate
+                for candidate in (
+                    match.group("deadline"),
+                    "今日内",
+                    "今天内",
+                    "今天",
+                    "明天",
+                    "本周内",
+                    "本周",
+                    "下周",
+                )
+                if _literal_is_grounded(candidate, evidence, segment_texts)
+            ),
+            "",
+        )
+        task = text[match.end() :].strip("，,：: ") or text
+        promoted.append(
+            {
+                "task": task,
+                "owner": "",
+                "deadline": deadline,
+                "evidence": evidence,
+            }
+        )
+    return _merge_semantically_duplicate_actions(promoted)
 
 
 def _action_has_future_evidence(
@@ -6841,6 +7316,8 @@ def _remove_unsupported_decision_claims(text: str) -> str:
         "明确确定",
         "达成共识",
         "达成初步共识",
+        "达成若干决定",
+        "形成若干决定",
     )
     sentences = re.split(r"(?<=[。！？!?])", text)
     retained = [
@@ -6849,7 +7326,7 @@ def _remove_unsupported_decision_claims(text: str) -> str:
         if sentence.strip() and not any(marker in sentence for marker in unsupported_markers)
     ]
     result = "".join(retained).strip()
-    return result or text
+    return result or "会议未形成可由逐字稿明确确认的决定。"
 
 
 def _extend_with_latest_topic_evidence(

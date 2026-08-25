@@ -140,7 +140,10 @@ ALLOWED_TRANSITIONS: dict[JobState, frozenset[JobState]] = {
     ),
     JobState.PROCESSED: frozenset({JobState.PUBLISHING}),
     JobState.PUBLISHING: frozenset({JobState.PUBLISHED, JobState.PROCESSED, JobState.FAILED}),
-    JobState.PUBLISHED: frozenset(),
+    # A published package remains immutable in the Vault, but the private job may
+    # be revised and published again.  The only legal way back into publication
+    # is a fresh lease whose manifest differs from the archived acknowledgement.
+    JobState.PUBLISHED: frozenset({JobState.PUBLISHING}),
     JobState.PAUSED: frozenset({JobState.QUEUED, JobState.CANCELLED}),
     JobState.WAITING_USER: frozenset({JobState.QUEUED, JobState.CANCELLED}),
     JobState.PARTIAL: frozenset({JobState.QUEUED, JobState.PUBLISHING, JobState.CANCELLED}),
