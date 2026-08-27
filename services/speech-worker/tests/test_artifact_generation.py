@@ -234,6 +234,75 @@ def test_note_uses_human_readable_fallback_for_anonymous_speaker() -> None:
     assert "Speaker 3补充了数据来源" in note
 
 
+def test_meeting_note_renders_actions_as_scannable_table_without_inventing_metadata() -> None:
+    segment = TranscriptSegment(
+        job_id="job_action_table",
+        segment_sequence=1,
+        segment_id="seg_action_table",
+        commit_key="action-table-segment",
+        revision=1,
+        start_ms=0,
+        end_ms=1_000,
+        outcome=TranscriptOutcome.TRANSCRIBED,
+        text="整理近期款式数据，并补齐聚合表。",
+        language="zh",
+        confidence=0.9,
+        timing_status=TranscriptTimingStatus.ALIGNED,
+        speaker_id=None,
+        speaker_label_status=SpeakerLabelStatus.UNAVAILABLE,
+        error_code=None,
+        created_at="2026-08-27T00:00:00Z",
+        updated_at="2026-08-27T00:00:00Z",
+    )
+    document = {
+        "title": "排产基础数据排查会议",
+        "summary": {"text": "讨论了数据补齐方案。", "evidence": [segment.segment_id]},
+        "context": [],
+        "highlights": [],
+        "topics": [],
+        "timeline_sections": [],
+        "scene_sections": [],
+        "discussion_threads": [],
+        "speaker_summaries": [],
+        "decisions": [],
+        "actions": [
+            {
+                "task": "整理近期款式数据，并补齐聚合表",
+                "owner": "",
+                "deadline": "",
+                "evidence": [segment.segment_id],
+            },
+            {
+                "task": "提供工序表",
+                "owner": "技术侧",
+                "deadline": "数据到位后",
+                "evidence": [segment.segment_id],
+            },
+        ],
+        "risks": [],
+        "open_questions": [],
+        "chapters": [],
+    }
+
+    note = _build_note_markdown(
+        job=SimpleNamespace(source_display_name="meeting.wav"),
+        speech_id="speech_action_table",
+        upload=SimpleNamespace(duration_seconds=1.0),
+        segments=[segment],
+        block_ids={segment.segment_id: "sp-action"},
+        findings=(),
+        classification={"type": "meeting"},
+        document=document,
+        alignment_report={"transcript_complete": True, "timeline_accounted": True},
+        include_evidence=False,
+    )
+
+    assert "| 状态 | 待办事项 | 负责人 | 计划完成时间 |" in note
+    assert "| ☐ | 整理近期款式数据，并补齐聚合表 | 待确认 | 待确认 |" in note
+    assert "| ☐ | 提供工序表 | 技术侧 | 数据到位后 |" in note
+    assert "P0" not in note
+
+
 def test_manual_section_reader_rejects_symlink_and_invalid_utf8(tmp_path) -> None:
     target = tmp_path / "target.md"
     target.write_text("## 我的补充\n\n用户内容。\n", "utf-8")
@@ -639,12 +708,12 @@ def test_artifact_generation_writes_four_markdown_files_and_two_machine_records(
         assert "## 会议目标" in note
         assert "## 内容总结" in note
         assert "## 背景与参与方" in note
-        assert "## 议题与讨论" in note
+        assert "## 主要讨论与结论" in note
         assert "## 讨论演变与当前方向" in note
         assert note.index("## 会议目标") < note.index("## 内容总结")
         assert note.index("## 内容总结") < note.index("## 背景与参与方")
-        assert note.index("## 背景与参与方") < note.index("## 议题与讨论")
-        assert note.index("## 议题与讨论") < note.index("## 核心结论")
+        assert note.index("## 背景与参与方") < note.index("## 主要讨论与结论")
+        assert note.index("## 主要讨论与结论") < note.index("## 核心结论")
         assert "最初建议从销售预测切入" in note
         assert "当前方向转向计划排程" in note
         assert "[[transcript" not in note

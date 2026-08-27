@@ -1234,19 +1234,38 @@ def _build_note_markdown(
 
     if structured["actions"]:
         lines.extend([f"## {headings['actions']}", ""])
-        for action in _unique_action_items(structured["actions"]):
-            attributes = []
-            if action["owner"]:
-                attributes.append(f"负责人：{action['owner']}")
-            if action["deadline"]:
-                attributes.append(f"截止：{action['deadline']}")
-            suffix = f"；{'；'.join(attributes)}" if attributes else ""
-            lines.append(
-                f"- [ ] {action['task']}{suffix}"
-                + _note_evidence_suffix(
+        actions = _unique_action_items(structured["actions"])
+        if content_type == "meeting":
+            lines.extend(
+                [
+                    "| 状态 | 待办事项 | 负责人 | 计划完成时间 |",
+                    "| --- | --- | --- | --- |",
+                ]
+            )
+            for action in actions:
+                task = action["task"] + _note_evidence_suffix(
                     action["evidence"], block_ids, segment_map, include_evidence
                 )
-            )
+                lines.append(
+                    "| ☐ | "
+                    f"{_markdown_table_cell(task)} | "
+                    f"{_markdown_table_cell(action['owner'] or '待确认')} | "
+                    f"{_markdown_table_cell(action['deadline'] or '待确认')} |"
+                )
+        else:
+            for action in actions:
+                attributes = []
+                if action["owner"]:
+                    attributes.append(f"负责人：{action['owner']}")
+                if action["deadline"]:
+                    attributes.append(f"截止：{action['deadline']}")
+                suffix = f"；{'；'.join(attributes)}" if attributes else ""
+                lines.append(
+                    f"- [ ] {action['task']}{suffix}"
+                    + _note_evidence_suffix(
+                        action["evidence"], block_ids, segment_map, include_evidence
+                    )
+                )
         lines.append("")
     elif content_type == "meeting":
         lines.extend([f"## {headings['actions']}", ""])
@@ -1390,6 +1409,12 @@ def _note_evidence_suffix(
     if not include_evidence:
         return ""
     return f" （{_evidence_links(evidence, block_ids, segment_map)}）"
+
+
+def _markdown_table_cell(value: str) -> str:
+    """Keep generated note text valid inside a compact Markdown table."""
+
+    return value.replace("|", "\\|").replace("\n", "<br>")
 
 
 def _build_timeline_markdown(

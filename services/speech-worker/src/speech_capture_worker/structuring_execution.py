@@ -86,7 +86,7 @@ GLOBAL_SYNTHESIS_CONTEXT_TOKENS = 65_536
 MAX_SYNTHESIS_FINDINGS_PER_BATCH = 10
 SCENE_COVERAGE_REPAIR_VERSION = "2026-08-02.4"
 MEETING_QUALITY_REPAIR_VERSION = "2026-08-25.3"
-MEETING_OUTCOME_REPAIR_VERSION = "2026-08-10.3"
+MEETING_OUTCOME_REPAIR_VERSION = "2026-08-27.1"
 INTERVIEW_QUALITY_REPAIR_VERSION = "2026-08-25.1"
 VOICE_MEMO_QUALITY_REPAIR_VERSION = "2026-08-02.2"
 MAX_FINDING_TEXT_CHARACTERS = 2000
@@ -284,7 +284,7 @@ DOCUMENT_JSON_SCHEMA = {
                     "details": {
                         "type": "array",
                         "items": EVIDENCE_TEXT_JSON_SCHEMA,
-                        "maxItems": 4,
+                        "maxItems": 6,
                     },
                     "evidence": {
                         "type": "array",
@@ -895,18 +895,25 @@ class OllamaStructuringEngine:
             "你是中文会议纪要主编。只返回符合 schema 的完整 JSON 文档，不要解释。现有文档已经"
             "完成全局综合；请在一次质量编辑中同时修复会议主线、讨论演变、说话人观点和结果事项，"
             "不得再次拆成多个相互覆盖的摘要。title 必须点明具体项目和会议目的。summary 用一段话"
-            "交代参与方、讨论对象、范围、推进方式和会议实际落点。objective 只用简洁文字说明会议"
+            "依次交代会议对象、需要解决的具体问题、已经核实的主要原因、确认的规则或方案和下一步，"
+            "优先保留数字、阈值、时间范围与关键取舍，禁止用‘深入讨论’‘初步共识’替代事实。"
+            "objective 只用简洁文字说明会议"
             "为什么召开、要解决的问题或期望形成的结果，必须有直接证据，不提前写结论，也不按固定"
             "句数填充。context 只写项目背景、"
             "参与方关系和明确约束，不按人复述观点。highlights 只保留最影响理解和后续工作的具体"
             "结论，不得收录问句、待确认事项或与 actions 重复的内容。topics 按互不重复的具体议题"
-            "组织；数据来源与映射、更新同步机制、系统配置与业务流程等不同问题必须分开，不得"
+            "组织。问题排查或规则确认会议优先拆成：问题现象与影响、已核实根因、分层规则或方案、"
+            "数据/实施处理；数据来源与映射、更新同步机制、系统配置与业务流程等不同问题必须分开，不得"
             "压缩成一个笼统主题。保留系统数量、阶段、时间、指标、技术原则、"
-            "交付物和范围边界，不写‘深入讨论’‘确保顺利推进’等套话。discussion_threads 只保留"
+            "比例阈值、优先顺序、表名、字段范围、输入输出、交付物和范围边界。两层或多层匹配、"
+            "回退或处理规则必须逐层说明触发条件和结果，不写‘深入讨论’‘确保顺利推进’等套话。"
+            "同一事实不得换词复制进两个 topics。discussion_threads 只保留"
             "确实发生观点变化的议题，按时间写清初始方案、变化和会议结束时方向；没有真实演变就"
             "返回空数组。speaker_summaries 必须覆盖下方逐字稿中所有实质发言者，每项至少引用该"
             "speaker_id 自己的一段发言，不复制其他人的观点。decisions 只写会上明确确认且会议"
-            "结束时仍成立的范围、机制、时间或取舍；actions 只写会后可验收动作，只有原文明示时"
+            "结束时仍成立的规则、阈值、优先级、数据范围、机制、时间或取舍；具体提议后被明确"
+            "回应‘可以’‘没问题’时，应联合提议与确认的证据判断，不得只丢下泛化结论。"
+            "actions 只写会后可交付、可验收动作；task 在原文明示时应包含交付物或验收结果，只有原文明示时"
             "填写 owner 和 deadline；risks 只写明确风险或依赖；open_questions 只写会议结束时仍"
             "未回答且没有责任动作的问题。口头语、笑声、脏话、输入法闲聊、普通问句、现场随口"
             "指令和指代不明碎片不得进入任何结果栏目。没有可靠内容的栏目返回空数组，禁止凑数。"
@@ -938,9 +945,12 @@ class OllamaStructuringEngine:
         prompt = (
             "你是中文会议纪要正文编辑。只返回 topics JSON 数组，不要解释。现有主题为空或过于"
             "笼统，请根据完整校订逐字稿补回可直接阅读的议题正文。按实际业务问题组织 1-6 个互不"
-            "重复的具体主题；数据来源与字段映射、更新同步机制、系统配置、业务流程、排产规则等"
-            "独立问题应分别成章，但不要为凑数量拆分同一问题。每个主题包含具体 title、连贯"
-            "summary、1-4 条有信息量的 details 和 1-3 条最直接 evidence。不得收录寒暄、口头语、"
+            "重复的具体主题；优先覆盖问题现象与影响、已核实根因、分层规则或方案、数据/实施处理。"
+            "数据来源与字段映射、更新同步机制、系统配置、业务流程、排产规则等"
+            "独立问题应分别成章，但不要为凑数量拆分同一问题。明确数量、比例阈值、时间范围、"
+            "优先顺序、表名、字段和验收条件必须原样保留；多层匹配或回退规则按顺序分别写清。"
+            "每个主题包含具体 title、连贯 summary、1-6 条有信息量的 details 和 1-3 条最直接 evidence。"
+            "同一事实不得换词复制到多个主题。不得收录寒暄、口头语、"
             "输入法闲聊、待办清单复述或 Meta 描述；不得添加逐字稿没有的信息。evidence 只能使用"
             "下方 segment_id。\n"
             + _recording_context_prompt(self.recording_context)
@@ -977,12 +987,14 @@ class OllamaStructuringEngine:
         }
         outcome_prompt = (
             "你是会议结果核对员。只返回 schema 要求的 JSON，不要解释。decisions 只写会上明确"
-            "确认的范围、机制、时间或取舍；需要同时引用提议和确认时可用 2-3 条 evidence。‘好’"
-            "‘可以’‘确定一下’和阶段介绍本身不是决定，但明确同意暂缓某范围、固定周期机制或确定"
+            "确认且会议结束仍成立的规则、比例阈值、优先级、数据范围、机制、时间或取舍；需要同时"
+            "引用提议和确认时必须用 2-3 条 evidence。‘好’‘可以’‘没问题’和阶段介绍本身不是决定，"
+            "但它们若明确回应一条具体规则或方案，应与被回应的提议合并核对；明确同意暂缓某范围、固定周期机制或确定"
             "进场日期属于决定。优先检查：当前先做什么、哪些范围明确后置、复盘频率是否固定、进场"
             "日期是否确认。计划开展访谈、准备资料、创建群组等是 actions，不是 decisions。actions "
-            "只写会后需要执行且可验收的具体动作，保留明确 owner 和"
-            "deadline；注意区分‘进场后的前两周’与‘进场前’，不得写反。阶段目标、愿景、能力内化"
+            "只写会后需要执行且可验收的具体动作，保留明确 owner 和 deadline；原文明示交付物或"
+            "验收结果时一并写入 task。不得根据常识补负责人、日期、P0/P1 或交付物。注意区分"
+            "‘进场后的前两周’与‘进场前’，不得写反。阶段目标、愿景、能力内化"
             "和普通介绍不是待办。已明确会后确认、发送、创建、拉人、准备或提供的事项应写 actions，"
             "不再保留为 open_questions。risks 只写原文明确指出的风险、依赖或能力边界，说明它影响"
             "哪个指标或结果，禁止自行补充常见风险。open_questions 只写会议结束仍未回答、也没有"
@@ -1639,7 +1651,21 @@ class StructuringExecutor:
         repaired["timeline_sections"] = prompt_document.get("timeline_sections", [])
         if not isinstance(repaired.get("discussion_threads"), list):
             repaired["discussion_threads"] = prompt_document.get("discussion_threads", [])
-        return _remap_document_evidence(repaired, aliases=aliases)
+        stable_repaired = _remap_document_evidence(repaired, aliases=aliases)
+        stable_coverage = [
+            {
+                **segment,
+                "segment_id": aliases.get(
+                    str(segment.get("segment_id")), str(segment.get("segment_id"))
+                ),
+            }
+            for segment in coverage
+            if isinstance(segment, dict) and isinstance(segment.get("segment_id"), str)
+        ]
+        return _repair_missing_quality_evidence(
+            stable_repaired,
+            segments=stable_coverage,
+        )
 
     def _repair_meeting_outcomes(
         self,
@@ -3004,6 +3030,17 @@ class StructuringExecutor:
             isinstance(result, dict) and result.get("unavailable_reason_code")
             for result in raw_payload["batch_results"]
         )
+        recovering_quality_candidate = (
+            raw_payload.get("prompt_version") == NOTE_PROMPT_VERSION
+            and raw_payload.get("document_candidate_stage") == "quality_editor"
+            and isinstance(raw_payload.get("document_candidate"), dict)
+            and not (
+                recording_context_changed
+                or content_type_changed
+                or extraction_type_changed
+                or manual_corrections_changed
+            )
+        )
         if extraction_type_changed:
             batches = _build_batches(
                 transcribed,
@@ -3027,7 +3064,14 @@ class StructuringExecutor:
             raw_payload["extraction_batching_version"] = STRUCTURING_BATCHING_VERSION
             raw_payload["extraction_batch_max_chars"] = self._batch_max_chars
             raw_payload["extraction_batch_target_tokens"] = self._batch_target_tokens
-        elif extraction_retry_required:
+        elif extraction_retry_required and not recovering_quality_candidate:
+            # A blocked quality-editor result already contains the complete
+            # document candidate that must be recovered. Retrying unrelated
+            # unavailable extraction batches here can spend many minutes in
+            # the model before the deterministic candidate repair even runs.
+            # Reuse the retained candidate and let strict document validation
+            # decide whether it is publishable; a failed validation still
+            # blocks publication safely.
             segment_map = {segment.segment_id: segment for segment in transcribed}
             valid_segment_ids = {segment.segment_id for segment in segments}
             repaired_results: list[dict[str, Any]] = []
@@ -3072,7 +3116,17 @@ class StructuringExecutor:
         interview_quality_repair_version = raw_payload.get("interview_quality_repair_version")
         voice_memo_quality_repair_version = raw_payload.get("voice_memo_quality_repair_version")
         try:
-            if (
+            if raw_payload.get("prompt_version") != NOTE_PROMPT_VERSION:
+                # A prompt-profile revision changes the contract of the whole
+                # Note, not just an individual outcome section. Reusing any
+                # previous document or editor candidate here would produce a
+                # nominally newer revision whose objective, summary and
+                # section structure still came from the old prompt.
+                # Re-synthesize from durable findings and the corrected
+                # transcript; upstream ASR and extraction evidence remain
+                # untouched.
+                candidate = None
+            elif (
                 document_candidate_stage == "quality_editor"
                 and isinstance(raw_payload.get("document_candidate"), dict)
                 and not (
@@ -3137,29 +3191,6 @@ class StructuringExecutor:
                         if key != "chapters"
                     },
                     aliases={stable: alias for alias, stable in evidence_aliases.items()},
-                )
-            elif raw_payload.get("prompt_version") in {
-                "2026-08-01.13",
-                "2026-08-01.14",
-                "2026-08-01.15",
-                "2026-08-01.16",
-                "2026-08-01.17",
-                "2026-08-01.18",
-            } and isinstance(raw_payload.get("document"), dict):
-                candidate = {
-                    key: value
-                    for key, value in raw_payload["document"].items()
-                    if key != "chapters"
-                }
-            elif raw_payload.get("prompt_version") != NOTE_PROMPT_VERSION:
-                candidate = (
-                    {
-                        key: value
-                        for key, value in raw_payload["document"].items()
-                        if key != "chapters"
-                    }
-                    if isinstance(raw_payload.get("document"), dict)
-                    else None
                 )
             else:
                 candidate = self._upgrade_document_discussion_threads(
@@ -3253,6 +3284,22 @@ class StructuringExecutor:
                 # repair it without touching immutable ASR evidence.
                 document_candidate = edited_document
                 document_candidate_stage = "quality_editor"
+            if classification.type is ContentType.MEETING:
+                # Apply the same conservative evidence repair when recovering
+                # an exact quality-editor candidate from a previously blocked
+                # run.  That path deliberately skips another model call, so it
+                # must not depend on _repair_meeting_quality being invoked
+                # again.
+                repaired_document = _repair_missing_quality_evidence(
+                    repaired_document,
+                    segments=coverage_payload,
+                )
+                if isinstance(edited_document, dict):
+                    edited_document = _repair_missing_quality_evidence(
+                        edited_document,
+                        segments=coverage_payload,
+                    )
+                    document_candidate = edited_document
             validation_kwargs = {
                 "segment_ids": {segment.segment_id for segment in segments},
                 "speaker_ids": speaker_ids,
@@ -4378,6 +4425,19 @@ def _meeting_outcome_segments(segments: list[dict[str, Any]]) -> list[dict[str, 
         "工作台",
         "周报",
         "进度表",
+        "百分之",
+        "覆盖率",
+        "覆盖度",
+        "匹配",
+        "优先级",
+        "款式",
+        "工序",
+        "聚合表",
+        "原子表",
+        "补齐",
+        "补全",
+        "完整",
+        "模板",
     )
     selected: set[int] = set()
     for index, segment in enumerate(segments):
@@ -5288,7 +5348,7 @@ def _validate_document(
                     item.get("details"),
                     segment_ids=segment_ids,
                     field=f"topics[{index}].details",
-                    maximum=4,
+                    maximum=6,
                 ),
                 "evidence": _validate_evidence(
                     item.get("evidence"),
@@ -7658,6 +7718,92 @@ def _sanitize_quality_evidence_references(
             )
         ]
     return value
+
+
+def _repair_missing_quality_evidence(
+    value: Any,
+    *,
+    segments: list[dict[str, Any]],
+) -> Any:
+    """Restore omitted quality-editor evidence only on strong transcript overlap.
+
+    A quality editor may preserve a grounded statement while accidentally
+    returning an empty evidence list.  The final validator must still reject
+    unsupported prose, so this repair is intentionally conservative: it only
+    attaches transcript segments whose normalized character bigrams strongly
+    overlap the edited statement.  If no such segment exists, the empty list is
+    retained and normal validation continues to block publication.
+    """
+
+    evidence_rows = [
+        (
+            str(segment["segment_id"]),
+            _document_semantic_core(str(segment.get("text") or "")),
+            index,
+        )
+        for index, segment in enumerate(segments)
+        if isinstance(segment, dict)
+        and isinstance(segment.get("segment_id"), str)
+        and str(segment.get("text") or "").strip()
+    ]
+
+    def matching_evidence(text: str) -> list[str]:
+        query = _document_semantic_core(text)
+        query_bigrams = _character_bigrams(query)
+        query_characters = set(query) - set("的了和与及是把将并在对中")
+        if len(query) < 4 or len(query_bigrams) < 2:
+            return []
+        ranked: list[tuple[float, int, int, str]] = []
+        for segment_id, segment_text, index in evidence_rows:
+            segment_bigrams = _character_bigrams(segment_text)
+            segment_characters = set(segment_text) - set("的了和与及是把将并在对中")
+            if len(segment_text) < 4 or not segment_bigrams:
+                continue
+            shared_count = len(query_bigrams & segment_bigrams)
+            overlap = shared_count / min(len(query_bigrams), len(segment_bigrams))
+            shared_characters = len(query_characters & segment_characters)
+            character_overlap = shared_characters / max(
+                1, min(len(query_characters), len(segment_characters))
+            )
+            contains = query in segment_text or segment_text in query
+            if not contains and not (
+                (shared_count >= 2 and overlap >= 0.45)
+                or (shared_characters >= 4 and character_overlap >= 0.55)
+            ):
+                continue
+            score = 1.0 if contains else max(overlap, character_overlap * 0.9)
+            ranked.append((score, shared_count + shared_characters, -index, segment_id))
+        if not ranked:
+            return []
+        ranked.sort(reverse=True)
+        best_score = ranked[0][0]
+        return [
+            segment_id
+            for score, _shared, _index, segment_id in ranked
+            if score >= max(0.45, best_score - 0.1)
+        ][:MAX_DOCUMENT_EVIDENCE_ITEMS]
+
+    def repair(item: Any) -> Any:
+        if isinstance(item, dict):
+            repaired = {key: repair(child) for key, child in item.items()}
+            if repaired.get("evidence") == []:
+                evidence_text = next(
+                    (
+                        repaired[key]
+                        for key in ("text", "summary", "task", "title", "question")
+                        if isinstance(repaired.get(key), str) and repaired[key].strip()
+                    ),
+                    "",
+                )
+                inferred = matching_evidence(evidence_text)
+                if inferred:
+                    repaired["evidence"] = inferred
+            return repaired
+        if isinstance(item, list):
+            return [repair(child) for child in item]
+        return item
+
+    return repair(value)
 
 
 def _merge_findings(batch_results: list[dict[str, Any]]) -> tuple[Finding, ...]:

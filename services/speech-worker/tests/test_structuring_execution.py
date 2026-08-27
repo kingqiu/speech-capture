@@ -48,12 +48,14 @@ from speech_capture_worker.structuring_execution import (
     _estimate_text_tokens,
     _is_substantive_finding_text,
     _meeting_highlight_is_question,
+    _meeting_outcome_segments,
     _meeting_question_is_covered_by_action,
     _meeting_question_remains_open,
     _promote_meeting_actionable_highlights,
     _remove_unsupported_decision_claims,
     _remove_unsupported_open_question_claims,
     _remove_unsupported_speaker_host_claim,
+    _repair_missing_quality_evidence,
     _repair_speaker_supplement_evidence,
     _sanitize_quality_evidence_references,
     _synthesis_segment_payload,
@@ -1435,6 +1437,130 @@ def test_document_can_be_resynthesized_without_reextracting_batches(tmp_path) ->
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")
+def test_prompt_profile_change_resynthesizes_whole_document_without_reextracting(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    with JobStore(
+        tmp_path / "worker.sqlite3",
+        source_probe=source_probe_for(95),
+    ) as store:
+        job = create_structuring_job(
+            store,
+            duration_seconds=95,
+            suffix="prompt-profile-refresh",
+        )
+        segment_id = store.get_job_snapshot(job.job_id).stable_segments[0].segment_id
+        findings = [
+            {
+                "kind": "topic",
+                "text": "平台规划。",
+                "evidence": [segment_id],
+                "confidence": 0.9,
+            }
+        ]
+        StructuringExecutor(
+            store,
+            FakeStructuringEngine(findings=findings),
+            boundary_preflight=preflight(),
+        ).run(job.job_id)
+        monkeypatch.setattr(
+            "speech_capture_worker.structuring_execution.NOTE_PROMPT_VERSION",
+            "2099-01-01.prompt-refresh-test",
+        )
+        engine = FakeStructuringEngine(findings=findings)
+
+        result = StructuringExecutor(
+            store,
+            engine,
+            boundary_preflight=preflight(),
+        ).resynthesize_document(job.job_id)
+
+        assert result.outcome is StructuringOutcome.REGENERATED
+        assert engine.synthesize_calls == 1
+        assert engine.classify_calls == 0
+        assert engine.extract_calls == 0
+        assert engine.polish_calls == 0
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")
+def test_quality_candidate_recovery_does_not_retry_unavailable_extraction(tmp_path) -> None:
+    with JobStore(
+        tmp_path / "worker.sqlite3",
+        source_probe=source_probe_for(95),
+    ) as store:
+        job = create_structuring_job(
+            store,
+            duration_seconds=95,
+            suffix="quality-candidate-recovery",
+        )
+        segment_id = store.get_job_snapshot(job.job_id).stable_segments[0].segment_id
+        findings = [
+            {
+                "kind": "topic",
+                "text": "平台规划。",
+                "evidence": [segment_id],
+                "confidence": 0.9,
+            }
+        ]
+        executor = StructuringExecutor(
+            store,
+            FakeStructuringEngine(findings=findings),
+            boundary_preflight=preflight(),
+        )
+        executor.run(job.job_id)
+        checkpoint = next(
+            item
+            for item in store.list_checkpoints(job.job_id, stage="structuring")
+            if item.checkpoint_key == "structuring_result"
+        )
+        raw_path = store.data_directory / checkpoint.payload["raw_relative_path"]
+        raw = json.loads(raw_path.read_text("utf-8"))
+        raw["document_candidate"] = raw["document"]
+        raw["document_candidate_stage"] = "quality_editor"
+        raw["document"] = None
+        raw["batch_results"][0]["unavailable_reason_code"] = "RuntimeError"
+        raw_bytes = json.dumps(
+            raw,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        raw_sha256 = hashlib.sha256(raw_bytes).hexdigest()
+        raw_relative_path = executor._write_private_evidence(
+            job.job_id,
+            raw_sha256=raw_sha256,
+            raw_bytes=raw_bytes,
+        )
+        checkpoint_payload = dict(checkpoint.payload)
+        checkpoint_payload.update(
+            {
+                "document_available": False,
+                "raw_relative_path": raw_relative_path,
+                "raw_sha256": raw_sha256,
+                "unavailable_reason_code": "RuntimeError",
+            }
+        )
+        store.put_checkpoint(
+            job.job_id,
+            stage="structuring",
+            checkpoint_key="structuring_result",
+            payload=checkpoint_payload,
+        )
+        recovery_engine = FakeStructuringEngine(findings=findings)
+
+        with pytest.raises(StructuringFailed):
+            StructuringExecutor(
+                store,
+                recovery_engine,
+                boundary_preflight=preflight(),
+            ).resynthesize_document(job.job_id)
+
+        assert recovery_engine.extract_calls == 0
+        assert recovery_engine.synthesize_calls == 0
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")
 def test_summary_only_regeneration_reads_text_corrections_and_records_diff(tmp_path) -> None:
     with JobStore(
         tmp_path / "worker.sqlite3",
@@ -2021,6 +2147,7 @@ def test_nonmeeting_profiles_have_scene_specific_synthesis_contracts(
 
 def test_meeting_profile_preserves_approved_document_contract() -> None:
     schema = _document_json_schema(ContentType.MEETING)
+    guidance = synthesis_guidance(ContentType.MEETING.value)
 
     assert "scene_sections" not in schema["properties"]
     assert "objective" in schema["properties"]
@@ -2028,6 +2155,27 @@ def test_meeting_profile_preserves_approved_document_contract() -> None:
     assert "topics" in schema["required"]
     assert "discussion_threads" in schema["required"]
     assert "timeline_sections" in schema["required"]
+    assert schema["properties"]["topics"]["items"]["properties"]["details"]["maxItems"] == 6
+    assert "问题现象与影响—已核实根因—规则或方案" in guidance
+    assert "不能根据常识补成团队、P0/P1、日期或产物" in guidance
+
+
+def test_meeting_outcome_packet_keeps_numeric_rules_and_adjacent_confirmation() -> None:
+    segments = [
+        {"segment_id": "seg_rule", "text": "款式做过就按百分之百匹配。"},
+        {"segment_id": "seg_confirm", "text": "可以，没问题。"},
+        {"segment_id": "seg_fallback", "text": "否则按工序百分之八十覆盖度继续排序。"},
+        {"segment_id": "seg_noise", "text": "稍后休息一下。"},
+    ]
+
+    selected = _meeting_outcome_segments(segments)
+
+    assert [item["segment_id"] for item in selected] == [
+        "seg_rule",
+        "seg_confirm",
+        "seg_fallback",
+        "seg_noise",
+    ]
 
 
 def test_nonmeeting_profiles_do_not_gain_meeting_objective() -> None:
@@ -2118,6 +2266,40 @@ def test_quality_repair_sanitizes_unknown_and_excess_evidence_references() -> No
     assert repaired["summary"]["evidence"] == ["seg_1", "seg_2", "seg_3"]
     assert repaired["highlights"][0]["evidence"] == ["seg_2"]
     assert repaired["decisions"] == []
+
+
+def test_quality_repair_restores_only_strongly_grounded_missing_evidence() -> None:
+    repaired = _repair_missing_quality_evidence(
+        {
+            "discussion_threads": [
+                {
+                    "title": "数据准备与处理",
+                    "initial_position": {
+                        "text": "优先补全产线和对应款式的数据。",
+                        "evidence": [],
+                    },
+                    "current_direction": {
+                        "text": "没有原文支持的全新结论。",
+                        "evidence": [],
+                    },
+                }
+            ]
+        },
+        segments=[
+            {
+                "segment_id": "seg_match",
+                "text": "我们优先把产线做过的所有款式补全，工序可以先不管。",
+            },
+            {
+                "segment_id": "seg_unrelated",
+                "text": "下午安排系统配置验证。",
+            },
+        ],
+    )
+
+    thread = repaired["discussion_threads"][0]
+    assert thread["initial_position"]["evidence"] == ["seg_match"]
+    assert thread["current_direction"]["evidence"] == []
 
 
 def test_quality_repair_deduplicates_items_across_note_categories() -> None:
