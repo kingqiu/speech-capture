@@ -69,6 +69,29 @@ describe("publication client", () => {
     expect(acknowledged.job.state).toBe("published");
   });
 
+  it("keeps a stale receipt visible so the workbench can republish the new manifest", async () => {
+    const status = {
+      ...publicationStatus(),
+      receipt: {
+        target_relative_path: "语音笔记/旧版-V1",
+        manifest_sha256: "a".repeat(64),
+        published_at: "2026-08-25T10:00:00Z"
+      }
+    };
+    const transport = new QueuePublicationTransport([response(200, status)]);
+
+    const result = await getPublicationStatus(
+      transport,
+      WORKER,
+      "secret",
+      JOB.job_id,
+      "语音笔记"
+    );
+
+    expect(result.manifest_sha256).toBe(MANIFEST_SHA);
+    expect(result.receipt?.manifest_sha256).toBe("a".repeat(64));
+  });
+
   it("downloads and verifies every file in the exact publication package", async () => {
     const files = publicationFiles();
     const manifest = files.get("artifact-manifest.json")!;

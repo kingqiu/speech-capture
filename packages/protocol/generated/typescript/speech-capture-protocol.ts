@@ -1,5 +1,5 @@
 // Generated Worker protocol wire types. Do not edit manually.
-export const OPENAPI_SHA256 = "148d231b2055a6163e1dcc7aaf2576a33cd2585f60193a2e65d08ed62e880eb4" as const;
+export const OPENAPI_SHA256 = "51f281bb42687685c3499046ae13553c5aa54427c4daa5c06e5f3210df904e01" as const;
 export const OPENAPI_VERSION = "3.1.0" as const;
 export const PROTOCOL_VERSION = "1.0.0" as const;
 
@@ -152,6 +152,12 @@ export interface JobCreateSchema {
   readonly upload_id: string;
 }
 
+export interface JobDeletionEnvelope {
+  readonly deleted_bytes: number;
+  readonly job_id: string;
+  readonly published_target_relative_path: string | null;
+}
+
 export interface JobEnvelope {
   readonly created?: boolean | null;
   readonly job: JobSchema;
@@ -197,6 +203,9 @@ export interface JobSchema {
   readonly recording_context: string | null;
   readonly recording_date: string | null;
   readonly revision: number;
+  readonly source_audio_deleted_at: string | null;
+  readonly source_audio_deleted_bytes: number;
+  readonly source_audio_status: "available" | "deleted";
   readonly source_display_name: string;
   readonly source_sha256: string;
   readonly source_size_bytes: number;
@@ -215,6 +224,13 @@ export interface JobSnapshotResponse {
   readonly provisional: ProvisionalTranscriptSchema | null;
   readonly resource_report: Readonly<Record<string, unknown>> | null;
   readonly stable_segments: ReadonlyArray<TranscriptSegmentSchema>;
+}
+
+export interface JobSourceAudioDeletionEnvelope {
+  readonly deleted: boolean;
+  readonly deleted_at: string;
+  readonly deleted_bytes: number;
+  readonly job: JobSchema;
 }
 
 export type JobState =
@@ -319,7 +335,8 @@ export type ProtocolCapability =
   | "publication_leases"
   | "atomic_vault_publication"
   | "review_audio_ranges"
-  | "worker_readiness";
+  | "worker_readiness"
+  | "job_data_deletion";
 
 export interface ProtocolLimitsSchema {
   readonly default_upload_chunk_size_bytes: number;

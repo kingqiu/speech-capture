@@ -1048,6 +1048,22 @@ def _build_note_markdown(
             ]
         )
     lines.extend([f"# {title}", ""])
+    objective = structured.get("objective")
+    if content_type == "meeting" and isinstance(objective, dict):
+        objective_text = objective.get("text")
+        objective_evidence = objective.get("evidence")
+        if isinstance(objective_text, str) and objective_text.strip():
+            lines.extend([f"## {headings['objective']}", ""])
+            lines.append(
+                objective_text
+                + _note_evidence_suffix(
+                    objective_evidence if isinstance(objective_evidence, list) else [],
+                    block_ids,
+                    segment_map,
+                    include_evidence,
+                )
+            )
+            lines.append("")
     if include_evidence:
         lines.extend(
             [
@@ -1063,9 +1079,14 @@ def _build_note_markdown(
     else:
         lines.extend(["## 内容总结", "", structured["summary"]["text"]])
     lines.append("")
-    if structured["context"]:
+    rendered_context = [
+        item
+        for item in structured["context"]
+        if not (content_type == "meeting" and item.get("kind") == "purpose")
+    ]
+    if rendered_context:
         lines.extend([f"## {headings['context']}", ""])
-        for item in structured["context"]:
+        for item in rendered_context:
             lines.append(
                 f"- **{item['title']}**：{item['text']}"
                 + _note_evidence_suffix(
@@ -1074,17 +1095,15 @@ def _build_note_markdown(
             )
         lines.append("")
 
-    lines.extend([f"## {headings['highlights']}", ""])
-    if structured["highlights"]:
-        for item in _unique_evidence_items(structured["highlights"]):
-            lines.append(
-                f"- {item['text']}"
-                + _note_evidence_suffix(
-                    item["evidence"], block_ids, segment_map, include_evidence
-                )
-            )
-    else:
-        lines.append("暂无可靠的核心结论。")
+    if content_type != "meeting":
+        _append_highlights_section(
+            lines,
+            heading=headings["highlights"],
+            highlights=structured["highlights"],
+            block_ids=block_ids,
+            segment_map=segment_map,
+            include_evidence=include_evidence,
+        )
 
     lines.extend(["", f"## {headings['body']}", ""])
     body_items = structured["topics"] if content_type == "meeting" else structured["scene_sections"]
@@ -1191,6 +1210,16 @@ def _build_note_markdown(
                 ]
             )
             lines.append("")
+
+    if content_type == "meeting":
+        _append_highlights_section(
+            lines,
+            heading=headings["highlights"],
+            highlights=structured["highlights"],
+            block_ids=block_ids,
+            segment_map=segment_map,
+            include_evidence=include_evidence,
+        )
 
     if structured["decisions"]:
         lines.extend([f"## {headings['decisions']}", ""])
@@ -1327,6 +1356,31 @@ def _build_note_markdown(
     return rendered.rstrip() + "\n\n" + protected
 
 
+def _append_highlights_section(
+    lines: list[str],
+    *,
+    heading: str,
+    highlights: list[dict[str, Any]],
+    block_ids: dict[str, str],
+    segment_map: dict[str, TranscriptSegment],
+    include_evidence: bool,
+) -> None:
+    """Render conclusions where the selected content profile expects them."""
+
+    lines.extend([f"## {heading}", ""])
+    if highlights:
+        for item in _unique_evidence_items(highlights):
+            lines.append(
+                f"- {item['text']}"
+                + _note_evidence_suffix(
+                    item["evidence"], block_ids, segment_map, include_evidence
+                )
+            )
+    else:
+        lines.append("暂无可靠的核心结论。")
+    lines.append("")
+
+
 def _note_evidence_suffix(
     evidence: list[str] | tuple[str, ...],
     block_ids: dict[str, str],
@@ -1438,6 +1492,20 @@ def _usable_document(value: Any) -> dict[str, Any] | None:
     normalized = dict(value)
     normalized.setdefault("scene_sections", [])
     normalized.setdefault("timeline_sections", [])
+    if "objective" not in normalized:
+        purpose = next(
+            (
+                item
+                for item in normalized.get("context", [])
+                if isinstance(item, dict) and item.get("kind") == "purpose"
+            ),
+            None,
+        )
+        if purpose is not None:
+            normalized["objective"] = {
+                "text": purpose.get("text", ""),
+                "evidence": list(purpose.get("evidence", [])),
+            }
     return normalized
 
 
@@ -1495,7 +1563,7 @@ def _fallback_document(
         else []
     )
     chapters = topics if content_type == "meeting" else scene_sections
-    return {
+    document = {
         "title": source_title,
         "summary": {"text": summary_text, "evidence": evidence},
         "context": [],
@@ -1536,6 +1604,12 @@ def _fallback_document(
             for item in chapters
         ],
     }
+    if content_type == "meeting":
+        document["objective"] = {
+            "text": summary_text,
+            "evidence": evidence,
+        }
+    return document
 
 
 def _evidence_links(

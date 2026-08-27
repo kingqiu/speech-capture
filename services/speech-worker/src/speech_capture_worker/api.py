@@ -33,11 +33,13 @@ from speech_capture_worker.api_schemas import (
     JobActionEnvelope,
     JobActionRequestSchema,
     JobCreateSchema,
+    JobDeletionEnvelope,
     JobEnvelope,
     JobListResponse,
     JobProgressSchema,
     JobSchema,
     JobSnapshotResponse,
+    JobSourceAudioDeletionEnvelope,
     JobUpdateSchema,
     JobUpdatesResponse,
     PairedDeviceListResponse,
@@ -1049,6 +1051,55 @@ def create_app(
             next_after_sequence=(updates[-1].sequence if updates else after_sequence),
         )
 
+    @app.post(
+        "/v1/jobs/{job_id}/source-audio-deletion",
+        response_model=JobSourceAudioDeletionEnvelope,
+        operation_id="deleteJobSourceAudio",
+        tags=["jobs"],
+        responses=PRIVATE_ERROR_RESPONSES,
+    )
+    def delete_job_source_audio(
+        job_id: str,
+        request: JobActionRequestSchema,
+        principal: Principal,
+        worker_store: Store,
+    ) -> JobSourceAudioDeletionEnvelope:
+        _authorized_job(worker_store, principal, job_id)
+        result = worker_store.delete_job_source_audio(
+            job_id,
+            expected_revision=request.expected_revision,
+        )
+        return JobSourceAudioDeletionEnvelope(
+            job=_job_schema(result.job),
+            deleted=result.deleted,
+            deleted_bytes=result.deleted_bytes,
+            deleted_at=result.deleted_at,
+        )
+
+    @app.post(
+        "/v1/jobs/{job_id}/deletion",
+        response_model=JobDeletionEnvelope,
+        operation_id="deleteJob",
+        tags=["jobs"],
+        responses=PRIVATE_ERROR_RESPONSES,
+    )
+    def delete_job(
+        job_id: str,
+        request: JobActionRequestSchema,
+        principal: Principal,
+        worker_store: Store,
+    ) -> JobDeletionEnvelope:
+        _authorized_job(worker_store, principal, job_id)
+        result = worker_store.delete_job(
+            job_id,
+            expected_revision=request.expected_revision,
+        )
+        return JobDeletionEnvelope(
+            job_id=result.job_id,
+            deleted_bytes=result.deleted_bytes,
+            published_target_relative_path=result.published_target_relative_path,
+        )
+
     @app.get(
         "/v1/jobs/{job_id}/review-audio",
         response_model=ReviewAudioResponse,
@@ -1061,7 +1112,9 @@ def create_app(
         principal: Principal,
         worker_store: Store,
     ) -> ReviewAudioResponse:
-        _authorized_job(worker_store, principal, job_id)
+        job = _authorized_job(worker_store, principal, job_id)
+        if job.source_audio_deleted_at is not None:
+            raise ReviewAudioNotFound("Review audio was deleted for this job.")
         plan = AudioPreprocessor(worker_store).get_plan(job_id)
         descriptor = ReviewAudioManager(worker_store).get(
             job_id,
@@ -1102,7 +1155,9 @@ def create_app(
         principal: Principal,
         worker_store: Store,
     ) -> FileResponse:
-        _authorized_job(worker_store, principal, job_id)
+        job = _authorized_job(worker_store, principal, job_id)
+        if job.source_audio_deleted_at is not None:
+            raise ReviewAudioNotFound("Review audio was deleted for this job.")
         plan = AudioPreprocessor(worker_store).get_plan(job_id)
         manager = ReviewAudioManager(worker_store)
         descriptor = manager.get(
@@ -1474,6 +1529,11 @@ def _job_schema(job: JobRecord) -> JobSchema:
         last_error_message=public_error_message(job.last_error_code),
         created_at=job.created_at,
         updated_at=job.updated_at,
+        source_audio_status=(
+            "deleted" if job.source_audio_deleted_at is not None else "available"
+        ),
+        source_audio_deleted_at=job.source_audio_deleted_at,
+        source_audio_deleted_bytes=job.source_audio_deleted_bytes,
     )
 
 

@@ -400,7 +400,9 @@ class FakeStructuringEngine:
             "risks": [],
             "open_questions": [],
         }
-        if self.content_type != "meeting":
+        if self.content_type == "meeting":
+            document["objective"] = {"text": text, "evidence": evidence}
+        else:
             document["title"] = self.scene_title or "场景化内容笔记"
             document["context"] = []
             document["scene_sections"] = [
@@ -626,6 +628,7 @@ def test_artifact_generation_writes_four_markdown_files_and_two_machine_records(
         assert speech_record["content"]["source"] == "automatic"
         assert speech_record["content"]["automatic_type"] == "meeting"
         assert speech_record["document"]["title"] == "平台规划会议"
+        assert speech_record["document"]["objective"]["text"]
         assert speech_record["document"]["timeline_sections"]
         assert speech_record["dates"]["recording_date"] == "2026-07-31"
         assert speech_record["segments"]
@@ -633,10 +636,15 @@ def test_artifact_generation_writes_four_markdown_files_and_two_machine_records(
         assert speech_record["findings"][0]["evidence"]
         assert "## 我的补充" in note
         assert note.startswith("# 平台规划会议\n")
+        assert "## 会议目标" in note
         assert "## 内容总结" in note
         assert "## 背景与参与方" in note
         assert "## 议题与讨论" in note
         assert "## 讨论演变与当前方向" in note
+        assert note.index("## 会议目标") < note.index("## 内容总结")
+        assert note.index("## 内容总结") < note.index("## 背景与参与方")
+        assert note.index("## 背景与参与方") < note.index("## 议题与讨论")
+        assert note.index("## 议题与讨论") < note.index("## 核心结论")
         assert "最初建议从销售预测切入" in note
         assert "当前方向转向计划排程" in note
         assert "[[transcript" not in note

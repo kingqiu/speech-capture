@@ -30,7 +30,9 @@ from speech_capture_worker.domain import (
     SAFE_IDENTIFIER_PATTERN,
     SHA256_PATTERN,
     CheckpointRecord,
+    JobAudioDeletionResult,
     JobCreateRequest,
+    JobDeletionResult,
     JobEvent,
     JobRecord,
     JobState,
@@ -101,7 +103,7 @@ from speech_capture_worker.transcript import (
     validate_transcript_text,
 )
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 DEFAULT_UPLOAD_CHUNK_SIZE_BYTES = 8 * 1024 * 1024
 MAX_UPLOAD_CHUNK_SIZE_BYTES = 64 * 1024 * 1024
 MAX_UPLOAD_PARTS = 10_000
@@ -342,6 +344,182 @@ class JobStore:
     def get_job(self, job_id: str) -> JobRecord:
         with self._lock:
             return self._row_to_job(self._fetch_job_row(job_id))
+
+    def delete_job_source_audio(
+        self,
+        job_id: str,
+        *,
+        expected_revision: int,
+    ) -> JobAudioDeletionResult:
+        """Permanently remove source and reviewable audio while retaining text output."""
+
+        with self._transaction():
+            current = self._row_to_job(self._fetch_job_row(job_id))
+            if current.source_audio_deleted_at is not None:
+                return JobAudioDeletionResult(
+                    job=current,
+                    deleted=False,
+                    deleted_bytes=current.source_audio_deleted_bytes,
+                    deleted_at=current.source_audio_deleted_at,
+                )
+            self._require_deletable_job(current, expected_revision=expected_revision)
+            if current.source_upload_id is None:
+                raise VerifiedUploadRequired(
+                    "The job is not bound to a Worker-owned source audio file."
+                )
+            shared = self._connection.execute(
+                "SELECT 1 FROM jobs WHERE source_upload_id = ? AND job_id != ? LIMIT 1",
+                (current.source_upload_id, job_id),
+            ).fetchone()
+            if shared is not None:
+                raise InvalidJobRequest(
+                    "Source audio shared by multiple jobs cannot be deleted independently."
+                )
+
+            source_row = self._fetch_upload_row(current.source_upload_id)
+            paths = self._job_audio_paths(job_id, source_row=source_row)
+            _assert_private_deletion_paths(paths, root=self.data_directory)
+            deleted_bytes = sum(_private_path_size(path) for path in paths)
+            quarantined = _quarantine_private_paths(paths)
+            try:
+                now = _utc_now()
+                revision = current.revision + 1
+                self._connection.execute(
+                    """
+                    UPDATE jobs
+                    SET source_audio_deleted_at = ?, source_audio_deleted_bytes = ?,
+                        revision = ?, updated_at = ?
+                    WHERE job_id = ? AND revision = ?
+                    """,
+                    (now, deleted_bytes, revision, now, job_id, current.revision),
+                )
+                self._connection.execute(
+                    "UPDATE uploads SET source_relative_path = NULL, updated_at = ? "
+                    "WHERE upload_id = ?",
+                    (now, current.source_upload_id),
+                )
+                self._connection.execute(
+                    "DELETE FROM job_checkpoints WHERE job_id = ? AND stage IN (?, ?)",
+                    (job_id, "preprocessing", "review_audio"),
+                )
+                self._insert_event(
+                    job_id=job_id,
+                    revision=revision,
+                    event_type="job.source_audio_deleted",
+                    from_state=current.state,
+                    to_state=current.state,
+                    reason_code="user_deleted_source_audio",
+                    payload={"deleted_bytes": deleted_bytes},
+                    created_at=now,
+                )
+                updated = self._row_to_job(self._fetch_job_row(job_id))
+            except BaseException:
+                _restore_quarantined_paths(quarantined)
+                raise
+        _remove_quarantined_paths(quarantined)
+        assert updated.source_audio_deleted_at is not None
+        return JobAudioDeletionResult(
+            job=updated,
+            deleted=True,
+            deleted_bytes=deleted_bytes,
+            deleted_at=updated.source_audio_deleted_at,
+        )
+
+    def delete_job(
+        self,
+        job_id: str,
+        *,
+        expected_revision: int,
+    ) -> JobDeletionResult:
+        """Permanently delete one terminal job and its Worker-owned private data."""
+
+        with self._transaction():
+            current = self._row_to_job(self._fetch_job_row(job_id))
+            self._require_deletable_job(current, expected_revision=expected_revision)
+            receipt = self.get_publication_receipt(job_id)
+            source_row = (
+                self._fetch_upload_row(current.source_upload_id)
+                if current.source_upload_id is not None
+                else None
+            )
+            source_is_shared = bool(
+                current.source_upload_id
+                and self._connection.execute(
+                    "SELECT 1 FROM jobs WHERE source_upload_id = ? AND job_id != ? LIMIT 1",
+                    (current.source_upload_id, job_id),
+                ).fetchone()
+            )
+            paths = [self.jobs_directory / job_id]
+            if source_row is not None and not source_is_shared:
+                relative = source_row["source_relative_path"]
+                if relative is not None:
+                    paths.append(self.data_directory / str(relative))
+                paths.append(self.uploads_directory / current.source_upload_id)
+            _assert_private_deletion_paths(paths, root=self.data_directory)
+            deleted_bytes = sum(_private_path_size(path) for path in paths)
+            quarantined = _quarantine_private_paths(paths)
+            try:
+                self._connection.execute("DELETE FROM jobs WHERE job_id = ?", (job_id,))
+                if current.source_upload_id is not None and not source_is_shared:
+                    self._connection.execute(
+                        "DELETE FROM uploads WHERE upload_id = ?",
+                        (current.source_upload_id,),
+                    )
+            except BaseException:
+                _restore_quarantined_paths(quarantined)
+                raise
+        _remove_quarantined_paths(quarantined)
+        return JobDeletionResult(
+            job_id=job_id,
+            deleted_bytes=deleted_bytes,
+            published_target_relative_path=(
+                receipt.target_relative_path if receipt is not None else None
+            ),
+        )
+
+    def _require_deletable_job(
+        self,
+        job: JobRecord,
+        *,
+        expected_revision: int,
+    ) -> None:
+        if expected_revision != job.revision:
+            raise RevisionConflict(
+                "The job changed after the deletion confirmation.",
+                details={
+                    "job_id": job.job_id,
+                    "expected_revision": expected_revision,
+                    "current_revision": job.revision,
+                },
+            )
+        if job.state not in {
+            JobState.PROCESSED,
+            JobState.PUBLISHED,
+            JobState.PARTIAL,
+            JobState.FAILED,
+            JobState.CANCELLED,
+        }:
+            raise InvalidJobRequest(
+                "Only a terminal or safely stopped job can be deleted."
+            )
+
+    def _job_audio_paths(
+        self,
+        job_id: str,
+        *,
+        source_row: sqlite3.Row,
+    ) -> list[Path]:
+        paths: list[Path] = []
+        relative = source_row["source_relative_path"]
+        if relative is not None:
+            paths.append(self.data_directory / str(relative))
+        paths.extend(
+            [
+                self.jobs_directory / job_id / "preprocessing",
+                self.jobs_directory / job_id / "review_audio",
+            ]
+        )
+        return paths
 
     def update_job_recording_context(
         self,
@@ -4227,6 +4405,32 @@ class JobStore:
                     if self._connection.in_transaction:
                         self._connection.execute("ROLLBACK")
                     raise
+                current = 10
+            if current == 10:
+                try:
+                    self._connection.execute("BEGIN IMMEDIATE")
+                    job_columns = {
+                        str(row[1])
+                        for row in self._connection.execute(
+                            "PRAGMA table_info(jobs)"
+                        ).fetchall()
+                    }
+                    if "source_audio_deleted_at" not in job_columns:
+                        self._connection.execute(
+                            "ALTER TABLE jobs ADD COLUMN source_audio_deleted_at TEXT"
+                        )
+                    if "source_audio_deleted_bytes" not in job_columns:
+                        self._connection.execute(
+                            "ALTER TABLE jobs ADD COLUMN source_audio_deleted_bytes "
+                            "INTEGER NOT NULL DEFAULT 0 "
+                            "CHECK (source_audio_deleted_bytes >= 0)"
+                        )
+                    self._connection.execute("PRAGMA user_version = 11")
+                    self._connection.execute("COMMIT")
+                except BaseException:
+                    if self._connection.in_transaction:
+                        self._connection.execute("ROLLBACK")
+                    raise
 
     @contextmanager
     def _transaction(self) -> Iterator[None]:
@@ -5325,6 +5529,17 @@ class JobStore:
             last_error_message=row["last_error_message"],
             created_at=str(row["created_at"]),
             updated_at=str(row["updated_at"]),
+            source_audio_deleted_at=(
+                str(row["source_audio_deleted_at"])
+                if "source_audio_deleted_at" in row.keys()
+                and row["source_audio_deleted_at"] is not None
+                else None
+            ),
+            source_audio_deleted_bytes=(
+                int(row["source_audio_deleted_bytes"])
+                if "source_audio_deleted_bytes" in row.keys()
+                else 0
+            ),
         )
 
     @staticmethod
@@ -5563,6 +5778,12 @@ def _job_record_from_dict(value: dict[str, Any]) -> JobRecord:
         ),
         created_at=str(value["created_at"]),
         updated_at=str(value["updated_at"]),
+        source_audio_deleted_at=(
+            str(value["source_audio_deleted_at"])
+            if value.get("source_audio_deleted_at") is not None
+            else None
+        ),
+        source_audio_deleted_bytes=int(value.get("source_audio_deleted_bytes", 0)),
     )
 
 
@@ -5659,6 +5880,70 @@ def _expected_part_size(upload: UploadRecord, part_number: int) -> int:
     if part_number < upload.part_count:
         return upload.chunk_size_bytes
     return upload.source_size_bytes - upload.chunk_size_bytes * (upload.part_count - 1)
+
+
+def _private_path_size(path: Path) -> int:
+    if not path.exists():
+        return 0
+    if path.is_symlink():
+        raise UploadStorageError("Worker deletion targets must not be symbolic links.")
+    if path.is_file():
+        return path.stat().st_size
+    total = 0
+    for candidate in path.rglob("*"):
+        if candidate.is_symlink():
+            raise UploadStorageError("Worker deletion targets must not contain symbolic links.")
+        if candidate.is_file():
+            total += candidate.stat().st_size
+    return total
+
+
+def _assert_private_deletion_paths(paths: Sequence[Path], *, root: Path) -> None:
+    resolved_root = root.resolve()
+    for path in paths:
+        resolved = path.resolve(strict=False)
+        if resolved == resolved_root or not resolved.is_relative_to(resolved_root):
+            raise UploadStorageError("Worker deletion target escaped private storage.")
+
+
+def _quarantine_private_paths(paths: Sequence[Path]) -> list[tuple[Path, Path]]:
+    quarantined: list[tuple[Path, Path]] = []
+    try:
+        for path in paths:
+            if not path.exists():
+                continue
+            if path.is_symlink():
+                raise UploadStorageError("Worker deletion targets must not be symbolic links.")
+            quarantine = path.with_name(f".{path.name}.{uuid4().hex}.deleting")
+            os.replace(path, quarantine)
+            _fsync_directory(path.parent)
+            quarantined.append((path, quarantine))
+    except BaseException:
+        _restore_quarantined_paths(quarantined)
+        raise
+    return quarantined
+
+
+def _restore_quarantined_paths(paths: Sequence[tuple[Path, Path]]) -> None:
+    for original, quarantine in reversed(paths):
+        if quarantine.exists() and not original.exists():
+            os.replace(quarantine, original)
+            _fsync_directory(original.parent)
+
+
+def _remove_quarantined_paths(paths: Sequence[tuple[Path, Path]]) -> None:
+    for _original, quarantine in paths:
+        try:
+            if quarantine.is_dir():
+                shutil.rmtree(quarantine)
+            else:
+                quarantine.unlink()
+            _fsync_directory(quarantine.parent)
+        except (FileNotFoundError, OSError):
+            # The database deletion is already committed and the original path is
+            # no longer addressable. A quarantined path can be cleaned by a later
+            # maintenance pass without making the API report a false failure.
+            continue
 
 
 def _ensure_private_directory(directory: Path, *, root: Path | None = None) -> None:

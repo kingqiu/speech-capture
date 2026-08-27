@@ -18,6 +18,7 @@ export interface SummaryChangeCounts {
 
 const SECTION_ORDER = [
   "title",
+  "objective",
   "summary",
   "context",
   "highlights",
@@ -34,8 +35,9 @@ const SECTION_ORDER = [
 
 const SECTION_LABELS: Readonly<Record<string, string>> = {
   title: "标题",
+  objective: "会议目标",
   summary: "一分钟总览",
-  context: "背景与目的",
+  context: "背景与参与方",
   highlights: "核心信息",
   topics: "重点议题",
   discussion_threads: "讨论脉络",

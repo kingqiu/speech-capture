@@ -698,6 +698,39 @@
         "title": "JobCreateSchema",
         "type": "object"
       },
+      "JobDeletionEnvelope": {
+        "additionalProperties": false,
+        "properties": {
+          "deleted_bytes": {
+            "minimum": 0.0,
+            "title": "Deleted Bytes",
+            "type": "integer"
+          },
+          "job_id": {
+            "pattern": "^job_[0-9a-f]{32}$",
+            "title": "Job Id",
+            "type": "string"
+          },
+          "published_target_relative_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Published Target Relative Path"
+          }
+        },
+        "required": [
+          "job_id",
+          "deleted_bytes",
+          "published_target_relative_path"
+        ],
+        "title": "JobDeletionEnvelope",
+        "type": "object"
+      },
       "JobEnvelope": {
         "additionalProperties": false,
         "properties": {
@@ -970,6 +1003,30 @@
             "title": "Revision",
             "type": "integer"
           },
+          "source_audio_deleted_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Audio Deleted At"
+          },
+          "source_audio_deleted_bytes": {
+            "minimum": 0.0,
+            "title": "Source Audio Deleted Bytes",
+            "type": "integer"
+          },
+          "source_audio_status": {
+            "enum": [
+              "available",
+              "deleted"
+            ],
+            "title": "Source Audio Status",
+            "type": "string"
+          },
           "source_display_name": {
             "title": "Source Display Name",
             "type": "string"
@@ -1025,7 +1082,10 @@
           "last_error_code",
           "last_error_message",
           "created_at",
-          "updated_at"
+          "updated_at",
+          "source_audio_status",
+          "source_audio_deleted_at",
+          "source_audio_deleted_bytes"
         ],
         "title": "JobSchema",
         "type": "object"
@@ -1099,6 +1159,35 @@
           "has_more_segments"
         ],
         "title": "JobSnapshotResponse",
+        "type": "object"
+      },
+      "JobSourceAudioDeletionEnvelope": {
+        "additionalProperties": false,
+        "properties": {
+          "deleted": {
+            "title": "Deleted",
+            "type": "boolean"
+          },
+          "deleted_at": {
+            "title": "Deleted At",
+            "type": "string"
+          },
+          "deleted_bytes": {
+            "minimum": 0.0,
+            "title": "Deleted Bytes",
+            "type": "integer"
+          },
+          "job": {
+            "$ref": "#/components/schemas/JobSchema"
+          }
+        },
+        "required": [
+          "job",
+          "deleted",
+          "deleted_bytes",
+          "deleted_at"
+        ],
+        "title": "JobSourceAudioDeletionEnvelope",
         "type": "object"
       },
       "JobState": {
@@ -1497,7 +1586,8 @@
           "publication_leases",
           "atomic_vault_publication",
           "review_audio_ranges",
-          "worker_readiness"
+          "worker_readiness",
+          "job_data_deletion"
         ],
         "title": "ProtocolCapability",
         "type": "string"
@@ -4723,6 +4813,143 @@
         ]
       }
     },
+    "/v1/jobs/{job_id}/deletion": {
+      "post": {
+        "operationId": "deleteJob",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "title": "Job Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/JobActionRequestSchema"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobDeletionEnvelope"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Request Entity Too Large"
+          },
+          "415": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Unsupported Media Type"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Delete Job",
+        "tags": [
+          "jobs"
+        ]
+      }
+    },
     "/v1/jobs/{job_id}/events": {
       "get": {
         "operationId": "getJobUpdates",
@@ -6414,6 +6641,143 @@
           }
         ],
         "summary": "Get Job Snapshot",
+        "tags": [
+          "jobs"
+        ]
+      }
+    },
+    "/v1/jobs/{job_id}/source-audio-deletion": {
+      "post": {
+        "operationId": "deleteJobSourceAudio",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "title": "Job Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/JobActionRequestSchema"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobSourceAudioDeletionEnvelope"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Request Entity Too Large"
+          },
+          "415": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Unsupported Media Type"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Delete Job Source Audio",
         "tags": [
           "jobs"
         ]

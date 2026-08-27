@@ -1,4 +1,13 @@
-import { ItemView, Modal, normalizePath, setIcon, TFile, type WorkspaceLeaf } from "obsidian";
+import {
+  ItemView,
+  Modal,
+  normalizePath,
+  setIcon,
+  setTooltip,
+  TFile,
+  TFolder,
+  type WorkspaceLeaf
+} from "obsidian";
 
 import type {
   CorrectionSchema,
@@ -31,6 +40,8 @@ import { sameJobListPresentation } from "./job-list-refresh";
 import type SpeechCapturePlugin from "./main";
 import {
   applyJobAction,
+  deleteJob,
+  deleteJobSourceAudio,
   decideJobSummaryRevision,
   effectiveSpeakerDisplayName,
   effectiveTranscriptSegment,
@@ -80,6 +91,11 @@ import {
   type TaskDetailMode
 } from "./task-view-routing";
 import {
+  canManageJobData,
+  requiresPublishedFolderCleanup,
+  safePublishedFolderPath
+} from "./record-management";
+import {
   confirmPairingTicket,
   probeWorker,
   type WorkerProbeResult
@@ -90,7 +106,12 @@ import {
   countSummaryChanges,
   renderSummaryCandidateMarkdown
 } from "./summary-diff";
-import { publishedManifestIsStale } from "./summary-publication";
+import {
+  currentPublicationReceipt,
+  publishedManifestIsStale,
+  summaryRevisionIsPublished,
+  upsertSavedSummaryRevision
+} from "./summary-publication";
 import {
   chooseNewPublicationPath,
   inspectPublicationTarget,
@@ -165,22 +186,38 @@ type SubmissionState =
   | { readonly state: "complete"; readonly jobId: string }
   | { readonly state: "error"; readonly message: string };
 
+type PublicationConflictStep = "notice" | "difference" | "location";
+
+interface PublicationReplacementContext {
+  readonly previousTargetRelativePath: string;
+  readonly publicationVersion: number;
+}
+
 type PublicationViewState =
   | { readonly state: "idle" }
   | { readonly state: "loading" }
-  | { readonly state: "publishing"; readonly targetRelativePath: string }
+  | {
+      readonly state: "publishing";
+      readonly targetRelativePath: string;
+      readonly replacement?: PublicationReplacementContext | undefined;
+    }
   | { readonly state: "waiting_other_client"; readonly targetRelativePath: string }
   | {
       readonly state: "conflict";
       readonly status: PublicationStatusResponse;
       readonly packageData: DownloadedPublicationPackage;
       readonly diff: PublicationConflictDiff;
-      readonly viewed: boolean;
+      readonly step: PublicationConflictStep;
+      readonly recommendedTargetRelativePath: string;
+      readonly destinationChoice: "recommended" | "custom";
+      readonly customTargetRelativePath: string;
+      readonly pathError?: string | undefined;
     }
   | {
       readonly state: "published";
       readonly targetRelativePath: string;
       readonly manifestSha256: string;
+      readonly replacement?: PublicationReplacementContext | undefined;
     }
   | { readonly state: "error"; readonly message: string };
 
@@ -206,6 +243,7 @@ export class SpeechWorkbenchView extends ItemView {
   private summaryRevisions: SummaryRevisionListResponse | null = null;
   private selectedSummaryRevisionKey: string | null = null;
   private summaryDecisionSaving = false;
+  private summaryDraftOpening = false;
   private summaryDraftEditing = false;
   private summaryDraftText = "";
   private summaryDraftSaving = false;
@@ -471,6 +509,10 @@ export class SpeechWorkbenchView extends ItemView {
     const identity = header.createDiv({ cls: "speech-capture-header__identity" });
     identity.createEl("h1", { text: "语音工作台" });
     identity.createEl("p", { text: "把长录音安全地转成逐字稿和可用笔记" });
+    identity.createEl("small", {
+      cls: "speech-capture-header__version",
+      text: `Speech Capture ${this.plugin.manifest.version}`
+    });
 
     const preferredWorker = this.plugin.preferredWorker();
     const statusPresentation = this.workerStatusPresentation(preferredWorker?.displayName);
@@ -507,28 +549,74 @@ export class SpeechWorkbenchView extends ItemView {
     setIcon(icon, "plus");
     newTask.prepend(icon);
     newTask.addEventListener("click", () => this.openIntake());
-    if (this.jobs.length > 0) {
-      for (const job of this.jobs) {
-        const task = aside.createEl("button", {
+    const visibleJobs = this.visibleJobs();
+    if (visibleJobs.length > 0) {
+      for (const job of visibleJobs) {
+        const titleText = taskTitle(job.source_display_name);
+        const task = aside.createDiv({
           cls: `speech-capture-task-card ${job.job_id === this.selectedJobId ? "is-selected" : ""}`,
           attr: {
-            type: "button",
             ...(job.job_id === this.selectedJobId
               ? { "aria-current": "page" }
               : {})
           }
         });
-        const row = task.createSpan({ cls: "speech-capture-task-card__title" });
+        const open = task.createEl("button", {
+          cls: "speech-capture-task-card__open",
+          attr: {
+            type: "button",
+            title: titleText,
+            "aria-label": `打开任务：${titleText}`
+          }
+        });
+        setTooltip(open, titleText, {
+          placement: "right",
+          delay: 200,
+          classes: ["speech-capture-task-title-tooltip"]
+        });
+        const row = open.createSpan({ cls: "speech-capture-task-card__title" });
         const wave = row.createSpan({ cls: "speech-capture-task-card__icon" });
         setIcon(wave, "audio-lines");
-        row.createEl("strong", { text: taskTitle(job.source_display_name) });
-        task.createEl("span", {
+        row.createEl("strong", {
+          text: titleText,
+          attr: { title: titleText }
+        });
+        open.createEl("span", {
+          cls: "speech-capture-task-card__status",
           text: this.taskCardStatus(job)
         });
         if (job.recording_date) {
-          task.createEl("small", { text: job.recording_date });
+          open.createEl("small", { text: job.recording_date });
         }
-        task.addEventListener("click", () => void this.selectJob(job.job_id));
+        open.addEventListener("click", () => void this.selectJob(job.job_id));
+        const manageable = canManageJobData(job.state);
+        const manage = task.createEl("button", {
+          cls: "speech-capture-task-card__manage",
+          text: "管理/删除",
+          attr: {
+            type: "button",
+            title: manageable
+              ? "管理记录和空间"
+              : "任务处理完成或停止后才可清理数据",
+            "aria-label": `管理记录和空间：${titleText}`,
+            ...(manageable ? {} : { disabled: "", "aria-disabled": "true" })
+          }
+        });
+        setTooltip(
+          manage,
+          manageable
+            ? "删除原始音频，或删除整条语音记录"
+            : "任务处理完成或停止后才可清理数据",
+          {
+            placement: "right",
+            delay: 150
+          }
+        );
+        if (manageable) {
+          manage.addEventListener("click", () => {
+            this.openRecordManagement(job);
+          });
+        }
       }
     } else {
       aside.createEl("p", {
@@ -866,6 +954,7 @@ export class SpeechWorkbenchView extends ItemView {
     });
     const workerName = this.plugin.preferredWorker()?.displayName ?? "Worker";
     const offline = this.connectionRecovery !== null;
+    const audioDeleted = snapshot.job.source_audio_status === "deleted";
     const source = card.createDiv({ cls: "speech-capture-review-audio__source" });
     const sourceCopy = source.createDiv({
       cls: "speech-capture-review-audio__source-copy"
@@ -873,11 +962,19 @@ export class SpeechWorkbenchView extends ItemView {
     sourceCopy.createSpan({
       text: offline
         ? "当前无法播放音频，逐字稿仍可阅读和修改"
+        : audioDeleted
+          ? "原始音频已删除 · 逐字稿、证据和笔记仍可使用"
         : this.localAudioByJobId.has(snapshot.job.job_id)
           ? "当前设备原始音频 · 本地播放"
           : `${workerName} 在线 · 流式播放`
     });
-    if (offline) {
+    if (audioDeleted) {
+      play.disabled = true;
+      slider.disabled = true;
+      sourceCopy.createEl("small", {
+        text: `已释放 ${formatBytes(snapshot.job.source_audio_deleted_bytes)}，不能再播放或执行依赖音频的处理。`
+      });
+    } else if (offline) {
       play.disabled = true;
       slider.disabled = true;
       if (this.connectionRecovery?.state === "retrying") {
@@ -976,6 +1073,10 @@ export class SpeechWorkbenchView extends ItemView {
       });
       return;
     }
+    const publishedRevision = summaryRevisionIsPublished(
+      revision,
+      this.publishedSummaryManifest()
+    );
     const heading = main.createDiv({ cls: "speech-capture-summary-heading" });
     const copy = heading.createDiv();
     copy.createEl("p", { cls: "speech-capture-eyebrow", text: "NOTE REVISION" });
@@ -983,25 +1084,38 @@ export class SpeechWorkbenchView extends ItemView {
     copy.createEl("p", {
       text: "逐字稿修订已用于生成候选笔记；确认前不会替换当前 Note。"
     });
-    const protectedBadge = heading.createEl("span", {
+    const headingActions = heading.createDiv({
+      cls: "speech-capture-summary-heading__actions"
+    });
+    const protectedBadge = headingActions.createEl("span", {
       cls: "speech-capture-summary-protected",
       text: "原始证据已保护"
     });
     protectedBadge.prepend(this.choiceMark("shield-check"));
-    if (revision.status === "pending") {
-      const edit = heading.createEl("button", {
-        text: this.summaryDraftEditing ? "返回差异对照" : "直接编辑候选 Note",
+    if (revision.status !== "rejected") {
+      const edit = headingActions.createEl("button", {
+        cls: "speech-capture-summary-edit-note",
+        text: this.summaryDraftOpening
+          ? "正在确认版本状态…"
+          : this.summaryDraftEditing
+          ? "返回差异对照"
+          : publishedRevision
+            ? `基于已发布 V${revision.candidate_version.toString()} 创建 V${(
+                revision.candidate_version + 1
+              ).toString()}`
+          : revision.status === "accepted"
+            ? `编辑 V${revision.candidate_version.toString()} Note`
+            : "直接编辑候选 Note",
         attr: { type: "button" }
       });
+      edit.disabled = this.summaryDraftOpening;
       edit.addEventListener("click", () => {
-        this.summaryDraftEditing = !this.summaryDraftEditing;
         if (this.summaryDraftEditing) {
-          this.summaryDraftText =
-            revision.draft_markdown ??
-            renderSummaryCandidateMarkdown(revision.after_document);
-          this.summaryDraftFeedback = null;
+          this.summaryDraftEditing = false;
+          this.render();
+          return;
         }
-        this.render();
+        void this.openSummaryDraftEditor(revision);
       });
     }
 
@@ -1021,7 +1135,7 @@ export class SpeechWorkbenchView extends ItemView {
       revision.before_document,
       revision.after_document
     );
-    if (this.summaryDraftEditing && revision.status === "pending") {
+    if (this.summaryDraftEditing && revision.status !== "rejected") {
       this.renderSummaryDraftEditor(main, revision);
       if (this.isNarrowWorkbench()) {
         this.renderSummaryDecisionPanel(main, revision, true);
@@ -1103,10 +1217,26 @@ export class SpeechWorkbenchView extends ItemView {
     parent: HTMLElement,
     revision: SummaryRevisionSchema
   ): void {
+    const publishedRevision = summaryRevisionIsPublished(
+      revision,
+      this.publishedSummaryManifest()
+    );
+    const targetVersion = publishedRevision
+      ? revision.candidate_version + 1
+      : revision.candidate_version;
     const editor = parent.createDiv({ cls: "speech-capture-summary-draft" });
-    editor.createEl("h3", { text: "人工编辑候选 Note" });
+    editor.createEl("h3", {
+      text: publishedRevision
+        ? `基于已发布 V${revision.candidate_version.toString()} 创建 V${targetVersion.toString()}`
+        : "人工编辑候选 Note"
+    });
     editor.createEl("p", {
-      text: "这里只修改最终 Note 正文；原始 ASR、校订逐字稿、证据笔记和“我的补充”都不会改变。"
+      text:
+        publishedRevision
+          ? `保存后会创建新的 V${targetVersion.toString()}，已发布的 V${revision.candidate_version.toString()} 保持只读且不会被覆盖；原始 ASR、校订逐字稿、证据笔记和“我的补充”也不会改变。`
+          : revision.status === "accepted"
+          ? `保存后会更新待发布的 V${revision.candidate_version.toString()} Note；原始 ASR、校订逐字稿、证据笔记、旧版 Note 和“我的补充”都不会改变。`
+          : "这里只修改最终 Note 正文；原始 ASR、校订逐字稿、证据笔记和“我的补充”都不会改变。"
     });
     const textarea = editor.createEl("textarea", {
       cls: "speech-capture-summary-draft__editor",
@@ -1128,13 +1258,40 @@ export class SpeechWorkbenchView extends ItemView {
           ? `已保存人工草稿 v${revision.draft_version.toString()}`
           : "尚未保存人工草稿"
     });
-    const save = footer.createEl("button", {
+    const footerActions = footer.createDiv({
+      cls: "speech-capture-summary-draft__actions"
+    });
+    const save = footerActions.createEl("button", {
       cls: "mod-cta",
-      text: this.summaryDraftSaving ? "正在保存…" : "保存人工定稿",
+      text: this.summaryDraftSaving
+        ? "正在保存…"
+        : publishedRevision
+          ? `保存为 V${targetVersion.toString()}`
+        : revision.status === "accepted"
+          ? `保存并更新 V${revision.candidate_version.toString()}`
+          : "保存人工定稿",
       attr: { type: "button" }
     });
     save.disabled = this.summaryDraftSaving || !this.summaryDraftText.trim();
     save.addEventListener("click", () => void this.saveSummaryDraft(revision));
+    if (revision.status === "accepted" && !publishedRevision) {
+      const persisted = (
+        revision.draft_markdown ?? renderSummaryCandidateMarkdown(revision.after_document)
+      ).trim();
+      const continuePublication = footerActions.createEl("button", {
+        text: `继续发布 V${revision.candidate_version.toString()}`,
+        attr: { type: "button" }
+      });
+      continuePublication.disabled =
+        this.summaryDraftSaving || this.summaryDraftText.trim() !== persisted;
+      continuePublication.addEventListener("click", () => {
+        this.summaryDraftEditing = false;
+        this.taskDetailMode = "publication";
+        this.allowAutomaticPublicationView = true;
+        this.publicationState = { state: "idle" };
+        void this.preparePublication(true, true);
+      });
+    }
     if (this.summaryDraftFeedback) {
       editor.createEl("p", {
         cls: "speech-capture-inline-warning",
@@ -1177,6 +1334,10 @@ export class SpeechWorkbenchView extends ItemView {
     revision: SummaryRevisionSchema,
     inline: boolean
   ): void {
+    const publishedRevision = summaryRevisionIsPublished(
+      revision,
+      this.publishedSummaryManifest()
+    );
     const panel = parent.createDiv({
       cls: `speech-capture-summary-decision ${inline ? "is-inline" : ""}`
     });
@@ -1205,16 +1366,20 @@ export class SpeechWorkbenchView extends ItemView {
       status.createEl("strong", {
         text:
           revision.status === "accepted"
-            ? `v${revision.candidate_version.toString()} 已成为待发布笔记`
+            ? publishedRevision
+              ? `v${revision.candidate_version.toString()} 已发布`
+              : `v${revision.candidate_version.toString()} 已成为待发布笔记`
             : `已保留 v${revision.base_version.toString()} 作为当前笔记`
       });
       status.createEl("p", {
         text:
           revision.status === "accepted"
-            ? "Worker 中的新版已经确认；当前 Vault 旧版尚未变化，需要继续完成重新发布。"
+            ? publishedRevision
+              ? `当前 Vault 已经使用 V${revision.candidate_version.toString()}；再次编辑会创建下一版本，不会覆盖这份已发布记录。`
+              : "Worker 中的新版已经确认；当前 Vault 旧版尚未变化，需要继续完成重新发布。"
             : "此记录只读，当前 Vault Note 与原始证据均保持不变。"
       });
-      if (revision.status === "accepted") {
+      if (revision.status === "accepted" && !publishedRevision) {
         const publish = status.createEl("button", {
           cls: "mod-cta",
           text: "继续到重新发布",
@@ -1366,20 +1531,44 @@ export class SpeechWorkbenchView extends ItemView {
     }
     const heading = main.createDiv({ cls: "speech-capture-publication__heading" });
     const copy = heading.createDiv();
-    copy.createEl("p", { cls: "speech-capture-eyebrow", text: "ACTIVE TASK" });
-    copy.createEl("h2", { text: taskTitle(job.source_display_name) });
-    heading.createEl("span", {
-      cls: "speech-capture-job-state is-good",
-      text: job.state === "published" ? "已发布" : "已处理"
+    const replacementVersion = this.publicationReplacementVersion();
+    copy.createEl("p", {
+      cls: "speech-capture-eyebrow",
+      text: replacementVersion === null ? "ACTIVE TASK" : "REPUBLISH NOTE"
     });
-    this.renderPublicationRail(main);
+    copy.createEl("h2", {
+      text:
+        replacementVersion === null
+          ? taskTitle(job.source_display_name)
+          : `重新发布 V${replacementVersion.toString()}`
+    });
+    heading.createEl("span", {
+      cls: `speech-capture-job-state ${replacementVersion === null ? "is-good" : "is-warning"}`,
+      text:
+        replacementVersion === null
+          ? job.state === "published" ? "已发布" : "已处理"
+          : this.publicationState.state === "published"
+            ? `V${replacementVersion.toString()} 已发布`
+            : `V${replacementVersion.toString()} 待发布`
+    });
+    if (replacementVersion === null) {
+      this.renderPublicationRail(main);
+    } else {
+      this.renderRepublicationRail(main);
+    }
 
     const state = this.publicationState;
     if (state.state === "conflict") {
-      if (state.viewed) {
-        this.renderPublicationConflictDiff(main, state);
-      } else {
-        this.renderPublicationConflictNotice(main, state);
+      switch (state.step) {
+        case "notice":
+          this.renderPublicationConflictNotice(main, state);
+          break;
+        case "difference":
+          this.renderPublicationConflictDiff(main, state);
+          break;
+        case "location":
+          this.renderPublicationLocation(main, state);
+          break;
       }
       return;
     }
@@ -1388,17 +1577,31 @@ export class SpeechWorkbenchView extends ItemView {
       card.setAttrs({ role: "status", "aria-live": "polite" });
       setIcon(card.createSpan(), "circle-check-big");
       const result = card.createDiv();
-      result.createEl("h3", { text: "已发布到 Obsidian" });
+      const version = state.replacement?.publicationVersion;
+      result.createEl("h3", {
+        text: version === undefined
+          ? "已发布到 Obsidian"
+          : `V${version.toString()} 已发布到 Obsidian`
+      });
       result.createEl("p", { text: "完整产物包已经写入当前 Vault，并通过写入后校验。" });
       const actions = result.createDiv({
         cls: "speech-capture-publication-result__actions"
       });
       const open = actions.createEl("button", {
         cls: "mod-cta",
-        text: "打开 Note",
+        text: version === undefined ? "打开 Note" : `打开 V${version.toString()} Note`,
         attr: { type: "button" }
       });
       open.addEventListener("click", () => void this.openPublishedNote(state.targetRelativePath));
+      if (state.replacement) {
+        const previous = actions.createEl("button", {
+          text: `打开 V${Math.max(1, state.replacement.publicationVersion - 1).toString()} Note`,
+          attr: { type: "button" }
+        });
+        previous.addEventListener("click", () =>
+          void this.openPublishedNote(state.replacement!.previousTargetRelativePath)
+        );
+      }
       const review = actions.createEl("button", {
         text: "查看完整逐字稿与证据",
         attr: { type: "button" }
@@ -1489,7 +1692,7 @@ export class SpeechWorkbenchView extends ItemView {
       attr: { type: "button" }
     });
     view.addEventListener("click", () => {
-      this.publicationState = { ...state, viewed: true };
+      this.publicationState = { ...state, step: "difference", pathError: undefined };
       this.render();
     });
     copy.createEl("p", {
@@ -1502,10 +1705,12 @@ export class SpeechWorkbenchView extends ItemView {
     main: HTMLElement,
     state: Extract<PublicationViewState, { state: "conflict" }>
   ): void {
-    const heading = main.createDiv({ cls: "speech-capture-publication-diff-heading" });
+    main.addClass("has-action-dock");
+    const body = main.createDiv({ cls: "speech-capture-publication-flow-scroll" });
+    const heading = body.createDiv({ cls: "speech-capture-publication-diff-heading" });
     heading.createEl("h3", { text: "已查看发布差异" });
     heading.createEl("p", { text: "当前 Vault 的修改与 Worker 待发布版本都已保留。" });
-    const diff = main.createDiv({ cls: "speech-capture-publication-diff" });
+    const diff = body.createDiv({ cls: "speech-capture-publication-diff" });
     const current = diff.createDiv();
     current.createEl("strong", { text: "当前 Vault 版本" });
     this.renderPublicationHighlights(
@@ -1520,29 +1725,184 @@ export class SpeechWorkbenchView extends ItemView {
       state.diff.workerNoteHighlights,
       "Worker 的完整产物包已通过校验。"
     );
-    const safeguards = main.createDiv({ cls: "speech-capture-publication-safeguards" });
+    const safeguards = body.createDiv({ cls: "speech-capture-publication-safeguards" });
     this.assurance(safeguards, "shield-check", "当前位置不变：保留现有人工与同步修改");
     this.assurance(safeguards, "shield-check", "Worker 版本不变：不做覆盖或逐条合并");
     this.assurance(safeguards, "shield-check", "新位置写入后再次校验完整性");
-    const save = main.createEl("button", {
-      cls: "mod-cta speech-capture-publication-primary",
-      text: this.publicationBusy ? "正在保存…" : "保存到新位置",
-      attr: { type: "button" }
-    });
-    save.disabled = this.publicationBusy;
-    save.addEventListener("click", () => void this.savePublicationToNewLocation(state));
-    main.createEl("p", {
-      cls: "speech-capture-publication-hint",
-      text: "将创建一个新的任务目录并重新校验，不会覆盖当前内容。"
-    });
-    const back = main.createEl("button", {
-      cls: "speech-capture-publication-back",
+    const actions = main.createDiv({ cls: "speech-capture-publication-sticky-actions" });
+    const back = actions.createEl("button", {
       text: "返回冲突说明",
       attr: { type: "button" }
     });
     back.addEventListener("click", () => {
-      this.publicationState = { ...state, viewed: false };
+      this.publicationState = { ...state, step: "notice", pathError: undefined };
       this.render();
+    });
+    const continueButton = actions.createEl("button", {
+      cls: "mod-cta speech-capture-publication-sticky-actions__continue",
+      text: "继续：选择保存位置",
+      attr: { type: "button" }
+    });
+    continueButton.addEventListener("click", () => {
+      this.publicationState = { ...state, step: "location", pathError: undefined };
+      this.render();
+    });
+  }
+
+  private renderPublicationLocation(
+    main: HTMLElement,
+    state: Extract<PublicationViewState, { state: "conflict" }>
+  ): void {
+    const version = this.publicationVersion();
+    main.addClass("has-action-dock");
+    const body = main.createDiv({ cls: "speech-capture-publication-flow-scroll" });
+    const section = body.createDiv({ cls: "speech-capture-publication-location" });
+    section.createEl("h3", { text: `选择 V${version.toString()} 保存位置` });
+    section.createEl("p", {
+      text: `V${Math.max(1, version - 1).toString()} 保持原位且不会被覆盖；V${version.toString()} 将保存为新的独立笔记。`
+    });
+
+    const recommended = section.createDiv({
+      cls: `speech-capture-publication-destination ${
+        state.destinationChoice === "recommended" ? "is-selected" : ""
+      }`
+    });
+    const recommendedRadio = recommended.createEl("input", {
+      attr: {
+        type: "radio",
+        name: "speech-capture-publication-destination",
+        value: "recommended",
+        "aria-label": "保存到同级新文件夹（推荐）"
+      }
+    });
+    recommendedRadio.checked = state.destinationChoice === "recommended";
+    const recommendedCopy = recommended.createDiv();
+    const recommendedHeading = recommendedCopy.createDiv({
+      cls: "speech-capture-publication-destination__heading"
+    });
+    recommendedHeading.createEl("strong", { text: "保存到同级新文件夹（推荐）" });
+    recommendedHeading.createEl("span", { text: "推荐" });
+    recommendedCopy.createEl("small", { text: "新位置" });
+    recommendedCopy.createEl("code", { text: `${state.recommendedTargetRelativePath}/note.md` });
+    recommended.addEventListener("click", () => {
+      if (state.destinationChoice === "recommended") {
+        return;
+      }
+      this.publicationState = {
+        ...state,
+        destinationChoice: "recommended",
+        pathError: undefined
+      };
+      this.render();
+    });
+
+    const custom = section.createDiv({
+      cls: `speech-capture-publication-destination ${
+        state.destinationChoice === "custom" ? "is-selected" : ""
+      }`
+    });
+    const customRadio = custom.createEl("input", {
+      attr: {
+        type: "radio",
+        name: "speech-capture-publication-destination",
+        value: "custom",
+        "aria-label": "选择其他新位置"
+      }
+    });
+    customRadio.checked = state.destinationChoice === "custom";
+    const customCopy = custom.createDiv();
+    const customHeading = customCopy.createDiv({
+      cls: "speech-capture-publication-destination__heading"
+    });
+    customHeading.createEl("strong", { text: "选择其他新位置" });
+    const chooseFolder = customHeading.createEl("button", {
+      text: "选择文件夹",
+      attr: { type: "button" }
+    });
+    chooseFolder.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      this.openPublicationFolderPicker(state);
+    });
+    const input = customCopy.createEl("input", {
+      attr: {
+        type: "text",
+        value: state.customTargetRelativePath,
+        placeholder: "输入 Vault 内的新文件夹路径；不得覆盖现有 Note",
+        "aria-label": `V${version.toString()} 自定义保存位置`
+      }
+    });
+    input.addEventListener("click", (event) => event.stopPropagation());
+    input.addEventListener("input", () => {
+      const current = this.publicationState;
+      if (current.state !== "conflict") {
+        return;
+      }
+      this.publicationState = {
+        ...current,
+        destinationChoice: "custom",
+        customTargetRelativePath: input.value,
+        pathError: undefined
+      };
+      publish.disabled = this.publicationBusy || !input.value.trim();
+    });
+    custom.addEventListener("click", () => {
+      if (state.destinationChoice === "custom") {
+        return;
+      }
+      this.publicationState = {
+        ...state,
+        destinationChoice: "custom",
+        pathError: undefined
+      };
+      this.render();
+    });
+
+    const safety = section.createDiv({ cls: "speech-capture-publication-location__safety" });
+    this.assurance(safety, "shield-check", "原始 ASR、证据和旧版 Note 均不会改变");
+    if (state.pathError) {
+      section.createEl("p", {
+        cls: "speech-capture-inline-warning",
+        text: state.pathError,
+        attr: { role: "alert" }
+      });
+    }
+
+    const actions = main.createDiv({ cls: "speech-capture-publication-sticky-actions" });
+    const back = actions.createEl("button", {
+      text: "返回查看差异",
+      attr: { type: "button" }
+    });
+    back.addEventListener("click", () => {
+      this.publicationState = { ...state, step: "difference", pathError: undefined };
+      this.render();
+    });
+    const publishGroup = actions.createDiv({
+      cls: "speech-capture-publication-sticky-actions__primary"
+    });
+    const publish = publishGroup.createEl("button", {
+      cls: "mod-cta",
+      text: this.publicationBusy
+        ? "正在发布并校验…"
+        : `发布 V${version.toString()} 到此位置`,
+      attr: { type: "button" }
+    });
+    publish.disabled =
+      this.publicationBusy ||
+      (state.destinationChoice === "custom" && !state.customTargetRelativePath.trim());
+    publish.addEventListener("click", () => {
+      const current = this.publicationState;
+      if (current.state !== "conflict") {
+        return;
+      }
+      const target =
+        current.destinationChoice === "recommended"
+          ? current.recommendedTargetRelativePath
+          : current.customTargetRelativePath.trim();
+      void this.savePublicationToNewLocation(current, target);
+    });
+    publishGroup.createEl("small", {
+      text: `发布后自动校验并打开 V${version.toString()} Note`
     });
   }
 
@@ -1567,16 +1927,17 @@ export class SpeechWorkbenchView extends ItemView {
       attr: { "aria-label": "发布目标" }
     });
     const title = aside.createDiv({ cls: "speech-capture-panel__title" });
+    const replacementVersion = this.publicationReplacementVersion();
     title.createEl("h2", {
-      text: this.publicationState.state === "conflict" && this.publicationState.viewed
-        ? "解决方式"
-        : this.publicationState.state === "conflict"
-          ? "冲突位置"
-          : "发布目标"
+      text: replacementVersion === null ? "发布目标" : "版本与发布"
     });
     title.appendChild(
       this.collapseButton("right", "收起发布目标栏", "panel-right-close")
     );
+    if (replacementVersion !== null) {
+      this.renderRepublicationSidebar(aside, replacementVersion);
+      return;
+    }
     const target = publicationTargetPath(this.publicationState);
     const facts = aside.createDiv({ cls: "speech-capture-publication-sidebar__facts" });
     this.assurance(facts, "vault", "当前 Obsidian Vault");
@@ -1593,6 +1954,222 @@ export class SpeechWorkbenchView extends ItemView {
     this.assurance(safety, "circle-check", "产物校验通过");
     this.assurance(safety, "circle-check", "原始 ASR 已保留");
     this.assurance(safety, "circle-check", "“我的补充”不会被原位置覆盖");
+  }
+
+  private renderRepublicationSidebar(aside: HTMLElement, version: number): void {
+    const state = this.publicationState;
+    const previousVersion = Math.max(1, version - 1);
+    const previousTarget =
+      state.state === "conflict"
+        ? state.status.suggested_target_relative_path
+        : state.state === "publishing" || state.state === "published"
+          ? state.replacement?.previousTargetRelativePath ?? null
+          : null;
+    const nextTarget =
+      state.state === "conflict"
+        ? state.destinationChoice === "custom" && state.customTargetRelativePath.trim()
+          ? state.customTargetRelativePath.trim()
+          : state.recommendedTargetRelativePath
+        : state.state === "publishing" || state.state === "published"
+          ? state.targetRelativePath
+          : null;
+
+    const previous = aside.createDiv({
+      cls: "speech-capture-publication-version-card is-current"
+    });
+    previous.createEl("h3", { text: `V${previousVersion.toString()} · 当前已发布` });
+    previous.createEl("small", { text: "旧位置" });
+    previous.createEl("code", { text: previousTarget ?? "正在读取旧版位置…" });
+    if (previousTarget) {
+      const open = previous.createEl("button", {
+        text: `打开 V${previousVersion.toString()}`,
+        attr: { type: "button" }
+      });
+      open.addEventListener("click", () => void this.openPublishedNote(previousTarget));
+    }
+
+    const next = aside.createDiv({
+      cls: `speech-capture-publication-version-card ${
+        state.state === "published" ? "is-published" : "is-pending"
+      }`
+    });
+    next.createEl("h3", {
+      text: `V${version.toString()} · ${
+        state.state === "published"
+          ? "已发布"
+          : state.state === "publishing"
+            ? "正在发布"
+            : "待发布"
+      }`
+    });
+    next.createEl("small", { text: "来源" });
+    next.createEl("p", { text: this.publicationRevisionSource(version) });
+    next.createEl("small", { text: "新位置" });
+    next.createEl("code", { text: nextTarget ?? "尚未选择" });
+    this.assurance(next, "circle-check", `不会覆盖 V${previousVersion.toString()}`);
+
+    const checks = aside.createDiv({ cls: "speech-capture-publication-sidebar__safety" });
+    checks.createEl("h3", { text: "发布检查清单" });
+    this.assurance(
+      checks,
+      nextTarget ? "circle-check" : "circle",
+      nextTarget ? "新位置已选择" : "等待选择新位置"
+    );
+    this.assurance(
+      checks,
+      state.state === "conflict" && state.pathError ? "triangle-alert" : "circle-check",
+      state.state === "conflict" && state.pathError ? "路径需要调整" : "路径无已知冲突"
+    );
+    this.assurance(checks, "circle-check", "原始证据已保留");
+  }
+
+  private renderRepublicationRail(parent: HTMLElement): void {
+    const state = this.publicationState;
+    const currentStep =
+      state.state === "conflict"
+        ? state.step === "notice" || state.step === "difference" ? 0 : 1
+        : state.state === "publishing" || state.state === "published"
+          ? 2
+          : 0;
+    const completedThrough = state.state === "published" ? 2 : currentStep - 1;
+    const rail = parent.createDiv({ cls: "speech-capture-republication-rail" });
+    for (const [index, label] of ["查看差异", "选择保存位置", "发布并校验"].entries()) {
+      const item = rail.createDiv({
+        cls: `speech-capture-republication-step ${
+          index <= completedThrough
+            ? "is-complete"
+            : index === currentStep
+              ? "is-current"
+              : ""
+        }`
+      });
+      const mark = item.createSpan({ cls: "speech-capture-republication-step__mark" });
+      if (index <= completedThrough) {
+        setIcon(mark, "check");
+      } else {
+        mark.setText((index + 1).toString());
+      }
+      const copy = item.createDiv();
+      copy.createEl("strong", { text: label });
+      copy.createEl("small", {
+        text:
+          index <= completedThrough
+            ? "已完成"
+            : index === currentStep
+              ? "当前步骤"
+              : "待进行"
+      });
+    }
+  }
+
+  private publicationReplacementVersion(): number | null {
+    const state = this.publicationState;
+    if (
+      (state.state === "publishing" || state.state === "published") &&
+      state.replacement
+    ) {
+      return state.replacement.publicationVersion;
+    }
+    const currentVersion = this.summaryRevisions?.current_version ?? 1;
+    if (state.state === "conflict" && currentVersion > 1) {
+      return currentVersion;
+    }
+    return null;
+  }
+
+  private publicationVersion(): number {
+    return this.publicationReplacementVersion() ?? Math.max(
+      2,
+      this.summaryRevisions?.current_version ?? 1
+    );
+  }
+
+  private publicationRevisionSource(version: number): string {
+    const revision = [...(this.summaryRevisions?.revisions ?? [])]
+      .reverse()
+      .find(
+        (item) =>
+          item.status === "accepted" && item.candidate_version === version
+      );
+    if (!revision) {
+      return "已确认的新版 Note";
+    }
+    return revision.draft_version > 0
+      ? `人工定稿 v${revision.draft_version.toString()}`
+      : "已确认的机器提炼版本";
+  }
+
+  private openPublicationFolderPicker(
+    conflict: Extract<PublicationViewState, { state: "conflict" }>
+  ): void {
+    const modal = new Modal(this.app);
+    const version = this.publicationVersion();
+    modal.titleEl.setText("选择新位置的父文件夹");
+    modal.contentEl.createEl("p", {
+      text: `系统会在所选文件夹内创建独立的 V${version.toString()} 任务目录，不会覆盖现有 Note。`
+    });
+    const select = modal.contentEl.createEl("select", {
+      cls: "speech-capture-publication-folder-select",
+      attr: { "aria-label": "Vault 文件夹" }
+    });
+    const folders = this.app.vault
+      .getAllLoadedFiles()
+      .filter((item): item is TFolder => item instanceof TFolder)
+      .map((folder) => folder.path === "/" ? "" : folder.path)
+      .filter((path, index, all) => all.indexOf(path) === index)
+      .sort((left, right) => left.localeCompare(right, "zh-CN"));
+    for (const folder of folders) {
+      select.createEl("option", {
+        text: folder || "Vault 根目录",
+        value: folder
+      });
+    }
+    const recommendedParent = relativeParentPath(conflict.recommendedTargetRelativePath);
+    if (folders.includes(recommendedParent)) {
+      select.value = recommendedParent;
+    }
+    const preview = modal.contentEl.createEl("code", {
+      cls: "speech-capture-publication-folder-preview"
+    });
+    const updatePreview = (): string => {
+      const parent = select.value;
+      const leaf = relativeLeafName(conflict.recommendedTargetRelativePath);
+      const target = parent ? `${parent}/${leaf}` : leaf;
+      preview.setText(`${target}/note.md`);
+      return target;
+    };
+    updatePreview();
+    select.addEventListener("change", updatePreview);
+    const actions = modal.contentEl.createDiv({ cls: "speech-capture-confirm-actions" });
+    const cancel = actions.createEl("button", {
+      text: "取消",
+      attr: { type: "button" }
+    });
+    cancel.addEventListener("click", () => modal.close());
+    const choose = actions.createEl("button", {
+      cls: "mod-cta",
+      text: "使用此位置",
+      attr: { type: "button" }
+    });
+    choose.addEventListener("click", () => {
+      const current = this.publicationState;
+      if (
+        current.state === "conflict" &&
+        current.packageData.manifestSha256 === conflict.packageData.manifestSha256
+      ) {
+        this.publicationState = {
+          ...current,
+          step: "location",
+          destinationChoice: "custom",
+          customTargetRelativePath: updatePreview(),
+          pathError: undefined
+        };
+        modal.close();
+        this.render();
+      }
+    });
+    modal.open();
+    select.focus();
   }
 
   private renderPublicationRail(parent: HTMLElement): void {
@@ -3077,6 +3654,250 @@ export class SpeechWorkbenchView extends ItemView {
     await this.refreshJobs();
   }
 
+  private visibleJobs(): readonly JobSchema[] {
+    return this.jobs;
+  }
+
+  private openRecordManagement(job: JobSchema): void {
+    if (!canManageJobData(job.state)) {
+      return;
+    }
+    const titleText = taskTitle(job.source_display_name);
+    const modal = new Modal(this.app);
+    modal.titleEl.setText("管理记录和空间");
+    modal.modalEl.addClass("speech-capture-record-management");
+    const renderMenu = (): void => {
+      modal.contentEl.empty();
+      modal.contentEl.createEl("p", {
+        cls: "speech-capture-record-management__title",
+        text: titleText
+      });
+      modal.contentEl.createEl("p", {
+        text: "这里执行的是真实删除，不会只把任务从列表隐藏。"
+      });
+      const audio = modal.contentEl.createDiv({
+        cls: "speech-capture-record-management__option"
+      });
+      audio.createEl("h3", { text: "仅删除原始音频" });
+      audio.createEl("p", {
+        text: "永久清理 Worker 上的原始音频、标准化音频和复核播放音频；保留逐字稿、证据、Note 与版本记录。删除后不能再播放音频或重新执行依赖音频的处理。"
+      });
+      audio.createEl("p", {
+        cls: "speech-capture-record-management__size",
+        text:
+          job.source_audio_status === "deleted"
+            ? `原始音频已删除，共释放 ${formatBytes(job.source_audio_deleted_bytes)}。`
+            : `原始文件约 ${formatBytes(job.source_size_bytes)}，实际释放空间将在删除后显示。`
+      });
+      const deleteAudio = audio.createEl("button", {
+        text:
+          job.source_audio_status === "deleted"
+            ? "原始音频已删除"
+            : "永久删除原始音频",
+        attr: {
+          type: "button",
+          ...(job.source_audio_status === "deleted" ? { disabled: "" } : {})
+        }
+      });
+      deleteAudio.addEventListener("click", () => {
+        renderConfirmation("audio");
+      });
+
+      const record = modal.contentEl.createDiv({
+        cls: "speech-capture-record-management__option is-danger"
+      });
+      record.createEl("h3", { text: "删除整条语音记录" });
+      record.createEl("p", {
+        text: "删除 Worker 上的任务、原始音频、逐字稿、证据、Note 候选和版本记录，并从左侧列表移除。若已发布到当前 Vault，对应发布文件夹会先移入 Obsidian 回收站。"
+      });
+      const deleteRecord = record.createEl("button", {
+        cls: "mod-warning",
+        text: "删除整条语音记录",
+        attr: { type: "button" }
+      });
+      deleteRecord.addEventListener("click", () => {
+        renderConfirmation("record");
+      });
+      const close = modal.contentEl.createEl("button", {
+        text: "关闭",
+        attr: { type: "button" }
+      });
+      close.addEventListener("click", () => modal.close());
+    };
+    const renderConfirmation = (kind: "audio" | "record"): void => {
+      modal.contentEl.empty();
+      const isAudio = kind === "audio";
+      modal.contentEl.createEl("h3", {
+        text: isAudio ? "永久删除原始音频？" : "删除整条语音记录？"
+      });
+      modal.contentEl.createEl("p", {
+        text: isAudio
+          ? "此操作不能撤销。逐字稿、证据和笔记会保留，但音频播放与依赖音频的再次处理将不可用。"
+          : "Worker 中的整条记录不能恢复。已发布的 Vault 文件夹会先移入 Obsidian 回收站；回收站是否可恢复取决于你的 Obsidian 设置。"
+      });
+      const status = modal.contentEl.createDiv({
+        cls: "speech-capture-record-management__status",
+        attr: { role: "status", "aria-live": "polite" }
+      });
+      const actions = modal.contentEl.createDiv({
+        cls: "speech-capture-confirm-actions"
+      });
+      const back = actions.createEl("button", {
+        text: "返回",
+        attr: { type: "button" }
+      });
+      back.addEventListener("click", renderMenu);
+      const confirm = actions.createEl("button", {
+        cls: "mod-warning",
+        text: isAudio ? "确认永久删除音频" : "确认删除整条记录",
+        attr: { type: "button" }
+      });
+      let completed = false;
+      confirm.addEventListener("click", () => {
+        if (completed) {
+          modal.close();
+          return;
+        }
+        back.disabled = true;
+        confirm.disabled = true;
+        confirm.setText("正在删除…");
+        status.setText(
+          isAudio
+            ? "正在清理 Worker 音频；笔记资料不会改变。"
+            : job.state === "published"
+              ? "正在确认已发布笔记的位置并删除记录，请勿关闭此窗口。"
+              : "正在删除未发布的 Worker 记录，请勿关闭此窗口。"
+        );
+        void (isAudio
+          ? this.performSourceAudioDeletion(job)
+          : this.performFullRecordDeletion(job)
+        )
+          .then((result) => {
+            status.addClass("is-success");
+            status.setText(result);
+            completed = true;
+            confirm.setText("完成");
+            confirm.disabled = false;
+          })
+          .catch((error: unknown) => {
+            status.addClass("is-error");
+            status.setText(
+              error instanceof Error
+                ? error.message
+                : "删除没有完成；没有把这条记录从列表隐藏。"
+            );
+            back.disabled = false;
+            confirm.disabled = false;
+            confirm.setText(isAudio ? "重试删除音频" : "重试删除记录");
+          });
+      });
+    };
+    renderMenu();
+    modal.open();
+  }
+
+  private async performSourceAudioDeletion(job: JobSchema): Promise<string> {
+    const worker = this.plugin.preferredWorker();
+    const token = worker ? this.plugin.credentials.get(worker.id) : null;
+    if (!worker || !token || !canManageJobData(job.state)) {
+      throw new Error("Worker 尚未就绪，未删除任何音频。请恢复连接后重试。");
+    }
+    const current = this.jobs.find((candidate) => candidate.job_id === job.job_id) ?? job;
+    const result = await deleteJobSourceAudio(
+      new ObsidianWorkerTransport(),
+      worker,
+      token,
+      current
+    );
+    this.localAudioByJobId.delete(result.job.job_id);
+    this.releaseReviewAudioUrl();
+    this.jobs = this.jobs.map((candidate) =>
+      candidate.job_id === result.job.job_id ? result.job : candidate
+    );
+    if (this.selectedSnapshot?.job.job_id === result.job.job_id) {
+      this.selectedSnapshot = { ...this.selectedSnapshot, job: result.job };
+    }
+    this.render();
+    return result.deleted
+      ? `音频已永久删除，共释放 ${formatBytes(result.deleted_bytes)}；逐字稿、证据和笔记仍保留。`
+      : `音频此前已经删除，共释放 ${formatBytes(result.deleted_bytes)}；没有重复改动笔记资料。`;
+  }
+
+  private async performFullRecordDeletion(job: JobSchema): Promise<string> {
+    const worker = this.plugin.preferredWorker();
+    const token = worker ? this.plugin.credentials.get(worker.id) : null;
+    if (!worker || !token || !canManageJobData(job.state)) {
+      throw new Error("Worker 尚未就绪，未删除任何记录。请恢复连接后重试。");
+    }
+    const current = this.jobs.find((candidate) => candidate.job_id === job.job_id) ?? job;
+    let receipt: ReturnType<typeof currentPublicationReceipt> = null;
+    if (requiresPublishedFolderCleanup(current.state)) {
+      const status = await getPublicationStatus(
+        new ObsidianWorkerTransport(),
+        worker,
+        token,
+        current.job_id,
+        this.plugin.settings.outputFolder
+      ).catch((error: unknown) => {
+        throw new Error(
+          error instanceof PublicationClientError
+            ? `无法确认已发布笔记的位置，未执行删除：${error.message}`
+            : "无法确认已发布笔记的位置，未执行删除。"
+        );
+      });
+      receipt = currentPublicationReceipt(status);
+    }
+    let movedPublishedFolder = false;
+    if (receipt) {
+      const safePath = safePublishedFolderPath(
+        receipt.target_relative_path,
+        this.plugin.settings.outputFolder
+      );
+      if (!safePath) {
+        throw new Error("发布目录超出当前语音笔记文件夹，安全检查已停止删除。请检查发布记录。");
+      }
+      const target = this.app.vault.getAbstractFileByPath(normalizePath(safePath));
+      if (target instanceof TFolder) {
+        await this.app.fileManager.trashFile(target);
+        movedPublishedFolder = true;
+      } else if (target instanceof TFile) {
+        throw new Error("发布目标不是预期的笔记文件夹，安全检查已停止删除。");
+      }
+    }
+    let result;
+    try {
+      result = await deleteJob(
+        new ObsidianWorkerTransport(),
+        worker,
+        token,
+        current
+      );
+    } catch (error) {
+      if (movedPublishedFolder) {
+        throw new Error(
+          "已发布笔记文件夹已移入 Obsidian 回收站，但 Worker 记录删除失败。记录仍在左侧列表，可直接重试；需要时可从回收站恢复笔记。"
+        );
+      }
+      throw error;
+    }
+    const index = this.jobs.findIndex((candidate) => candidate.job_id === current.job_id);
+    this.jobs = this.jobs.filter((candidate) => candidate.job_id !== current.job_id);
+    if (this.selectedJobId === current.job_id) {
+      const next = this.jobs[Math.min(Math.max(index, 0), this.jobs.length - 1)] ?? null;
+      if (next) {
+        await this.selectJob(next.job_id);
+      } else {
+        this.openIntake();
+      }
+    } else {
+      this.render();
+    }
+    const vaultResult = movedPublishedFolder
+      ? "已发布笔记文件夹已移入 Obsidian 回收站；"
+      : "当前 Vault 没有需要移动的已发布文件夹；";
+    return `${vaultResult}Worker 记录已永久删除，共释放 ${formatBytes(result.deleted_bytes)}。`;
+  }
+
   private openIntake(): void {
     this.clearSpeakerRenameSlowTimer();
     this.stopSummaryRegenerationTimer();
@@ -3133,6 +3954,12 @@ export class SpeechWorkbenchView extends ItemView {
       revisions.at(-1) ??
       null
     );
+  }
+
+  private publishedSummaryManifest(): string | null {
+    return this.publicationState.state === "published"
+      ? this.publicationState.manifestSha256
+      : null;
   }
 
   private summaryRevisionSignature(): string {
@@ -3416,8 +4243,15 @@ export class SpeechWorkbenchView extends ItemView {
       }
       this.applySummaryDraftResult(result);
       this.summaryDraftText = result.revision.draft_markdown ?? this.summaryDraftText;
+      if (result.revision.status === "accepted" && result.saved) {
+        this.publicationState = { state: "idle" };
+        this.publicationBusy = false;
+        this.allowAutomaticPublicationView = true;
+      }
       this.summaryDraftFeedback = result.saved
-        ? `人工草稿 v${result.revision.draft_version.toString()} 已保存；接受新版时将发布这份正文。`
+        ? result.revision.status === "accepted"
+          ? `人工定稿 v${result.revision.draft_version.toString()} 已保存；V${result.revision.candidate_version.toString()} 待发布内容已经更新。`
+          : `人工草稿 v${result.revision.draft_version.toString()} 已保存；接受新版时将发布这份正文。`
         : "当前内容已经保存。";
     } catch (error) {
       if (!this.isCurrentTaskRequest(job.job_id, requestEpoch)) {
@@ -3438,6 +4272,67 @@ export class SpeechWorkbenchView extends ItemView {
     }
   }
 
+  private async openSummaryDraftEditor(
+    revision: SummaryRevisionSchema
+  ): Promise<void> {
+    if (this.summaryDraftOpening) {
+      return;
+    }
+    const worker = this.plugin.preferredWorker();
+    const token = worker ? this.plugin.credentials.get(worker.id) : null;
+    const job = this.selectedSnapshot?.job;
+    const requestEpoch = this.taskSelectionEpoch;
+    this.summaryDraftOpening = true;
+    this.summaryDraftFeedback = null;
+    this.render();
+    try {
+      if (
+        revision.status === "accepted" &&
+        worker &&
+        token &&
+        job &&
+        this.publicationState.state !== "published"
+      ) {
+        const status = await getPublicationStatus(
+          new ObsidianWorkerTransport(),
+          worker,
+          token,
+          job.job_id,
+          this.plugin.settings.outputFolder
+        );
+        if (!this.isCurrentTaskRequest(job.job_id, requestEpoch)) {
+          return;
+        }
+        const receipt = currentPublicationReceipt(status);
+        if (receipt) {
+          this.publicationState = {
+            state: "published",
+            targetRelativePath: receipt.target_relative_path,
+            manifestSha256: receipt.manifest_sha256
+          };
+        }
+      }
+      this.summaryDraftEditing = true;
+      this.summaryDraftText =
+        revision.draft_markdown ??
+        renderSummaryCandidateMarkdown(revision.after_document);
+    } catch (error) {
+      this.summaryDraftEditing = true;
+      this.summaryDraftText =
+        revision.draft_markdown ??
+        renderSummaryCandidateMarkdown(revision.after_document);
+      this.summaryDraftFeedback =
+        error instanceof PublicationClientError
+          ? "暂时无法确认当前发布状态；保存时 Worker 仍会保护已发布版本并自动创建下一版。"
+          : null;
+    } finally {
+      if (!job || this.isCurrentTaskRequest(job.job_id, requestEpoch)) {
+        this.summaryDraftOpening = false;
+        this.render();
+      }
+    }
+  }
+
   private applySummaryDraftResult(
     result: Awaited<ReturnType<typeof saveJobSummaryRevisionDraft>>
   ): void {
@@ -3448,18 +4343,16 @@ export class SpeechWorkbenchView extends ItemView {
       this.selectedSnapshot = { ...this.selectedSnapshot, job: result.job };
     }
     if (this.summaryRevisions) {
-      this.summaryRevisions = {
-        ...this.summaryRevisions,
-        revisions: this.summaryRevisions.revisions.map((item) =>
-          item.revision_key === result.revision.revision_key
-            ? result.revision
-            : item
-        )
-      };
+      this.summaryRevisions = upsertSavedSummaryRevision(
+        this.summaryRevisions,
+        result.revision
+      );
     }
+    this.selectedSummaryRevisionKey = result.revision.revision_key;
   }
 
   private resetSummaryDraftEditor(): void {
+    this.summaryDraftOpening = false;
     this.summaryDraftEditing = false;
     this.summaryDraftText = "";
     this.summaryDraftSaving = false;
@@ -3739,12 +4632,22 @@ export class SpeechWorkbenchView extends ItemView {
       if (!this.isCurrentTaskRequest(jobId, requestEpoch)) {
         return;
       }
-      if (status.receipt) {
-        const target = status.receipt?.target_relative_path ?? status.suggested_target_relative_path;
+      const currentReceipt = currentPublicationReceipt(status);
+      if (currentReceipt) {
+        const target = currentReceipt.target_relative_path;
+        const currentVersion = this.summaryRevisions?.current_version ?? 1;
+        const replacement =
+          currentVersion > 1 && target !== status.suggested_target_relative_path
+            ? {
+                previousTargetRelativePath: status.suggested_target_relative_path,
+                publicationVersion: currentVersion
+              }
+            : undefined;
         this.publicationState = {
           state: "published",
           targetRelativePath: target,
-          manifestSha256: status.receipt.manifest_sha256
+          manifestSha256: currentReceipt.manifest_sha256,
+          replacement
         };
         this.publicationBusy = false;
         this.render();
@@ -3782,12 +4685,20 @@ export class SpeechWorkbenchView extends ItemView {
         return;
       }
       if (inspection.kind === "conflict") {
+        const recommendedTargetRelativePath = await chooseNewPublicationPath(
+          this.app.vault.adapter,
+          status.suggested_target_relative_path,
+          this.publicationVersion()
+        );
         this.publicationState = {
           state: "conflict",
           status,
           packageData,
           diff: inspection.diff,
-          viewed: false
+          step: "notice",
+          recommendedTargetRelativePath,
+          destinationChoice: "recommended",
+          customTargetRelativePath: ""
         };
         this.publicationBusy = false;
         this.render();
@@ -3828,7 +4739,8 @@ export class SpeechWorkbenchView extends ItemView {
     packageData: DownloadedPublicationPackage,
     targetRelativePath: string,
     existingLeaseId: string | null,
-    requestEpoch: number
+    requestEpoch: number,
+    replacement?: PublicationReplacementContext
   ): Promise<void> {
     const worker = this.plugin.preferredWorker();
     const token = worker ? this.plugin.credentials.get(worker.id) : null;
@@ -3851,7 +4763,11 @@ export class SpeechWorkbenchView extends ItemView {
         requestEpoch
       );
       if (currentRequest) {
-        this.publicationState = { state: "publishing", targetRelativePath };
+        this.publicationState = {
+          state: "publishing",
+          targetRelativePath,
+          replacement
+        };
         this.render();
       }
       await writePublicationPackage(this.app.vault.adapter, {
@@ -3874,10 +4790,17 @@ export class SpeechWorkbenchView extends ItemView {
         this.publicationState = {
           state: "published",
           targetRelativePath,
-          manifestSha256: packageData.manifestSha256
+          manifestSha256: packageData.manifestSha256,
+          replacement
         };
         this.publicationBusy = false;
         this.render();
+        if (replacement) {
+          window.setTimeout(
+            () => void this.openPublishedNote(targetRelativePath, true),
+            250
+          );
+        }
       }
     } catch (error) {
       if (leaseId) {
@@ -3904,12 +4827,20 @@ export class SpeechWorkbenchView extends ItemView {
           inspection.kind === "conflict" &&
           this.isCurrentTaskRequest(status.job.job_id, requestEpoch)
         ) {
+          const recommendedTargetRelativePath = await chooseNewPublicationPath(
+            this.app.vault.adapter,
+            status.suggested_target_relative_path,
+            this.publicationVersion()
+          );
           this.publicationState = {
             state: "conflict",
             status,
             packageData,
             diff: inspection.diff,
-            viewed: false
+            step: "notice",
+            recommendedTargetRelativePath,
+            destinationChoice: "recommended",
+            customTargetRelativePath: ""
           };
           this.publicationBusy = false;
           this.render();
@@ -3921,7 +4852,8 @@ export class SpeechWorkbenchView extends ItemView {
   }
 
   private async savePublicationToNewLocation(
-    conflict: Extract<PublicationViewState, { state: "conflict" }>
+    conflict: Extract<PublicationViewState, { state: "conflict" }>,
+    targetRelativePath: string
   ): Promise<void> {
     const worker = this.plugin.preferredWorker();
     const token = worker ? this.plugin.credentials.get(worker.id) : null;
@@ -3930,9 +4862,44 @@ export class SpeechWorkbenchView extends ItemView {
       return;
     }
     const requestEpoch = this.taskSelectionEpoch;
-    this.publicationBusy = true;
-    this.render();
     try {
+      if (!targetRelativePath) {
+        this.publicationState = {
+          ...conflict,
+          pathError: "请选择或输入一个新的 Vault 文件夹位置。"
+        };
+        this.render();
+        return;
+      }
+      if (targetRelativePath === conflict.status.suggested_target_relative_path) {
+        const version = this.publicationVersion();
+        this.publicationState = {
+          ...conflict,
+          pathError: `V${version.toString()} 必须保存到与 V${Math.max(1, version - 1).toString()} 不同的新位置。`
+        };
+        this.render();
+        return;
+      }
+      this.publicationBusy = true;
+      this.render();
+      const targetInspection = await inspectPublicationTarget(
+        this.app.vault.adapter,
+        targetRelativePath,
+        conflict.packageData
+      );
+      if (!this.isCurrentTaskRequest(job.job_id, requestEpoch)) {
+        this.publicationBusy = false;
+        return;
+      }
+      if (targetInspection.kind !== "available") {
+        this.publicationBusy = false;
+        this.publicationState = {
+          ...conflict,
+          pathError: "所选位置已经存在内容，请选择另一个新位置。"
+        };
+        this.render();
+        return;
+      }
       const transport = new ObsidianWorkerTransport();
       const status = await getPublicationStatus(
         transport,
@@ -3941,39 +4908,60 @@ export class SpeechWorkbenchView extends ItemView {
         job.job_id,
         this.plugin.settings.outputFolder
       );
+      if (!this.isCurrentTaskRequest(job.job_id, requestEpoch)) {
+        this.publicationBusy = false;
+        return;
+      }
       if (status.manifest_sha256 !== conflict.packageData.manifestSha256) {
         throw new VaultPublicationError("verification", "Worker 发布清单已发生变化，请重新查看。");
       }
-      const target = await chooseNewPublicationPath(
-        this.app.vault.adapter,
-        conflict.status.suggested_target_relative_path
-      );
       await this.publishPreparedPackage(
         status,
         conflict.packageData,
-        target,
+        targetRelativePath,
         null,
-        requestEpoch
+        requestEpoch,
+        {
+          previousTargetRelativePath: conflict.status.suggested_target_relative_path,
+          publicationVersion: this.publicationVersion()
+        }
       );
     } catch (error) {
       if (!this.isCurrentTaskRequest(job.job_id, requestEpoch)) {
         return;
       }
       this.publicationBusy = false;
-      this.publicationState = {
-        state: "error",
-        message:
-          error instanceof PublicationClientError || error instanceof VaultPublicationError
-            ? error.message
-            : "新位置未能完成写入，当前内容没有被覆盖。"
-      };
+      if (error instanceof VaultPublicationError && error.kind === "unsafe") {
+        this.publicationState = {
+          ...conflict,
+          step: "location",
+          pathError: error.message
+        };
+      } else {
+        this.publicationState = {
+          state: "error",
+          message:
+            error instanceof PublicationClientError || error instanceof VaultPublicationError
+              ? error.message
+              : "新位置未能完成写入，当前内容没有被覆盖。"
+        };
+      }
       this.render();
     }
   }
 
-  private async openPublishedNote(targetRelativePath: string): Promise<void> {
+  private async openPublishedNote(
+    targetRelativePath: string,
+    waitForIndex = false
+  ): Promise<void> {
     const notePath = normalizePath(`${targetRelativePath}/note.md`);
-    const note = this.app.vault.getAbstractFileByPath(notePath);
+    let note = this.app.vault.getAbstractFileByPath(notePath);
+    if (waitForIndex) {
+      for (let attempt = 0; attempt < 20 && !(note instanceof TFile); attempt += 1) {
+        await new Promise<void>((resolve) => window.setTimeout(resolve, 100));
+        note = this.app.vault.getAbstractFileByPath(notePath);
+      }
+    }
     if (!(note instanceof TFile)) {
       this.publicationState = {
         state: "error",
@@ -4457,6 +5445,16 @@ function publicationTargetPath(state: PublicationViewState): string | null {
     default:
       return null;
   }
+}
+
+function relativeParentPath(path: string): string {
+  const separator = path.lastIndexOf("/");
+  return separator < 0 ? "" : path.slice(0, separator);
+}
+
+function relativeLeafName(path: string): string {
+  const separator = path.lastIndexOf("/");
+  return separator < 0 ? path : path.slice(separator + 1);
 }
 
 function localDate(date: Date): string {

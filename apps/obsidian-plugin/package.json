@@ -1,6 +1,6 @@
 {
   "name": "speech-capture-obsidian-plugin",
-  "version": "0.1.14",
+  "version": "0.1.22",
   "private": true,
   "type": "module",
   "scripts": {

@@ -55,6 +55,12 @@ ranges for evidence seeking. Its current retention is the Worker job lifetime; d
 remove this private derivative. It is never copied to the Vault unless a future explicit audio-archive feature is
 separately designed and enabled.
 
+For a terminal job, the user may explicitly delete only the Worker-held source, normalized, and review audio while
+retaining the job and all text artifacts. The job then records the deletion time and released byte count, review
+playback returns unavailable, and processing that requires source audio cannot resume. Deleting the whole record
+removes all Worker-private job layers; if a package was published, the plugin first moves the complete published
+folder to the Obsidian-configured trash location rather than silently hiding the task card.
+
 ## 3. Date resolution
 
 Recording date and time are resolved in this order:
@@ -138,9 +144,11 @@ Every note contains a content-first common core:
 ```text
 Properties
 Title
+Meeting objective when content type is meeting
 Narrative content summary
-Core conclusions
 Thematic discussion with evidence-linked details
+Discussion evolution and participant viewpoints when supported
+Core conclusions
 Decisions and action items when present
 Risks and unresolved questions when present
 Time-ordered chapter navigation
@@ -152,7 +160,7 @@ Content-specific sections are then added:
 
 | Content type | Specialized sections |
 | --- | --- |
-| Meeting | decisions, action items, owners, deadlines, disagreements, unresolved questions |
+| Meeting | evidence-backed objective, participants, discussion evolution, viewpoints, decisions, action items, owners and deadlines only when stated, disagreements, unresolved questions |
 | Interview | interviewee background, question-answer links, viewpoints, reasoning, experiences, tensions, unanswered questions |
 | Course | learning goals, concepts, principles, methods, examples, limitations, review takeaways |
 | Speech | theme, arguments, evidence, examples, implications, takeaways |

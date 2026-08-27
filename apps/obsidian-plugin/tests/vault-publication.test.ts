@@ -79,11 +79,14 @@ describe("Vault publication", () => {
     const target = "语音笔记/2026-08-03-合成会议";
     await adapter.mkdir("语音笔记");
     await adapter.mkdir(target);
-    await adapter.mkdir(`${target}（新）`);
+    await adapter.mkdir(`${target}（V2）`);
 
     await expect(
       publication.chooseNewPublicationPath(adapter as never, target)
-    ).resolves.toBe(`${target}（新 2）`);
+    ).resolves.toBe(`${target}（V2-2）`);
+    await expect(
+      publication.chooseNewPublicationPath(adapter as never, target, 3)
+    ).resolves.toBe(`${target}（V3）`);
   });
 
   it("publishes an accepted replacement to a verified new path and leaves the old Note intact", async () => {

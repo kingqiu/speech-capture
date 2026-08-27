@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 
 import {
   applyJobAction,
+  deleteJob,
+  deleteJobSourceAudio,
   effectiveSpeakerDisplayName,
   effectiveTranscriptSegment,
   getJobSnapshot,
@@ -31,10 +33,52 @@ const JOB = {
   source_display_name: "synthetic.wav",
   state: "transcribing",
   revision: 4,
-  recording_date: "2026-08-03"
+  recording_date: "2026-08-03",
+  source_audio_status: "available",
+  source_audio_deleted_at: null,
+  source_audio_deleted_bytes: 0
 };
 
 describe("job client", () => {
+  it("deletes source audio separately from the complete Worker record", async () => {
+    const deletedJob = {
+      ...JOB,
+      revision: 5,
+      source_audio_status: "deleted",
+      source_audio_deleted_at: "2026-08-26T10:00:00Z",
+      source_audio_deleted_bytes: 4096
+    };
+    const transport = new QueueTransport([
+      response(200, {
+        job: deletedJob,
+        deleted: true,
+        deleted_bytes: 4096,
+        deleted_at: "2026-08-26T10:00:00Z"
+      }),
+      response(200, {
+        job_id: JOB.job_id,
+        deleted_bytes: 8192,
+        published_target_relative_path: "Speech Notes/2026/08/test"
+      })
+    ]);
+
+    const audio = await deleteJobSourceAudio(
+      transport,
+      WORKER,
+      "secret",
+      JOB
+    );
+    const record = await deleteJob(transport, WORKER, "secret", deletedJob);
+
+    expect(audio.job.source_audio_status).toBe("deleted");
+    expect(audio.deleted_bytes).toBe(4096);
+    expect(record.deleted_bytes).toBe(8192);
+    expect(transport.requests.map((request) => request.path)).toEqual([
+      `/v1/jobs/${JOB.job_id}/source-audio-deletion`,
+      `/v1/jobs/${JOB.job_id}/deletion`
+    ]);
+  });
+
   it("lists only the authorized Vault and reads progressive snapshot content", async () => {
     const transport = new QueueTransport([
       response(200, { jobs: [JOB] }),

@@ -977,6 +977,168 @@ def test_artifact_listing_download_and_integrity_failure(tmp_path) -> None:
     assert symlinked.status_code == 409
 
 
+def test_source_audio_deletion_frees_audio_and_preserves_transcript(tmp_path) -> None:
+    with JobStore(
+        tmp_path / "worker.sqlite3",
+        upload_chunk_size_bytes=4,
+        source_probe=_probe,
+    ) as store:
+        client = TestClient(create_app(store=store, credential_verifier=_verifier("vault_primary")))
+        upload = _create_upload(client)
+        upload_id = upload["upload"]["upload_id"]
+        _complete_upload(client, upload)
+        source_path = store.get_verified_source_path(upload_id)
+        job = _create_job(client, upload_id)
+        job_id = job["job"]["job_id"]
+        _advance_to_processed_review_job(store, job_id)
+        normalized = store.get_job_stage_directory(job_id, stage="preprocessing") / "audio.wav"
+        review = store.get_job_stage_directory(job_id, stage="review_audio") / "review.wav"
+        normalized.write_bytes(b"normalized-audio")
+        review.write_bytes(b"review-audio")
+        before = client.get(f"/v1/jobs/{job_id}", headers=AUTHORIZATION).json()["job"]
+
+        deleted = client.post(
+            f"/v1/jobs/{job_id}/source-audio-deletion",
+            headers=AUTHORIZATION,
+            json={"expected_revision": before["revision"]},
+        )
+        retry = client.post(
+            f"/v1/jobs/{job_id}/source-audio-deletion",
+            headers=AUTHORIZATION,
+            json={"expected_revision": before["revision"]},
+        )
+        snapshot = client.get(f"/v1/jobs/{job_id}/snapshot", headers=AUTHORIZATION)
+        review_response = client.get(
+            f"/v1/jobs/{job_id}/review-audio",
+            headers=AUTHORIZATION,
+        )
+
+        assert deleted.status_code == 200, deleted.text
+        assert deleted.json()["deleted"] is True
+        assert deleted.json()["deleted_bytes"] == len(SOURCE) + 16 + 12
+        assert deleted.json()["job"]["source_audio_status"] == "deleted"
+        assert retry.status_code == 200, retry.text
+        assert retry.json()["deleted"] is False
+        assert retry.json()["deleted_bytes"] == deleted.json()["deleted_bytes"]
+        assert not source_path.exists()
+        assert not normalized.exists()
+        assert not review.exists()
+        assert snapshot.status_code == 200
+        assert snapshot.json()["stable_segments"][0]["text"] == "这是合成逐字稿。"
+        assert review_response.status_code == 404
+
+
+def test_data_deletion_rejects_nonterminal_job_without_touching_source(tmp_path) -> None:
+    with JobStore(
+        tmp_path / "worker.sqlite3",
+        upload_chunk_size_bytes=4,
+        source_probe=_probe,
+    ) as store:
+        client = TestClient(create_app(store=store, credential_verifier=_verifier("vault_primary")))
+        upload = _create_upload(client)
+        upload_id = upload["upload"]["upload_id"]
+        _complete_upload(client, upload)
+        source_path = store.get_verified_source_path(upload_id)
+        job = _create_job(client, upload_id)["job"]
+
+        audio = client.post(
+            f"/v1/jobs/{job['job_id']}/source-audio-deletion",
+            headers=AUTHORIZATION,
+            json={"expected_revision": job["revision"]},
+        )
+        record = client.post(
+            f"/v1/jobs/{job['job_id']}/deletion",
+            headers=AUTHORIZATION,
+            json={"expected_revision": job["revision"]},
+        )
+
+        assert audio.status_code == 400
+        assert record.status_code == 400
+        assert source_path.exists()
+        assert client.get(f"/v1/jobs/{job['job_id']}", headers=AUTHORIZATION).status_code == 200
+
+
+def test_full_job_deletion_removes_worker_record_and_private_files(tmp_path) -> None:
+    with JobStore(
+        tmp_path / "worker.sqlite3",
+        upload_chunk_size_bytes=4,
+        source_probe=_probe,
+    ) as store:
+        client = TestClient(create_app(store=store, credential_verifier=_verifier("vault_primary")))
+        upload = _create_upload(client)
+        upload_id = upload["upload"]["upload_id"]
+        _complete_upload(client, upload)
+        source_path = store.get_verified_source_path(upload_id)
+        job = _create_job(client, upload_id)
+        job_id = job["job"]["job_id"]
+        _advance_to_processed_review_job(store, job_id)
+        private_note = store.get_job_stage_directory(job_id, stage="artifacts") / "note.md"
+        private_note.write_text("# 合成笔记\n", encoding="utf-8")
+        before = client.get(f"/v1/jobs/{job_id}", headers=AUTHORIZATION).json()["job"]
+
+        deleted = client.post(
+            f"/v1/jobs/{job_id}/deletion",
+            headers=AUTHORIZATION,
+            json={"expected_revision": before["revision"]},
+        )
+        missing = client.get(f"/v1/jobs/{job_id}", headers=AUTHORIZATION)
+        listing = client.get("/v1/jobs?vault_id=vault_primary", headers=AUTHORIZATION)
+
+        assert deleted.status_code == 200, deleted.text
+        assert deleted.json()["job_id"] == job_id
+        assert deleted.json()["deleted_bytes"] >= len(SOURCE) + len("# 合成笔记\n".encode())
+        assert deleted.json()["published_target_relative_path"] is None
+        assert missing.status_code == 404
+        assert all(item["job_id"] != job_id for item in listing.json()["jobs"])
+        assert not source_path.exists()
+        assert not private_note.exists()
+
+
+def test_full_job_deletion_accepts_partial_unpublished_job(tmp_path) -> None:
+    with JobStore(
+        tmp_path / "worker.sqlite3",
+        upload_chunk_size_bytes=4,
+        source_probe=_probe,
+    ) as store:
+        client = TestClient(create_app(store=store, credential_verifier=_verifier("vault_primary")))
+        upload = _create_upload(client)
+        upload_id = upload["upload"]["upload_id"]
+        _complete_upload(client, upload)
+        source_path = store.get_verified_source_path(upload_id)
+        job = _create_job(client, upload_id)
+        job_id = job["job"]["job_id"]
+        queued = store.get_job(job_id)
+        preprocessing = store.claim_job_for_processing(
+            job_id,
+            expected_revision=queued.revision,
+        )
+        transcribing = store.transition_job(
+            job_id,
+            JobState.TRANSCRIBING,
+            expected_revision=preprocessing.revision,
+        )
+        partial = store.transition_job(
+            job_id,
+            JobState.PARTIAL,
+            expected_revision=transcribing.revision,
+            error_code="ASR_CHUNK_RETRIES_EXHAUSTED",
+            error_message="The synthetic ASR stage stopped after its retry budget.",
+        )
+
+        deleted = client.post(
+            f"/v1/jobs/{job_id}/deletion",
+            headers=AUTHORIZATION,
+            json={"expected_revision": partial.revision},
+        )
+        missing = client.get(f"/v1/jobs/{job_id}", headers=AUTHORIZATION)
+
+        assert deleted.status_code == 200, deleted.text
+        assert deleted.json()["job_id"] == job_id
+        assert deleted.json()["published_target_relative_path"] is None
+        assert missing.status_code == 404
+        assert not source_path.exists()
+
+
 def _upload_request(vault_id: str):
     from speech_capture_worker.domain import UploadCreateRequest
 

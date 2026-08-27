@@ -674,5 +674,5 @@ def test_schema_three_migration_backfills_state_events_into_update_feed(tmp_path
         row[1] for row in connection.execute("PRAGMA table_info(job_progress)").fetchall()
     }
     connection.close()
-    assert version == 10
+    assert version == 11
     assert "detail_json" in progress_columns

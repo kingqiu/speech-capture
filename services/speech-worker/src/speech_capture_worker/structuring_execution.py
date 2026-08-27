@@ -411,6 +411,11 @@ def _document_json_schema(content_type: ContentType) -> dict[str, Any]:
     """Return the output schema, adding scene semantics outside approved meetings."""
 
     schema = json.loads(json.dumps(DOCUMENT_JSON_SCHEMA))
+    if content_type is ContentType.MEETING:
+        schema["properties"]["objective"] = json.loads(
+            json.dumps(EVIDENCE_TEXT_JSON_SCHEMA)
+        )
+        schema["required"].insert(1, "objective")
     kinds = scene_section_kinds(content_type.value)
     if kinds:
         scene_schema = json.loads(json.dumps(SCENE_SECTION_JSON_SCHEMA))
@@ -723,6 +728,12 @@ class OllamaStructuringEngine:
             + "\n"
             + output_contract_guidance(content_type.value)
             + _recording_context_prompt(self.recording_context)
+            + (
+                "\n会议专用结构：objective 用简洁文字说明会议为什么召开、要解决的问题或期望形成的"
+                "结果，必须有直接证据，不得提前写入会议结论；不设固定句数。"
+                if content_type is ContentType.MEETING
+                else ""
+            )
             + "\n结构要求：title 要具体；summary 用连贯文字讲清背景、参与方、会议或记录目标、"
             "核心讨论和"
             "结果；context 提取目的、人物、组织、关系、约束等理解全文必需的上下文；highlights 只"
@@ -884,7 +895,9 @@ class OllamaStructuringEngine:
             "你是中文会议纪要主编。只返回符合 schema 的完整 JSON 文档，不要解释。现有文档已经"
             "完成全局综合；请在一次质量编辑中同时修复会议主线、讨论演变、说话人观点和结果事项，"
             "不得再次拆成多个相互覆盖的摘要。title 必须点明具体项目和会议目的。summary 用一段话"
-            "交代参与方、讨论对象、范围、推进方式和会议实际落点。context 只写会议目的、项目背景、"
+            "交代参与方、讨论对象、范围、推进方式和会议实际落点。objective 只用简洁文字说明会议"
+            "为什么召开、要解决的问题或期望形成的结果，必须有直接证据，不提前写结论，也不按固定"
+            "句数填充。context 只写项目背景、"
             "参与方关系和明确约束，不按人复述观点。highlights 只保留最影响理解和后续工作的具体"
             "结论，不得收录问句、待确认事项或与 actions 重复的内容。topics 按互不重复的具体议题"
             "组织；数据来源与映射、更新同步机制、系统配置与业务流程等不同问题必须分开，不得"
@@ -5078,12 +5091,23 @@ def _validate_document(
     timeline_keys = expected_keys | {"timeline_sections"}
     scene_keys = expected_keys | {"scene_sections"}
     scene_timeline_keys = expected_keys | {"scene_sections", "timeline_sections"}
-    if frozenset(raw) not in {
+    allowed_field_sets = {
         frozenset(expected_keys),
         frozenset(timeline_keys),
         frozenset(scene_keys),
         frozenset(scene_timeline_keys),
-    }:
+    }
+    if content_type is ContentType.MEETING:
+        allowed_field_sets.update(
+            frozenset(fields | {"objective"})
+            for fields in (
+                expected_keys,
+                timeline_keys,
+                scene_keys,
+                scene_timeline_keys,
+            )
+        )
+    if frozenset(raw) not in allowed_field_sets:
         raise StructuringFailed("The structured document has invalid fields.")
     title = _validate_document_text(
         raw.get("title"),
@@ -5105,6 +5129,18 @@ def _validate_document(
         summary["text"] = _remove_unsupported_interview_inferences(
             summary["text"],
             summary["evidence"],
+            segment_texts,
+        )
+    objective: dict[str, Any] | None = None
+    if content_type is ContentType.MEETING and raw.get("objective") is not None:
+        objective = _validate_evidence_text(
+            raw.get("objective"),
+            segment_ids=segment_ids,
+            field="objective",
+        )
+        objective["text"] = _remove_unsupported_meeting_host_claim(
+            objective["text"],
+            objective["evidence"],
             segment_texts,
         )
     raw_context = raw.get("context")
@@ -5156,6 +5192,13 @@ def _validate_document(
         )
         if not (has_multiple_context_facets or has_single_rich_context):
             raise StructuringFailed("The meeting document has too little background context.")
+        if objective is None:
+            purpose = next((item for item in context if item["kind"] == "purpose"), None)
+            objective = (
+                {"text": purpose["text"], "evidence": list(purpose["evidence"])}
+                if purpose is not None
+                else {"text": summary["text"], "evidence": list(summary["evidence"])}
+            )
     if content_type is ContentType.INTERVIEW:
         context = [
             {
@@ -5768,7 +5811,7 @@ def _validate_document(
         for item in chapter_sources
     ]
 
-    return {
+    document = {
         "title": title,
         "summary": summary,
         "context": context,
@@ -5784,6 +5827,9 @@ def _validate_document(
         "open_questions": open_questions,
         "chapters": chapters,
     }
+    if objective is not None:
+        document["objective"] = objective
+    return document
 
 
 def _validate_timeline_sections(

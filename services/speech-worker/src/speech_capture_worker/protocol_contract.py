@@ -40,6 +40,7 @@ class ProtocolCapability(StrEnum):
     ATOMIC_VAULT_PUBLICATION = "atomic_vault_publication"
     REVIEW_AUDIO_RANGES = "review_audio_ranges"
     WORKER_READINESS = "worker_readiness"
+    JOB_DATA_DELETION = "job_data_deletion"
 
 
 SUPPORTED_CAPABILITIES = tuple(ProtocolCapability)

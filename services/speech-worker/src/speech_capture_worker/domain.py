@@ -250,9 +250,26 @@ class JobRecord:
     last_error_message: str | None
     created_at: str
     updated_at: str
+    source_audio_deleted_at: str | None = None
+    source_audio_deleted_bytes: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+@dataclass(frozen=True)
+class JobAudioDeletionResult:
+    job: JobRecord
+    deleted: bool
+    deleted_bytes: int
+    deleted_at: str
+
+
+@dataclass(frozen=True)
+class JobDeletionResult:
+    job_id: str
+    deleted_bytes: int
+    published_target_relative_path: str | None
 
 
 @dataclass(frozen=True)

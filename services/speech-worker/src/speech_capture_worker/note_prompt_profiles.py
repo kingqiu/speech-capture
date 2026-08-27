@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-NOTE_PROMPT_VERSION = "2026-08-25.1"
+NOTE_PROMPT_VERSION = "2026-08-26.1"
 
 _COMMON_SALIENCE = """
 信息优先级不是由发言长度、措辞宏大或出现顺序决定。请依次判断：
@@ -17,6 +17,8 @@ _COMMON_SALIENCE = """
 _PROFILE_GUIDANCE = {
     "meeting": """
 这是会议纪要。必须先还原会议背景、参与方、会议目标和合作关系，再整理议题。
+objective 必须用一段简洁、可由逐字稿证实的文字说明为什么召开本次会议、要解决什么问题或
+期望形成什么结果；不要提前塞入会议结论，也不要为了满足固定句数而填充套话。
 参与方只包括本次会议中实际出现的个人或组织；过去任职公司、客户案例和被举例的机构不是参与方。
 如果开场明确介绍了公司、人物、能力或合作背景，必须在 context 中单独保留 organization 或
 participant 项，并在 topics 中保留与本次合作有关的实质信息，不能被后面的长篇方法论覆盖。
@@ -190,6 +192,7 @@ _SCENE_SECTION_LABELS = {
 
 _RENDER_HEADINGS = {
     "meeting": {
+        "objective": "会议目标",
         "context": "背景与参与方",
         "highlights": "核心结论",
         "body": "议题与讨论",

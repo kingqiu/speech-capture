@@ -70,6 +70,27 @@ describe("summary diff", () => {
     });
   });
 
+  it("shows the meeting objective before the narrative summary", () => {
+    const changes = buildSummaryChanges(
+      {
+        objective: { text: "确认旧范围", evidence: ["seg_1"] },
+        summary: { text: "旧摘要", evidence: ["seg_1"] }
+      },
+      {
+        objective: { text: "确认新范围", evidence: ["seg_2"] },
+        summary: { text: "新摘要", evidence: ["seg_2"] }
+      }
+    );
+
+    expect(changes.map((change) => change.id)).toEqual(["objective", "summary"]);
+    expect(changes[0]).toMatchObject({
+      label: "会议目标",
+      kind: "modified",
+      afterText: "确认新范围",
+      evidenceIds: ["seg_2"]
+    });
+  });
+
   it("ignores key order and unchanged nested content", () => {
     expect(
       buildSummaryChanges(

@@ -54,7 +54,9 @@ The system distinguishes anonymous speakers within a recording. Users confirm re
 - Audio embedded in the active note.
 - Common formats supported through FFmpeg, including WAV, MP3, M4A, FLAC, and audio tracks from supported media containers.
 
-The original source file is never modified or deleted by Speech Capture.
+The source file selected on the submitting computer is never modified or deleted by Speech
+Capture. The checksum-bound private copy stored by the Worker may be permanently deleted only
+through the explicit `仅删除原始音频` or `删除整条语音记录` action after a second confirmation.
 
 ### 4.2 Upload and intake
 
@@ -108,8 +110,10 @@ The original source file is never modified or deleted by Speech Capture.
 - Every supported content type—meeting, interview, course or speech, voice memo or
   personal note, and generic content—must reach the same quality level. This is a shared
   quality bar, not a requirement to reuse the meeting-note headings or layout.
-- Meetings prioritize context, participants, viewpoints, discussion evolution, decisions,
-  actions, risks, and open questions.
+- Meetings begin with an evidence-backed objective, then present the narrative summary,
+  context, discussion, discussion evolution and participant viewpoints before conclusions,
+  decisions, actions, risks, and open questions. Owner and deadline fields are populated only
+  when the transcript states them.
 - Interviews distinguish interviewer prompts from interviewee statements and preserve the
   interviewee's background, central views, reasoning, examples, tensions, and unanswered
   questions.

@@ -75,8 +75,7 @@ export async function getPublicationStatus(
   const status = value as unknown as PublicationStatusResponse;
   if (
     (status.active_lease !== null &&
-      status.active_lease.manifest_sha256 !== status.manifest_sha256) ||
-    (status.receipt !== null && status.receipt.manifest_sha256 !== status.manifest_sha256)
+      status.active_lease.manifest_sha256 !== status.manifest_sha256)
   ) {
     throw new PublicationClientError("invalid", "Worker 发布状态与当前产物不一致。");
   }

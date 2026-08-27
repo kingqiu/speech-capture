@@ -135,13 +135,18 @@ export async function writePublicationPackage(
 
 export async function chooseNewPublicationPath(
   adapter: DataAdapter,
-  originalRelativePath: string
+  originalRelativePath: string,
+  version = 2
 ): Promise<string> {
   const original = safeRelativePath(originalRelativePath);
   const parent = parentPath(original);
   const name = leafName(original);
+  const safeVersion = Math.max(2, Math.trunc(version));
   for (let index = 1; index <= 999; index += 1) {
-    const suffix = index === 1 ? "（新）" : `（新 ${index.toString()}）`;
+    const suffix =
+      index === 1
+        ? `（V${safeVersion.toString()}）`
+        : `（V${safeVersion.toString()}-${index.toString()}）`;
     const candidate = `${parent ? `${parent}/` : ""}${name}${suffix}`;
     if (!(await adapter.exists(candidate))) {
       return candidate;

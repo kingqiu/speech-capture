@@ -5,9 +5,11 @@ import type {
   CorrectionListResponse,
   CorrectionSchema,
   JobActionEnvelope,
+  JobDeletionEnvelope,
   JobListResponse,
   JobSchema,
   JobSnapshotResponse,
+  JobSourceAudioDeletionEnvelope,
   SegmentReviewEnvelope,
   SpeakerDisplayNameEnvelope,
   SummaryRevisionDecisionEnvelope,
@@ -413,6 +415,64 @@ export async function applyJobAction(
   return (value as unknown as JobActionEnvelope).job;
 }
 
+export async function deleteJobSourceAudio(
+  transport: WorkerTransport,
+  worker: WorkerConnectionSettings,
+  bearerToken: string,
+  job: Pick<JobSchema, "job_id" | "revision">
+): Promise<JobSourceAudioDeletionEnvelope> {
+  const response = await transport.request(
+    worker,
+    `/v1/jobs/${encodeURIComponent(job.job_id)}/source-audio-deletion`,
+    {
+      method: "POST",
+      body: { expected_revision: job.revision },
+      bearerToken,
+      timeoutMs: 30_000
+    }
+  );
+  const value = parseSuccess(response);
+  if (
+    !isJobSummary(value.job) ||
+    typeof value.deleted !== "boolean" ||
+    typeof value.deleted_bytes !== "number" ||
+    typeof value.deleted_at !== "string"
+  ) {
+    throw new JobClientError("invalid", "Worker 返回了无法识别的音频删除结果。");
+  }
+  return value as unknown as JobSourceAudioDeletionEnvelope;
+}
+
+export async function deleteJob(
+  transport: WorkerTransport,
+  worker: WorkerConnectionSettings,
+  bearerToken: string,
+  job: Pick<JobSchema, "job_id" | "revision">
+): Promise<JobDeletionEnvelope> {
+  const response = await transport.request(
+    worker,
+    `/v1/jobs/${encodeURIComponent(job.job_id)}/deletion`,
+    {
+      method: "POST",
+      body: { expected_revision: job.revision },
+      bearerToken,
+      timeoutMs: 30_000
+    }
+  );
+  const value = parseSuccess(response);
+  if (
+    typeof value.job_id !== "string" ||
+    typeof value.deleted_bytes !== "number" ||
+    !(
+      value.published_target_relative_path === null ||
+      typeof value.published_target_relative_path === "string"
+    )
+  ) {
+    throw new JobClientError("invalid", "Worker 返回了无法识别的记录删除结果。");
+  }
+  return value as unknown as JobDeletionEnvelope;
+}
+
 function parseSuccess(response: WorkerTransportResponse): Record<string, unknown> {
   if (response.status === 401 || response.status === 403) {
     throw new JobClientError("authentication", "Worker 授权已失效，请重新连接。");
@@ -436,6 +496,10 @@ function isJobSummary(value: unknown): value is Record<string, unknown> {
     typeof value.source_display_name === "string" &&
     typeof value.state === "string" &&
     typeof value.revision === "number" &&
+    ["available", "deleted"].includes(String(value.source_audio_status)) &&
+    (value.source_audio_deleted_at === null ||
+      typeof value.source_audio_deleted_at === "string") &&
+    typeof value.source_audio_deleted_bytes === "number" &&
     (value.recording_date === null || typeof value.recording_date === "string")
   );
 }

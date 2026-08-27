@@ -259,6 +259,130 @@ def test_human_note_drafts_are_versioned_and_forwarded_on_accept(tmp_path, monke
     assert generated[0]["note_revision_provenance"]["draft_version"] == 2
 
 
+def test_accepted_unpublished_note_can_be_edited_before_republication(
+    tmp_path, monkeypatch
+) -> None:
+    generated: list[dict] = []
+
+    class FakeArtifactGenerator:
+        def __init__(self, _store):
+            pass
+
+        def generate(self, job_id: str, **kwargs):
+            generated.append({"job_id": job_id, **kwargs})
+            manifest = ("8" if len(generated) == 1 else "7") * 64
+            return SimpleNamespace(manifest_sha256=manifest)
+
+    monkeypatch.setattr(
+        "speech_capture_worker.summary_revisions.ArtifactGenerator",
+        FakeArtifactGenerator,
+    )
+    with JobStore(tmp_path / "worker.sqlite3", source_probe=_probe) as store:
+        job = _processed_job(store)
+        revision_key = _seed_revision(store, job.job_id)
+        accepted = decide_summary_revision(
+            store,
+            job.job_id,
+            revision_key=revision_key,
+            decision=SummaryRevisionStatus.ACCEPTED,
+            expected_revision=job.revision,
+            idempotency_key="accept-before-human-amendment",
+        )
+        amended = save_summary_revision_draft(
+            store,
+            job.job_id,
+            revision_key=revision_key,
+            markdown="# 人工修订后的 V2\n\n保留完整内容。",
+            expected_revision=job.revision,
+            expected_draft_version=0,
+            idempotency_key="amend-accepted-v2-before-publication",
+        )
+
+    assert accepted.revision.artifact_manifest_sha256 == "8" * 64
+    assert amended.saved is True
+    assert amended.revision.status is SummaryRevisionStatus.ACCEPTED
+    assert amended.revision.draft_version == 1
+    assert amended.revision.draft_markdown == "# 人工修订后的 V2\n\n保留完整内容。"
+    assert amended.revision.artifact_manifest_sha256 == "7" * 64
+    assert generated[1]["note_body_override"] == "# 人工修订后的 V2\n\n保留完整内容。"
+    assert generated[1]["note_revision_provenance"]["draft_version"] == 1
+
+
+def test_editing_published_note_forks_next_version_without_mutating_source(
+    tmp_path, monkeypatch
+) -> None:
+    generated: list[dict] = []
+
+    class FakeArtifactGenerator:
+        def __init__(self, _store):
+            pass
+
+        def generate(self, job_id: str, **kwargs):
+            generated.append({"job_id": job_id, **kwargs})
+            manifest = ("8" if len(generated) == 1 else "7") * 64
+            return SimpleNamespace(manifest_sha256=manifest)
+
+    monkeypatch.setattr(
+        "speech_capture_worker.summary_revisions.ArtifactGenerator",
+        FakeArtifactGenerator,
+    )
+    with JobStore(tmp_path / "worker.sqlite3", source_probe=_probe) as store:
+        job = _processed_job(store)
+        revision_key = _seed_revision(store, job.job_id)
+        accepted = decide_summary_revision(
+            store,
+            job.job_id,
+            revision_key=revision_key,
+            decision=SummaryRevisionStatus.ACCEPTED,
+            expected_revision=job.revision,
+            idempotency_key="accept-published-v2-source",
+        )
+        monkeypatch.setattr(
+            store,
+            "get_publication_receipt",
+            lambda _job_id: SimpleNamespace(
+                manifest_sha256=accepted.revision.artifact_manifest_sha256
+            ),
+        )
+        forked = save_summary_revision_draft(
+            store,
+            job.job_id,
+            revision_key=revision_key,
+            markdown="# 人工修订后的 V3\n\nV2 应保持不变。",
+            expected_revision=job.revision,
+            expected_draft_version=0,
+            idempotency_key="fork-published-v2-as-v3",
+        )
+        replay = save_summary_revision_draft(
+            store,
+            job.job_id,
+            revision_key=revision_key,
+            markdown="# 人工修订后的 V3\n\nV2 应保持不变。",
+            expected_revision=job.revision,
+            expected_draft_version=0,
+            idempotency_key="fork-published-v2-as-v3",
+        )
+        collection = list_summary_revisions(store, job.job_id)
+
+    assert forked.saved is True
+    assert replay.saved is False
+    assert forked.revision.revision_key != revision_key
+    assert forked.revision.base_version == 2
+    assert forked.revision.candidate_version == 3
+    assert forked.revision.status is SummaryRevisionStatus.ACCEPTED
+    assert forked.revision.draft_version == 1
+    assert forked.revision.draft_markdown == "# 人工修订后的 V3\n\nV2 应保持不变。"
+    assert forked.revision.artifact_manifest_sha256 == "7" * 64
+    assert collection.current_version == 3
+    assert len(collection.revisions) == 2
+    assert collection.revisions[0].revision_key == revision_key
+    assert collection.revisions[0].candidate_version == 2
+    assert collection.revisions[0].artifact_manifest_sha256 == "8" * 64
+    assert replay.revision.revision_key == forked.revision.revision_key
+    assert len(generated) == 2
+    assert generated[1]["note_body_override"] == "# 人工修订后的 V3\n\nV2 应保持不变。"
+
+
 def test_human_note_draft_cannot_replace_protected_manual_section(tmp_path) -> None:
     with JobStore(tmp_path / "worker.sqlite3", source_probe=_probe) as store:
         job = _processed_job(store)

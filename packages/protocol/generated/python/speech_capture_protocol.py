@@ -2,7 +2,7 @@
 
 from typing import Final, Literal, NotRequired, TypeAlias, TypedDict
 
-OPENAPI_SHA256: Final = "148d231b2055a6163e1dcc7aaf2576a33cd2585f60193a2e65d08ed62e880eb4"
+OPENAPI_SHA256: Final = "51f281bb42687685c3499046ae13553c5aa54427c4daa5c06e5f3210df904e01"
 OPENAPI_VERSION: Final = "3.1.0"
 PROTOCOL_VERSION: Final = "1.0.0"
 
@@ -66,6 +66,7 @@ ProtocolCapability: TypeAlias = Literal[
     'atomic_vault_publication',
     'review_audio_ranges',
     'worker_readiness',
+    'job_data_deletion',
 ]
 
 SpeakerLabelStatus: TypeAlias = Literal[
@@ -183,6 +184,11 @@ class JobCreateSchema(TypedDict):
     recording_date: NotRequired[str | None]
     upload_id: str
 
+class JobDeletionEnvelope(TypedDict):
+    deleted_bytes: int
+    job_id: str
+    published_target_relative_path: str | None
+
 class JobProgressDetailSchema(TypedDict):
     cache_hits: int
     completed_units: int
@@ -204,6 +210,9 @@ class JobSchema(TypedDict):
     recording_context: str | None
     recording_date: str | None
     revision: int
+    source_audio_deleted_at: str | None
+    source_audio_deleted_bytes: int
+    source_audio_status: Literal['available', 'deleted']
     source_display_name: str
     source_sha256: str
     source_size_bytes: int
@@ -472,6 +481,12 @@ class JobProgressSchema(TypedDict):
     stage_progress: float
     updated_at: str
 
+class JobSourceAudioDeletionEnvelope(TypedDict):
+    deleted: bool
+    deleted_at: str
+    deleted_bytes: int
+    job: JobSchema
+
 class JobUpdatesResponse(TypedDict):
     has_more: bool
     next_after_sequence: int
@@ -603,12 +618,14 @@ __all__ = [
     "JobActionEnvelope",
     "JobActionRequestSchema",
     "JobCreateSchema",
+    "JobDeletionEnvelope",
     "JobEnvelope",
     "JobListResponse",
     "JobProgressDetailSchema",
     "JobProgressSchema",
     "JobSchema",
     "JobSnapshotResponse",
+    "JobSourceAudioDeletionEnvelope",
     "JobState",
     "JobUpdateSchema",
     "JobUpdatesResponse",

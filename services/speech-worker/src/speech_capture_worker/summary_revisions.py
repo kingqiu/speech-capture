@@ -405,28 +405,21 @@ def save_summary_revision_draft(
 ) -> SummaryRevisionDraftResult:
     validate_idempotency_key(idempotency_key)
     job = store.get_job(job_id)
-    if job.revision != expected_revision:
-        raise RevisionConflict(
-            "The job changed after the candidate Note was loaded.",
-            details={
-                "job_id": job_id,
-                "expected_revision": expected_revision,
-                "current_revision": job.revision,
-            },
-        )
     if job.state not in {JobState.PROCESSED, JobState.PUBLISHED}:
         raise InvalidJobRequest("Candidate Note editing requires a processed or published job.")
-    revision = _checkpoint_by_key(
-        store.list_checkpoints(job_id, stage=SUMMARY_REVISION_STAGE),
-        revision_key,
-    )
+    revisions = store.list_checkpoints(job_id, stage=SUMMARY_REVISION_STAGE)
+    revision = _checkpoint_by_key(revisions, revision_key)
     if revision is None:
         raise InvalidJobRequest("The requested summary revision does not exist.")
-    if _checkpoint_by_key(
+    prior_decision = _checkpoint_by_key(
         store.list_checkpoints(job_id, stage=SUMMARY_REVISION_DECISION_STAGE),
         revision_key,
-    ) is not None:
-        raise InvalidJobRequest("A decided summary revision can no longer be edited.")
+    )
+    prior_status = _decision_status(
+        prior_decision.payload if prior_decision is not None else None
+    )
+    if prior_status is SummaryRevisionStatus.REJECTED:
+        raise InvalidJobRequest("A rejected summary revision can no longer be edited.")
     normalized = markdown.strip()
     if not normalized:
         raise InvalidJobRequest("The candidate Note cannot be empty.")
@@ -438,6 +431,33 @@ def save_summary_revision_draft(
     ):
         raise InvalidJobRequest(
             "Edit the protected manual section in the current Note, not in the candidate body."
+        )
+    if prior_status is SummaryRevisionStatus.ACCEPTED:
+        published = store.get_publication_receipt(job_id)
+        accepted_manifest = prior_decision.payload.get("artifact_manifest_sha256")
+        if (
+            published is not None
+            and isinstance(accepted_manifest, str)
+            and published.manifest_sha256 == accepted_manifest
+        ):
+            return _fork_published_summary_revision_draft(
+                store,
+                job_id,
+                source_revision=revision,
+                source_decision=prior_decision,
+                markdown=normalized,
+                expected_revision=expected_revision,
+                expected_draft_version=expected_draft_version,
+                idempotency_key=idempotency_key,
+            )
+    if job.revision != expected_revision:
+        raise RevisionConflict(
+            "The job changed after the candidate Note was loaded.",
+            details={
+                "job_id": job_id,
+                "expected_revision": expected_revision,
+                "current_revision": job.revision,
+            },
         )
     latest = _latest_draft(store, job_id, revision_key)
     current_version = (
@@ -476,9 +496,210 @@ def save_summary_revision_draft(
             "saved_at": datetime.now(UTC).isoformat(),
         },
     )
+    if prior_status is SummaryRevisionStatus.ACCEPTED:
+        draft_provenance = {
+            "source": "human_draft",
+            "summary_revision_key": revision_key,
+            "draft_version": draft_version,
+            "markdown_sha256": digest,
+            "updated_at": datetime.now(UTC).isoformat(),
+        }
+        artifact = ArtifactGenerator(store).generate(
+            job_id,
+            force=True,
+            note_body_override=normalized,
+            note_revision_provenance=draft_provenance,
+        )
+        decision_payload = dict(prior_decision.payload)
+        decision_payload.update(
+            {
+                "artifact_manifest_sha256": artifact.manifest_sha256,
+                "draft_sha256": digest,
+                "amended_at": datetime.now(UTC).isoformat(),
+            }
+        )
+        store.put_checkpoint(
+            job_id,
+            stage=SUMMARY_REVISION_DECISION_STAGE,
+            checkpoint_key=revision_key,
+            payload=decision_payload,
+        )
+        job = store.get_job(job_id)
     return SummaryRevisionDraftResult(
         revision=_view_by_key(store, job_id, revision_key),
         job=job,
+        saved=True,
+    )
+
+
+def _fork_published_summary_revision_draft(
+    store: JobStore,
+    job_id: str,
+    *,
+    source_revision: Any,
+    source_decision: Any,
+    markdown: str,
+    expected_revision: int,
+    expected_draft_version: int,
+    idempotency_key: str,
+) -> SummaryRevisionDraftResult:
+    """Create the next immutable Note version when editing a published revision."""
+
+    revisions = store.list_checkpoints(job_id, stage=SUMMARY_REVISION_STAGE)
+    target = next(
+        (
+            item
+            for item in revisions
+            if item.payload.get("source") == "published_human_amendment"
+            and item.payload.get("source_revision_key") == source_revision.checkpoint_key
+            and item.payload.get("manual_edit_idempotency_key") == idempotency_key
+        ),
+        None,
+    )
+    digest = hashlib.sha256(markdown.encode("utf-8")).hexdigest()
+    if target is None:
+        job = store.get_job(job_id)
+        if job.revision != expected_revision:
+            raise RevisionConflict(
+                "The job changed after the published Note was loaded.",
+                details={
+                    "job_id": job_id,
+                    "expected_revision": expected_revision,
+                    "current_revision": job.revision,
+                },
+            )
+        source_draft = _latest_draft(store, job_id, source_revision.checkpoint_key)
+        source_draft_version = (
+            _positive_int(source_draft.payload.get("draft_version"), 1)
+            if source_draft is not None
+            else 0
+        )
+        if source_draft_version != expected_draft_version:
+            raise RevisionConflict(
+                "The published Note draft changed after it was loaded.",
+                details={
+                    "expected_draft_version": expected_draft_version,
+                    "current_draft_version": source_draft_version,
+                },
+            )
+        candidate_version = max(
+            (
+                _positive_int(item.payload.get("candidate_version"), index + 2)
+                for index, item in enumerate(revisions)
+            ),
+            default=1,
+        ) + 1
+        target_key = (
+            f"revision_manual_{candidate_version:08d}_"
+            f"{hashlib.sha256(idempotency_key.encode('utf-8')).hexdigest()[:12]}"
+        )
+        source_payload = source_revision.payload
+        current_document = _document(source_payload.get("after_document"))
+        current_checkpoint = source_payload.get("after_checkpoint")
+        current_sha256 = source_payload.get("after_sha256")
+        target, _ = store.put_checkpoint(
+            job_id,
+            stage=SUMMARY_REVISION_STAGE,
+            checkpoint_key=target_key,
+            payload={
+                "schema_version": SUMMARY_REVISION_SCHEMA_VERSION,
+                "structuring_generation": source_payload.get("structuring_generation"),
+                "candidate_version": candidate_version,
+                "corrections_sha256": source_payload.get("corrections_sha256"),
+                "text_correction_count": 0,
+                "speaker_rename_count": 0,
+                "before_sha256": current_sha256,
+                "after_sha256": current_sha256,
+                "before_document": current_document,
+                "after_document": current_document,
+                "before_checkpoint": current_checkpoint,
+                "after_checkpoint": current_checkpoint,
+                "changed": True,
+                "diff": "",
+                "diff_truncated": False,
+                "source": "published_human_amendment",
+                "source_revision_key": source_revision.checkpoint_key,
+                "source_manifest_sha256": source_decision.payload.get(
+                    "artifact_manifest_sha256"
+                ),
+                "manual_edit_idempotency_key": idempotency_key,
+            },
+        )
+
+    target_key = target.checkpoint_key
+    latest = _latest_draft(store, job_id, target_key)
+    if latest is not None:
+        if latest.payload.get("markdown_sha256") != digest:
+            raise RevisionConflict(
+                "The manual Note version already exists with different content."
+            )
+    else:
+        source_draft = _latest_draft(store, job_id, source_revision.checkpoint_key)
+        store.put_checkpoint(
+            job_id,
+            stage=SUMMARY_REVISION_DRAFT_STAGE,
+            checkpoint_key=f"{target_key}_draft_{1:08d}",
+            payload={
+                "schema_version": SUMMARY_REVISION_DRAFT_SCHEMA_VERSION,
+                "summary_revision_key": target_key,
+                "draft_version": 1,
+                "markdown": markdown,
+                "markdown_sha256": digest,
+                "previous_markdown_sha256": (
+                    source_draft.payload.get("markdown_sha256")
+                    if source_draft is not None
+                    else source_decision.payload.get("draft_sha256")
+                ),
+                "idempotency_key": idempotency_key,
+                "saved_at": datetime.now(UTC).isoformat(),
+            },
+        )
+
+    prior_target_decision = _checkpoint_by_key(
+        store.list_checkpoints(job_id, stage=SUMMARY_REVISION_DECISION_STAGE),
+        target_key,
+    )
+    if (
+        prior_target_decision is not None
+        and _decision_status(prior_target_decision.payload)
+        is SummaryRevisionStatus.ACCEPTED
+    ):
+        return SummaryRevisionDraftResult(
+            revision=_view_by_key(store, job_id, target_key),
+            job=store.get_job(job_id),
+            saved=False,
+        )
+
+    draft_provenance = {
+        "source": "human_draft",
+        "summary_revision_key": target_key,
+        "draft_version": 1,
+        "markdown_sha256": digest,
+        "updated_at": datetime.now(UTC).isoformat(),
+    }
+    artifact = ArtifactGenerator(store).generate(
+        job_id,
+        force=True,
+        note_body_override=markdown,
+        note_revision_provenance=draft_provenance,
+    )
+    store.put_checkpoint(
+        job_id,
+        stage=SUMMARY_REVISION_DECISION_STAGE,
+        checkpoint_key=target_key,
+        payload={
+            "schema_version": "1.0.0",
+            "status": SummaryRevisionStatus.ACCEPTED.value,
+            "decided_at": datetime.now(UTC).isoformat(),
+            "idempotency_key": idempotency_key,
+            "artifact_manifest_sha256": artifact.manifest_sha256,
+            "draft_sha256": digest,
+            "source_revision_key": source_revision.checkpoint_key,
+        },
+    )
+    return SummaryRevisionDraftResult(
+        revision=_view_by_key(store, job_id, target_key),
+        job=store.get_job(job_id),
         saved=True,
     )
 

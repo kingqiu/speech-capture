@@ -23,7 +23,8 @@ export const REQUIRED_STAGE_I_FEATURES = Object.freeze([
   "publication_leases",
   "atomic_vault_publication",
   "review_audio_ranges",
-  "worker_readiness"
+  "worker_readiness",
+  "job_data_deletion"
 ]);
 
 export interface WorkerTransportResponse {

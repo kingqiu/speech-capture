@@ -317,6 +317,9 @@ class JobSchema(PublicSchema):
     last_error_message: str | None
     created_at: str
     updated_at: str
+    source_audio_status: Literal["available", "deleted"]
+    source_audio_deleted_at: str | None
+    source_audio_deleted_bytes: int = Field(ge=0)
 
 
 class JobEnvelope(PublicSchema):
@@ -331,6 +334,19 @@ class JobActionRequestSchema(PublicSchema):
 class JobActionEnvelope(PublicSchema):
     job: JobSchema
     applied: bool
+
+
+class JobSourceAudioDeletionEnvelope(PublicSchema):
+    job: JobSchema
+    deleted: bool
+    deleted_bytes: int = Field(ge=0)
+    deleted_at: str
+
+
+class JobDeletionEnvelope(PublicSchema):
+    job_id: JobIdentifier
+    deleted_bytes: int = Field(ge=0)
+    published_target_relative_path: str | None
 
 
 class JobListResponse(PublicSchema):

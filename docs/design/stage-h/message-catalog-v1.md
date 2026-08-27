@@ -20,6 +20,11 @@
 | `speechCapture.workbench.subtitle` | 把长录音安全地转成逐字稿和可用笔记 | 首页副标题 |
 | `speechCapture.task.new` | 新建任务 | 任务列表与空状态 |
 | `speechCapture.task.current` | 当前任务 | 窄窗口任务选择器 |
+| `speechCapture.task.manageRecord` | 管理记录和空间 | 终态任务的左栏省略号动作 |
+| `speechCapture.task.deleteSourceAudio` | 仅删除原始音频 | 永久清理 Worker 音频并保留文字产物 |
+| `speechCapture.task.deleteRecord` | 删除整条语音记录 | Vault 目录进废纸篓后永久删除 Worker 任务 |
+| `speechCapture.task.deleteKeep` | 保留，不删除 | 两种删除确认的安全返回 |
+| `speechCapture.task.deleteRetry` | 手动重试 | 删除失败后的原位重试动作 |
 | `speechCapture.note.openClean` | 打开纯净 Note | 任务页 |
 | `speechCapture.timeline.open` | 打开时间线 | 任务页 |
 | `speechCapture.transcript.openReview` | 复核逐字稿 | 任务页 |

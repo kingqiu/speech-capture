@@ -265,7 +265,9 @@ class FakeStructuringEngine:
             "risks": [],
             "open_questions": [],
         }
-        if content_type is not ContentType.MEETING:
+        if content_type is ContentType.MEETING:
+            document["objective"] = {"text": text, "evidence": evidence}
+        else:
             scene_kind = {
                 ContentType.INTERVIEW: "viewpoint",
                 ContentType.COURSE: "concept",
@@ -2021,9 +2023,18 @@ def test_meeting_profile_preserves_approved_document_contract() -> None:
     schema = _document_json_schema(ContentType.MEETING)
 
     assert "scene_sections" not in schema["properties"]
+    assert "objective" in schema["properties"]
+    assert "objective" in schema["required"]
     assert "topics" in schema["required"]
     assert "discussion_threads" in schema["required"]
     assert "timeline_sections" in schema["required"]
+
+
+def test_nonmeeting_profiles_do_not_gain_meeting_objective() -> None:
+    schema = _document_json_schema(ContentType.INTERVIEW)
+
+    assert "objective" not in schema["properties"]
+    assert "objective" not in schema["required"]
 
 
 def test_meeting_quality_repair_preserves_timeline_and_accepts_unified_discussion_edit() -> None:
