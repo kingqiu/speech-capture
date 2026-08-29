@@ -18,6 +18,8 @@ from typing import Any, Protocol
 from uuid import uuid4
 
 from speech_capture_worker.audio_preprocessing import AudioPreprocessor, NormalizedAudioPlan
+from speech_capture_worker.content_profile_prompts import MeetingProfilePrompts
+from speech_capture_worker.content_profiles import ProfileBundle, ProfileReference
 from speech_capture_worker.corrections import CorrectionField, corrections_sha256
 from speech_capture_worker.domain import JobRecord, JobState, ResourceStatus
 from speech_capture_worker.errors import (
@@ -628,6 +630,7 @@ class OllamaStructuringEngine:
         *,
         model: str = "qwen3:14b",
         editor_model: str = "qwen3:8b",
+        meeting_profile: ProfileBundle | None = None,
     ) -> None:
         if not isinstance(model, str) or not model.strip() or len(model) > 200:
             raise InvalidJobRequest("Ollama model name is invalid.")
@@ -638,6 +641,34 @@ class OllamaStructuringEngine:
         self.model_id = f"ollama/{self.model};editor={self.editor_model}"
         self.recording_context: str | None = None
         self._generation_metrics: list[dict[str, Any]] = []
+        self._meeting_profile_prompts = (
+            MeetingProfilePrompts.from_bundle(meeting_profile)
+            if meeting_profile is not None
+            else None
+        )
+        self.meeting_profile_reference: ProfileReference | None = (
+            meeting_profile.reference if meeting_profile is not None else None
+        )
+
+    def _extraction_profile_guidance(self, content_type: ContentType) -> str:
+        if content_type is ContentType.MEETING and self._meeting_profile_prompts is not None:
+            return self._meeting_profile_prompts.extraction
+        return extraction_guidance(content_type.value)
+
+    def _synthesis_profile_guidance(self, content_type: ContentType) -> str:
+        if content_type is ContentType.MEETING and self._meeting_profile_prompts is not None:
+            return self._meeting_profile_prompts.synthesis
+        return synthesis_guidance(content_type.value)
+
+    def _meeting_quality_profile_guidance(self) -> str:
+        if self._meeting_profile_prompts is not None:
+            return self._meeting_profile_prompts.quality_edit
+        return synthesis_guidance(ContentType.MEETING.value)
+
+    def _meeting_outcomes_profile_guidance(self) -> str:
+        if self._meeting_profile_prompts is None:
+            return ""
+        return self._meeting_profile_prompts.meeting_outcomes + "\n"
 
     def set_recording_context(self, context: str | None) -> None:
         self.recording_context = normalize_recording_context(context)
@@ -691,7 +722,7 @@ class OllamaStructuringEngine:
             "必须通读并均匀覆盖本批的"
             "开头、中段和结尾，不能在达到某个条数后丢弃后半段；宁可减少同一案例的细枝末节，也"
             "不能遗漏后续出现的独立人物、组织、项目、案例、结论或行动。\n"
-            + extraction_guidance(content_type.value)
+            + self._extraction_profile_guidance(content_type)
             + _recording_context_prompt(self.recording_context)
             + f"\n内容类型：{content_type.value}。文字段：\n"
             + json.dumps(segments, ensure_ascii=False)
@@ -724,7 +755,7 @@ class OllamaStructuringEngine:
             "batch_range 表示已经完整阅读过的连续原文范围，候选索引携带可回查的原文证据片段。"
             "请跨批次合并、核验并生成一篇可直接使用的完整笔记，而不是转写片段清单。只返回符合"
             " schema 的 JSON，不要解释。\n"
-            + synthesis_guidance(content_type.value)
+            + self._synthesis_profile_guidance(content_type)
             + "\n"
             + output_contract_guidance(content_type.value)
             + _recording_context_prompt(self.recording_context)
@@ -913,28 +944,48 @@ class OllamaStructuringEngine:
             "speaker_id 自己的一段发言，不复制其他人的观点。decisions 只写会上明确确认且会议"
             "结束时仍成立的规则、阈值、优先级、数据范围、机制、时间或取舍；具体提议后被明确"
             "回应‘可以’‘没问题’时，应联合提议与确认的证据判断，不得只丢下泛化结论。"
-            "actions 只写会后可交付、可验收动作；task 在原文明示时应包含交付物或验收结果，只有原文明示时"
-            "填写 owner 和 deadline；risks 只写明确风险或依赖；open_questions 只写会议结束时仍"
+            "actions 只写会后可交付、可验收动作；task 在原文明示时应包含交付物或验收结果，"
+            "只有原文明示时填写 owner 和 deadline；risks 只写明确风险或依赖；open_questions "
+            "只写会议结束时仍"
             "未回答且没有责任动作的问题。口头语、笑声、脏话、输入法闲聊、普通问句、现场随口"
             "指令和指代不明碎片不得进入任何结果栏目。没有可靠内容的栏目返回空数组，禁止凑数。"
             "每项 evidence 只能使用下方 segment_id。\n"
-            + synthesis_guidance(ContentType.MEETING.value)
+            + self._meeting_quality_profile_guidance()
             + _recording_context_prompt(self.recording_context)
             + "\n现有会议文档（只作为待校验候选）：\n"
             + json.dumps(document, ensure_ascii=False)
             + "\n统一校订阅读包（已去除纯口头承接，仍保持时间顺序和所有实质发言者）：\n"
             + json.dumps(quality_segments, ensure_ascii=False)
         )
-        return _parse_json_object(
-            self._generate(
-                prompt,
-                format_schema=_document_json_schema(ContentType.MEETING),
-                model=self.editor_model,
-                num_predict=6144,
-                num_ctx=GLOBAL_SYNTHESIS_CONTEXT_TOKENS,
-                timeout_seconds=1200,
-            )
+        schema = _document_json_schema(ContentType.MEETING)
+        response = self._generate(
+            prompt,
+            format_schema=schema,
+            model=self.editor_model,
+            num_predict=6144,
+            num_ctx=GLOBAL_SYNTHESIS_CONTEXT_TOKENS,
+            timeout_seconds=1200,
         )
+        try:
+            return _parse_json_object(response)
+        except StructuringFailed as exc:
+            if str(exc) not in {
+                "The Ollama engine did not return a JSON object.",
+                "The Ollama engine returned unparsable JSON.",
+            }:
+                raise
+        retry_response = self._generate(
+            prompt
+            + "\n上一次质量编辑输出未形成完整 JSON。请重新返回完整对象，保留所有可靠栏目，"
+            "确保字符串、数组和对象全部闭合，不要输出 JSON 之外的文字。",
+            format_schema=schema,
+            model=self.editor_model,
+            num_predict=8192,
+            num_ctx=GLOBAL_SYNTHESIS_CONTEXT_TOKENS,
+            timeout_seconds=1200,
+            retry_attempt=1,
+        )
+        return _parse_json_object(retry_response)
 
     def synthesize_meeting_topics(
         self,
@@ -949,7 +1000,8 @@ class OllamaStructuringEngine:
             "数据来源与字段映射、更新同步机制、系统配置、业务流程、排产规则等"
             "独立问题应分别成章，但不要为凑数量拆分同一问题。明确数量、比例阈值、时间范围、"
             "优先顺序、表名、字段和验收条件必须原样保留；多层匹配或回退规则按顺序分别写清。"
-            "每个主题包含具体 title、连贯 summary、1-6 条有信息量的 details 和 1-3 条最直接 evidence。"
+            "每个主题包含具体 title、连贯 summary、1-6 条有信息量的 details 和 1-3 条最直接 "
+            "evidence。"
             "同一事实不得换词复制到多个主题。不得收录寒暄、口头语、"
             "输入法闲聊、待办清单复述或 Meta 描述；不得添加逐字稿没有的信息。evidence 只能使用"
             "下方 segment_id。\n"
@@ -986,7 +1038,8 @@ class OllamaStructuringEngine:
             "additionalProperties": False,
         }
         outcome_prompt = (
-            "你是会议结果核对员。只返回 schema 要求的 JSON，不要解释。decisions 只写会上明确"
+            self._meeting_outcomes_profile_guidance()
+            + "你是会议结果核对员。只返回 schema 要求的 JSON，不要解释。decisions 只写会上明确"
             "确认且会议结束仍成立的规则、比例阈值、优先级、数据范围、机制、时间或取舍；需要同时"
             "引用提议和确认时必须用 2-3 条 evidence。‘好’‘可以’‘没问题’和阶段介绍本身不是决定，"
             "但它们若明确回应一条具体规则或方案，应与被回应的提议合并核对；明确同意暂缓某范围、固定周期机制或确定"

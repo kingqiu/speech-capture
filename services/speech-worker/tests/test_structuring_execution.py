@@ -18,6 +18,7 @@ from speech_capture_worker.alignment import (
     TranscriptAlignmentFinalizer,
 )
 from speech_capture_worker.asr_execution import AsrChunkExecutor, AsrRunOutcome
+from speech_capture_worker.content_profile_prompts import load_bundled_meeting_profile
 from speech_capture_worker.corrections import CorrectionField
 from speech_capture_worker.domain import JobState, ResourceStatus, UploadCreateRequest
 from speech_capture_worker.errors import InvalidJobRequest, StructuringFailed
@@ -2000,6 +2001,88 @@ def test_ollama_engine_requires_valid_model_name() -> None:
         OllamaStructuringEngine(model="   ")
 
 
+def test_ollama_engine_keeps_builtin_prompts_without_explicit_profile(monkeypatch) -> None:
+    engine = OllamaStructuringEngine(model="qwen3:14b", editor_model="qwen3:8b")
+    prompts: list[str] = []
+
+    def generate(prompt, **kwargs):
+        prompts.append(prompt)
+        if kwargs["format_schema"].get("type") == "array":
+            return "[]"
+        return "{}"
+
+    monkeypatch.setattr(engine, "_generate", generate)
+    segments = [{"segment_id": "seg_1", "text": "确认测试边界。", "speaker_id": "speaker_1"}]
+
+    engine.extract_batch(segments, content_type=ContentType.MEETING)
+    engine.synthesize_document([], segments, content_type=ContentType.MEETING)
+
+    assert engine.meeting_profile_reference is None
+    assert all("这是会议纪要。必须先还原会议背景" in prompt for prompt in prompts)
+    assert all("信息优先级不由发言长度或出现顺序决定" not in prompt for prompt in prompts)
+    assert all("输出顺序和阅读逻辑" not in prompt for prompt in prompts)
+
+
+def test_explicit_meeting_profile_supplies_all_four_prompt_slots(monkeypatch) -> None:
+    profile = load_bundled_meeting_profile()
+    engine = OllamaStructuringEngine(
+        model="qwen3:14b",
+        editor_model="qwen3:8b",
+        meeting_profile=profile,
+    )
+    prompts: list[str] = []
+
+    def generate(prompt, **kwargs):
+        prompts.append(prompt)
+        schema = kwargs["format_schema"]
+        if schema.get("type") == "array":
+            return "[]"
+        if set(schema.get("required", [])) == {
+            "decisions",
+            "actions",
+            "risks",
+            "open_questions",
+        }:
+            return '{"decisions":[],"actions":[],"risks":[],"open_questions":[]}'
+        return "{}"
+
+    monkeypatch.setattr(engine, "_generate", generate)
+    segments = [{"segment_id": "seg_1", "text": "确认测试边界。", "speaker_id": "speaker_1"}]
+
+    engine.extract_batch(segments, content_type=ContentType.MEETING)
+    engine.synthesize_document([], segments, content_type=ContentType.MEETING)
+    engine.refine_meeting_document({}, segments)
+    engine.refine_meeting_outcomes({}, segments)
+
+    assert engine.meeting_profile_reference == profile.reference
+    assert "信息优先级不由发言长度或出现顺序决定" in prompts[0]
+    assert "输出顺序和阅读逻辑" in prompts[1]
+    assert "质量复核必须检查会议主线" in prompts[2]
+    assert "只核对会议结果栏目" in prompts[3]
+
+
+def test_meeting_profile_never_changes_nonmeeting_prompt_selection(monkeypatch) -> None:
+    engine = OllamaStructuringEngine(
+        model="qwen3:14b",
+        editor_model="qwen3:8b",
+        meeting_profile=load_bundled_meeting_profile(),
+    )
+    captured: dict[str, str] = {}
+
+    def generate(prompt, **kwargs):
+        captured["prompt"] = prompt
+        return "[]"
+
+    monkeypatch.setattr(engine, "_generate", generate)
+    engine.extract_batch(
+        [{"segment_id": "seg_1", "text": "受访者说明个人经历。"}],
+        content_type=ContentType.INTERVIEW,
+    )
+
+    assert "这是访谈笔记" in captured["prompt"]
+    assert "信息优先级不由发言长度或出现顺序决定" not in captured["prompt"]
+
+
 @pytest.mark.parametrize(
     ("kind", "text"),
     [
@@ -2085,6 +2168,30 @@ def test_meeting_quality_editor_uses_one_unified_full_document_call(monkeypatch)
         "risks",
         "open_questions",
     }.issubset(requests[0]["format_schema"]["required"])
+
+
+def test_meeting_quality_editor_retries_truncated_json(monkeypatch) -> None:
+    engine = OllamaStructuringEngine(model="qwen3:14b", editor_model="qwen3:8b")
+    responses = iter(['{"title":"未闭合"', '{"title":"完整质量文档"}'])
+    requests = []
+
+    def generate(prompt, **kwargs):
+        requests.append({"prompt": prompt, **kwargs})
+        return next(responses)
+
+    monkeypatch.setattr(engine, "_generate", generate)
+
+    document = engine.refine_meeting_document(
+        {},
+        [{"segment_id": "seg_retry", "text": "完整原文。", "speaker_id": "speaker_1"}],
+    )
+
+    assert document == {"title": "完整质量文档"}
+    assert len(requests) == 2
+    assert requests[0]["num_predict"] == 6144
+    assert requests[1]["num_predict"] == 8192
+    assert requests[1]["retry_attempt"] == 1
+    assert "上一次质量编辑输出未形成完整 JSON" in requests[1]["prompt"]
 
 
 @pytest.mark.parametrize(

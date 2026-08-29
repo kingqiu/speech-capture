@@ -1,0 +1,19 @@
+{
+  "renderer_version": "1.0.0",
+  "document_schema_version": "1.0.0",
+  "sections": [
+    {"field": "objective", "heading": "会议目标", "when": "nonempty"},
+    {"field": "summary", "heading": "内容总结", "when": "always"},
+    {"field": "context", "heading": "背景与参与方", "when": "nonempty"},
+    {"field": "topics", "heading": "主要讨论与结论", "when": "nonempty"},
+    {"field": "discussion_threads", "heading": "讨论演变", "when": "nonempty"},
+    {"field": "speaker_summaries", "heading": "参与者与各方观点", "when": "nonempty"},
+    {"field": "highlights", "heading": "核心结论", "when": "nonempty"},
+    {"field": "decisions", "heading": "会议决议", "when": "nonempty"},
+    {"field": "actions", "heading": "待办事项", "when": "nonempty"},
+    {"field": "risks", "heading": "风险与待确认项", "when": "nonempty"},
+    {"field": "open_questions", "heading": "仍待确认的问题", "when": "nonempty"}
+  ],
+  "timeline_output": "separate_markdown",
+  "evidence_output": "separate_markdown"
+}
