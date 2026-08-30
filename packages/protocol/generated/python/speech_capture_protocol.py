@@ -2,7 +2,7 @@
 
 from typing import Final, Literal, NotRequired, TypeAlias, TypedDict
 
-OPENAPI_SHA256: Final = "51f281bb42687685c3499046ae13553c5aa54427c4daa5c06e5f3210df904e01"
+OPENAPI_SHA256: Final = "464e1155558ad4ca57acec210d42ea848371e0af959281126dbad6e4ebdc34f8"
 OPENAPI_VERSION: Final = "3.1.0"
 PROTOCOL_VERSION: Final = "1.0.0"
 
@@ -61,6 +61,7 @@ ProtocolCapability: TypeAlias = Literal[
     'content_type_override',
     'correction_ledger',
     'summary_revisions',
+    'background_summary_regeneration',
     'evidence_linked_artifacts',
     'publication_leases',
     'atomic_vault_publication',
@@ -342,6 +343,19 @@ class SpeakerDisplayNameRequestSchema(TypedDict):
     expected_revision: int
     speaker_id: str
 
+class SummaryRegenerationStatusSchema(TypedDict):
+    elapsed_seconds: float
+    error_code: str | None
+    error_message: str | None
+    finished_at: str | None
+    phase: Literal['queued', 'preparing', 'synthesizing', 'quality_review', 'validating', 'completed', 'failed']
+    request_id: str
+    requested_at: str
+    revision_key: str | None
+    started_at: str | None
+    state: Literal['queued', 'running', 'succeeded', 'failed']
+    updated_at: str
+
 class SummaryRevisionDecisionRequestSchema(TypedDict):
     decision: Literal['accepted', 'rejected']
     expected_revision: int
@@ -541,12 +555,13 @@ class SummaryRevisionListResponse(TypedDict):
     can_regenerate: bool
     current_version: int
     manual_section_markdown: str
+    regeneration: SummaryRegenerationStatusSchema | None
     revisions: list[SummaryRevisionSchema]
 
 class SummaryRevisionRegenerationEnvelope(TypedDict):
     applied: bool
     job: JobSchema
-    revision: SummaryRevisionSchema
+    regeneration: SummaryRegenerationStatusSchema
 
 class UploadEnvelope(TypedDict):
     created: NotRequired[bool | None]
@@ -655,6 +670,7 @@ __all__ = [
     "SpeakerDisplayNameEnvelope",
     "SpeakerDisplayNameRequestSchema",
     "SpeakerLabelStatus",
+    "SummaryRegenerationStatusSchema",
     "SummaryRevisionDecisionEnvelope",
     "SummaryRevisionDecisionRequestSchema",
     "SummaryRevisionDraftEnvelope",

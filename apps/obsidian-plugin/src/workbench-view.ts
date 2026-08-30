@@ -704,15 +704,19 @@ export class SpeechWorkbenchView extends ItemView {
         this.taskDetailMode = "summary";
         this.render();
       });
-    } else if (this.summaryRevisions?.can_regenerate) {
+    } else if (
+      this.summaryRevisions?.can_regenerate ||
+      this.activeSummaryRegeneration()
+    ) {
+      const backgroundActive = this.activeSummaryRegeneration();
       const regenerate = headingActions.createEl("button", {
         cls: "mod-cta",
-        text: this.summaryRegenerating
+        text: this.summaryRegenerating || backgroundActive
           ? "正在生成候选…"
           : "生成新版笔记候选",
         attr: { type: "button" }
       });
-      regenerate.disabled = this.summaryRegenerating;
+      regenerate.disabled = this.summaryRegenerating || backgroundActive;
       regenerate.addEventListener("click", () => void this.regenerateSummary());
     }
     if ((this.summaryRevisions?.revisions.length ?? 0) > 0) {
@@ -850,7 +854,19 @@ export class SpeechWorkbenchView extends ItemView {
   }
 
   private renderSummaryRegenerationStatus(parent: HTMLElement): void {
-    const feedback = this.summaryRegenerationFeedback;
+    const regeneration = this.summaryRevisions?.regeneration ?? null;
+    const backgroundActive =
+      regeneration?.state === "queued" || regeneration?.state === "running";
+    const feedback = backgroundActive
+      ? { state: "working" as const, message: "正在生成新版笔记候选。" }
+      : regeneration?.state === "failed"
+        ? {
+            state: "error" as const,
+            message:
+              regeneration.error_message ??
+              "候选笔记生成失败；当前已发布 Note 保持不变。"
+          }
+        : this.summaryRegenerationFeedback;
     if (!feedback) {
       return;
     }
@@ -876,13 +892,13 @@ export class SpeechWorkbenchView extends ItemView {
       cls: "speech-capture-summary-regeneration__phase",
       text:
         feedback.state === "working"
-          ? this.summaryRegenerationPhase()
+          ? this.summaryRegenerationPhase(regeneration?.phase)
           : feedback.message
     });
     if (feedback.state === "working") {
       copy.createEl("p", {
         cls: "speech-capture-summary-regeneration__elapsed",
-        text: `已用时 ${this.summaryRegenerationElapsed()}`
+        text: `已用时 ${this.summaryRegenerationElapsed(regeneration?.elapsed_seconds)}`
       });
       const progress = copy.createDiv({
         cls: "speech-capture-progress is-indeterminate",
@@ -3421,7 +3437,6 @@ export class SpeechWorkbenchView extends ItemView {
     if (
       this.reviewSaving ||
       this.speakerRenameSaving ||
-      this.summaryRegenerating ||
       this.summaryDecisionSaving
     ) {
       return;
@@ -3518,6 +3533,7 @@ export class SpeechWorkbenchView extends ItemView {
       this.selectedSnapshot = selectedSnapshot;
       this.corrections = corrections;
       this.summaryRevisions = summaryRevisions;
+      this.reconcileSummaryRegenerationStatus();
       if (this.selectedSnapshot) {
         if (
           this.selectedSummaryRevisionKey &&
@@ -3963,9 +3979,16 @@ export class SpeechWorkbenchView extends ItemView {
   }
 
   private summaryRevisionSignature(): string {
-    return (this.summaryRevisions?.revisions ?? [])
+    const revisions = (this.summaryRevisions?.revisions ?? [])
       .map((revision) => `${revision.revision_key}:${revision.status}`)
       .join("|");
+    const regeneration = this.summaryRevisions?.regeneration;
+    return `${revisions}|${regeneration?.request_id ?? "none"}:${regeneration?.state ?? "none"}:${regeneration?.phase ?? "none"}`;
+  }
+
+  private activeSummaryRegeneration(): boolean {
+    const state = this.summaryRevisions?.regeneration?.state;
+    return state === "queued" || state === "running";
   }
 
   private isNarrowWorkbench(): boolean {
@@ -4492,11 +4515,11 @@ export class SpeechWorkbenchView extends ItemView {
       }
       this.reviewMutationEpoch += 1;
       this.applySummaryRegenerationResult(result);
-      this.selectedSummaryRevisionKey = result.revision.revision_key;
-      this.taskDetailMode = "summary";
       this.summaryRegenerating = false;
-      this.summaryRegenerationFeedback = null;
-      this.stopSummaryRegenerationTimer();
+      this.summaryRegenerationFeedback = {
+        state: "working",
+        message: "Worker 已接收请求，正在后台生成候选笔记。"
+      };
       this.render();
       void this.refreshJobs("manual");
     } catch (error) {
@@ -4533,17 +4556,12 @@ export class SpeechWorkbenchView extends ItemView {
       this.selectedSnapshot = { ...this.selectedSnapshot, job: result.job };
     }
     const existing = this.summaryRevisions;
-    const revisions = [
-      ...(existing?.revisions ?? []).filter(
-        (revision) => revision.revision_key !== result.revision.revision_key
-      ),
-      result.revision
-    ];
     this.summaryRevisions = {
-      revisions,
-      current_version: existing?.current_version ?? result.revision.base_version,
+      revisions: existing?.revisions ?? [],
+      current_version: existing?.current_version ?? 1,
       manual_section_markdown: existing?.manual_section_markdown ?? "",
-      can_regenerate: false
+      can_regenerate: existing?.can_regenerate ?? true,
+      regeneration: result.regeneration
     };
   }
 
@@ -4572,13 +4590,33 @@ export class SpeechWorkbenchView extends ItemView {
     }
   }
 
-  private summaryRegenerationElapsed(): string {
+  private summaryRegenerationElapsed(recordedSeconds?: number): string {
+    if (recordedSeconds !== undefined) {
+      const base = this.summaryRegenerationStartedAt;
+      const additional = base === null ? 0 : Math.max(0, Date.now() - base);
+      return formatDuration(recordedSeconds * 1_000 + additional);
+    }
     return formatDuration(
       Math.max(0, Date.now() - (this.summaryRegenerationStartedAt ?? Date.now()))
     );
   }
 
-  private summaryRegenerationPhase(): string {
+  private summaryRegenerationPhase(phase?: string): string {
+    if (phase === "queued") {
+      return "请求已保存，正在等待 Worker 开始。关闭或重新打开 Obsidian 不会丢失。";
+    }
+    if (phase === "preparing") {
+      return "Worker 正在校验逐字稿、修订记录和结构化证据。";
+    }
+    if (phase === "synthesizing") {
+      return "正在根据完整会议内容生成新版笔记正文。";
+    }
+    if (phase === "quality_review") {
+      return "正在复核议题、决定、行动项与证据引用。";
+    }
+    if (phase === "validating") {
+      return "正在做最终结构与证据校验，当前 Note 尚未改变。";
+    }
     const elapsed = Math.max(
       0,
       Date.now() - (this.summaryRegenerationStartedAt ?? Date.now())
@@ -4593,6 +4631,44 @@ export class SpeechWorkbenchView extends ItemView {
       return "仍在生成候选；已保存的文字与说话人修订会纳入结果。";
     }
     return "仍在处理长录音；页面会持续计时，最多等待 1 小时后明确失败。";
+  }
+
+  private reconcileSummaryRegenerationStatus(): void {
+    const regeneration = this.summaryRevisions?.regeneration;
+    if (!regeneration) {
+      return;
+    }
+    if (regeneration.state === "queued" || regeneration.state === "running") {
+      const parsed = Date.parse(regeneration.updated_at);
+      this.summaryRegenerationStartedAt = Number.isNaN(parsed) ? Date.now() : parsed;
+      this.summaryRegenerationFeedback = {
+        state: "working",
+        message: "正在生成新版笔记候选。"
+      };
+      if (this.summaryRegenerationTimer === null) {
+        this.startSummaryRegenerationTimer();
+      }
+      return;
+    }
+    this.stopSummaryRegenerationTimer();
+    if (regeneration.state === "failed") {
+      this.summaryRegenerationFeedback = {
+        state: "error",
+        message:
+          regeneration.error_message ??
+          "候选笔记生成失败；当前已发布 Note 保持不变。"
+      };
+      return;
+    }
+    this.summaryRegenerationFeedback = null;
+    if (
+      regeneration.revision_key &&
+      this.summaryRevisions?.revisions.some(
+        (revision) => revision.revision_key === regeneration.revision_key
+      )
+    ) {
+      this.selectedSummaryRevisionKey = regeneration.revision_key;
+    }
   }
 
   private async preparePublication(

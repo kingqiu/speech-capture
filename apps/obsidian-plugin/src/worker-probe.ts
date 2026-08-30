@@ -19,6 +19,7 @@ export const REQUIRED_STAGE_I_FEATURES = Object.freeze([
   "recording_context",
   "correction_ledger",
   "summary_revisions",
+  "background_summary_regeneration",
   "evidence_linked_artifacts",
   "publication_leases",
   "atomic_vault_publication",

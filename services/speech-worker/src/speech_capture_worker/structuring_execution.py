@@ -2438,6 +2438,10 @@ class StructuringExecutor:
                 automatic_classification,
                 job.content_type_override,
             )
+            content_profile_reference = _active_content_profile_reference(
+                self.engine,
+                classification.type,
+            )
             batches = _build_batches(
                 transcribed,
                 max_chars=self._batch_max_chars,
@@ -2457,6 +2461,7 @@ class StructuringExecutor:
                         "kind": "evidence_extraction",
                         "model_id": self.engine.model_id,
                         "prompt_version": NOTE_PROMPT_VERSION,
+                        "content_profile_reference": content_profile_reference,
                         "recording_context_sha256": recording_context_sha256(recording_context),
                         "normalized_sha256": plan.normalized_sha256,
                         "segments_sha256": segments_sha256,
@@ -2566,6 +2571,7 @@ class StructuringExecutor:
                             "kind": "synthesis_packet",
                             "model_id": self.engine.model_id,
                             "prompt_version": NOTE_PROMPT_VERSION,
+                            "content_profile_reference": content_profile_reference,
                             "recording_context_sha256": recording_context_sha256(
                                 recording_context
                             ),
@@ -2635,6 +2641,7 @@ class StructuringExecutor:
                             "kind": "document_candidate",
                             "model_id": self.engine.model_id,
                             "prompt_version": NOTE_PROMPT_VERSION,
+                            "content_profile_reference": content_profile_reference,
                             "packet_fingerprint": packet_fingerprint,
                             "manual_corrections_sha256": corrections_digest,
                             "content_type": classification.type.value,
@@ -2765,6 +2772,7 @@ class StructuringExecutor:
                             "kind": "quality_edit",
                             "model_id": self.engine.model_id,
                             "prompt_version": NOTE_PROMPT_VERSION,
+                            "content_profile_reference": content_profile_reference,
                             "meeting_quality_version": MEETING_QUALITY_REPAIR_VERSION,
                             "interview_quality_version": INTERVIEW_QUALITY_REPAIR_VERSION,
                             "voice_memo_quality_version": VOICE_MEMO_QUALITY_REPAIR_VERSION,
@@ -2909,6 +2917,7 @@ class StructuringExecutor:
                 "schema_version": STRUCTURING_RAW_SCHEMA_VERSION,
                 "prompt_version": NOTE_PROMPT_VERSION,
                 "model_id": self.engine.model_id,
+                "content_profile_reference": content_profile_reference,
                 "recording_context_schema_version": RECORDING_CONTEXT_SCHEMA_VERSION,
                 "recording_context_sha256": recording_context_sha256(recording_context),
                 "recording_context_applied": recording_context is not None,
@@ -2966,6 +2975,7 @@ class StructuringExecutor:
                     "schema_version": STRUCTURING_SCHEMA_VERSION,
                     "prompt_version": NOTE_PROMPT_VERSION,
                     "model_id": self.engine.model_id,
+                    "content_profile_reference": content_profile_reference,
                     "recording_context_schema_version": RECORDING_CONTEXT_SCHEMA_VERSION,
                     "recording_context_sha256": recording_context_sha256(recording_context),
                     "recording_context_applied": recording_context is not None,
@@ -3062,8 +3072,15 @@ class StructuringExecutor:
             resource_report=resource_report,
         )
 
-    def resynthesize_document(self, job_id: str) -> StructuringResult:
+    def resynthesize_document(
+        self,
+        job_id: str,
+        *,
+        progress: Callable[[str], None] | None = None,
+    ) -> StructuringResult:
         """Regenerate only the global document from durable extraction evidence."""
+        if progress is not None:
+            progress("preparing")
         job = self.store.get_job(job_id)
         recording_context = self._configure_recording_context(job)
         if job.state not in {
@@ -3131,6 +3148,13 @@ class StructuringExecutor:
             automatic_classification,
             job.content_type_override,
         )
+        content_profile_reference = _active_content_profile_reference(
+            self.engine,
+            classification.type,
+        )
+        content_profile_changed = (
+            raw_payload.get("content_profile_reference") != content_profile_reference
+        )
         content_type_changed = classification.type is not prior_classification.type
         recording_context_changed = raw_payload.get(
             "recording_context_sha256"
@@ -3192,6 +3216,7 @@ class StructuringExecutor:
         )
         recovering_quality_candidate = (
             raw_payload.get("prompt_version") == NOTE_PROMPT_VERSION
+            and not content_profile_changed
             and raw_payload.get("document_candidate_stage") == "quality_editor"
             and isinstance(raw_payload.get("document_candidate"), dict)
             and not (
@@ -3276,7 +3301,10 @@ class StructuringExecutor:
         interview_quality_repair_version = raw_payload.get("interview_quality_repair_version")
         voice_memo_quality_repair_version = raw_payload.get("voice_memo_quality_repair_version")
         try:
-            if raw_payload.get("prompt_version") != NOTE_PROMPT_VERSION:
+            if (
+                raw_payload.get("prompt_version") != NOTE_PROMPT_VERSION
+                or content_profile_changed
+            ):
                 # A prompt-profile revision changes the contract of the whole
                 # Note, not just an individual outcome section. Reusing any
                 # previous document or editor candidate here would produce a
@@ -3360,6 +3388,8 @@ class StructuringExecutor:
                 )
             document_was_resynthesized = candidate is None
             if document_was_resynthesized:
+                if progress is not None:
+                    progress("synthesizing")
                 candidate = self._synthesize_document_with_speaker_coverage(
                     _synthesis_finding_payload(
                         findings,
@@ -3402,6 +3432,12 @@ class StructuringExecutor:
                 document_was_resynthesized
                 or voice_memo_quality_repair_version != VOICE_MEMO_QUALITY_REPAIR_VERSION
             )
+            if progress is not None and (
+                should_repair_meeting
+                or should_repair_interview
+                or should_repair_voice_memo
+            ):
+                progress("quality_review")
             quality_document = (
                 self._repair_meeting_quality(
                     repaired_document,
@@ -3460,6 +3496,8 @@ class StructuringExecutor:
                         segments=coverage_payload,
                     )
                     document_candidate = edited_document
+            if progress is not None:
+                progress("validating")
             validation_kwargs = {
                 "segment_ids": {segment.segment_id for segment in segments},
                 "speaker_ids": speaker_ids,
@@ -3535,6 +3573,7 @@ class StructuringExecutor:
         raw_payload["schema_version"] = STRUCTURING_RAW_SCHEMA_VERSION
         raw_payload["prompt_version"] = NOTE_PROMPT_VERSION
         raw_payload["model_id"] = self.engine.model_id
+        raw_payload["content_profile_reference"] = content_profile_reference
         raw_payload["classification"] = classification.to_dict()
         raw_payload["classification_source"] = classification_source
         raw_payload["automatic_classification"] = automatic_classification.to_dict()
@@ -3592,6 +3631,7 @@ class StructuringExecutor:
                 "schema_version": STRUCTURING_SCHEMA_VERSION,
                 "prompt_version": NOTE_PROMPT_VERSION,
                 "model_id": self.engine.model_id,
+                "content_profile_reference": content_profile_reference,
                 "content_type": classification.type,
                 "content_type_source": classification_source,
                 "automatic_content_type": automatic_classification.type,
@@ -8114,6 +8154,20 @@ def _structuring_cache_fingerprint(payload: dict[str, Any]) -> str:
         "payload": payload,
     }
     return hashlib.sha256(_canonical_json(envelope).encode("utf-8")).hexdigest()
+
+
+def _active_content_profile_reference(
+    engine: StructuringEngine,
+    content_type: ContentType,
+) -> dict[str, str] | None:
+    """Return the exact external Profile identity that can affect this content type."""
+
+    if content_type is not ContentType.MEETING:
+        return None
+    reference = getattr(engine, "meeting_profile_reference", None)
+    if not isinstance(reference, ProfileReference):
+        return None
+    return reference.to_dict()
 
 
 def _nonnegative_integer(value: Any) -> int:

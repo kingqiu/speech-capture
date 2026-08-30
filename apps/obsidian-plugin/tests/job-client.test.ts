@@ -305,7 +305,8 @@ describe("job client", () => {
         revisions: [revision],
         current_version: 1,
         manual_section_markdown: "## 我的补充\n\n人工内容。\n",
-        can_regenerate: false
+        can_regenerate: false,
+        regeneration: null
       }),
       response(200, {
         applied: true,
@@ -346,27 +347,21 @@ describe("job client", () => {
   });
 
   it("triggers one revision-bound note regeneration", async () => {
-    const revision = {
-      revision_key: "summary_revision_regenerated",
-      base_version: 1,
-      candidate_version: 2,
-      status: "pending",
-      changed: true,
-      text_correction_count: 1,
-      speaker_rename_count: 0,
-      before_document: { summary: { text: "旧总览" } },
-      after_document: { summary: { text: "新总览" } },
-      diff_truncated: false,
-      created_at: "2026-08-08T00:00:00Z",
-      decided_at: null,
-      artifact_manifest_sha256: null,
-      draft_markdown: null,
-      draft_version: 0,
-      draft_updated_at: null,
-      draft_sha256: null
+    const regeneration = {
+      request_id: "regen_test",
+      state: "queued",
+      phase: "queued",
+      requested_at: "2026-08-08T00:00:00Z",
+      started_at: null,
+      updated_at: "2026-08-08T00:00:00Z",
+      finished_at: null,
+      elapsed_seconds: 0,
+      revision_key: null,
+      error_code: null,
+      error_message: null
     };
     const transport = new QueueTransport([
-      response(200, { applied: true, job: JOB, revision })
+      response(200, { applied: true, job: JOB, regeneration })
     ]);
 
     const result = await regenerateJobSummary(
@@ -376,7 +371,7 @@ describe("job client", () => {
       JOB
     );
 
-    expect(result.revision.revision_key).toBe(revision.revision_key);
+    expect(result.regeneration.request_id).toBe(regeneration.request_id);
     expect(transport.requests[0]).toMatchObject({
       path: `/v1/jobs/${JOB.job_id}/summary-revisions`,
       body: { expected_revision: 4 }
@@ -384,7 +379,7 @@ describe("job client", () => {
     expect(transport.requests[0]?.headers?.["Idempotency-Key"]).toMatch(
       /^obsidian-[0-9a-f]{64}$/
     );
-    expect(transport.requests[0]?.timeoutMs).toBe(60 * 60_000);
+    expect(transport.requests[0]?.timeoutMs).toBe(15_000);
   });
 
   it("saves a version-bound human candidate Note draft", async () => {

@@ -17,6 +17,7 @@ import type {
   SummaryRevisionListResponse,
   SummaryRevisionRegenerationEnvelope,
   SummaryRevisionSchema,
+  SummaryRegenerationStatusSchema,
   TranscriptSegmentSchema
 } from "../../../packages/protocol/generated/typescript/speech-capture-protocol";
 
@@ -126,7 +127,8 @@ export async function listJobSummaryRevisions(
     !value.revisions.every(isSummaryRevision) ||
     typeof value.current_version !== "number" ||
     typeof value.manual_section_markdown !== "string" ||
-    typeof value.can_regenerate !== "boolean"
+    typeof value.can_regenerate !== "boolean" ||
+    !(value.regeneration === null || isSummaryRegeneration(value.regeneration))
   ) {
     throw new JobClientError("invalid", "Worker 返回了无法识别的笔记版本记录。");
   }
@@ -154,19 +156,50 @@ export async function regenerateJobSummary(
       method: "POST",
       body,
       bearerToken,
-      timeoutMs: 60 * 60_000,
+      timeoutMs: 15_000,
       headers: { "Idempotency-Key": `obsidian-${idempotency}` }
     }
   );
   const value = parseSuccess(response);
   if (
     !isJobSummary(value.job) ||
-    !isSummaryRevision(value.revision) ||
+    !isSummaryRegeneration(value.regeneration) ||
     typeof value.applied !== "boolean"
   ) {
     throw new JobClientError("invalid", "Worker 返回了无法识别的笔记重新生成结果。");
   }
   return value as unknown as SummaryRevisionRegenerationEnvelope;
+}
+
+function isSummaryRegeneration(
+  value: unknown
+): value is SummaryRegenerationStatusSchema {
+  if (!isRecord(value)) {
+    return false;
+  }
+  return (
+    typeof value.request_id === "string" &&
+    ["queued", "running", "succeeded", "failed"].includes(
+      String(value.state)
+    ) &&
+    [
+      "queued",
+      "preparing",
+      "synthesizing",
+      "quality_review",
+      "validating",
+      "completed",
+      "failed"
+    ].includes(String(value.phase)) &&
+    typeof value.requested_at === "string" &&
+    (value.started_at === null || typeof value.started_at === "string") &&
+    typeof value.updated_at === "string" &&
+    (value.finished_at === null || typeof value.finished_at === "string") &&
+    typeof value.elapsed_seconds === "number" &&
+    (value.revision_key === null || typeof value.revision_key === "string") &&
+    (value.error_code === null || typeof value.error_code === "string") &&
+    (value.error_message === null || typeof value.error_message === "string")
+  );
 }
 
 export async function decideJobSummaryRevision(

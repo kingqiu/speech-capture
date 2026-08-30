@@ -85,43 +85,11 @@ def serve(config: ServerConfig, *, runner: Any | None = None) -> None:
     background = BackgroundProcessingService(validated.data_dir)
     background.start()
     try:
-
-        def regenerate_summary(job_id: str) -> None:
-            from speech_capture_worker.model_activation import (
-                resolve_active_model_target,
-            )
-            from speech_capture_worker.structuring_execution import (
-                OllamaStructuringEngine,
-                StructuringExecutor,
-            )
-
-            job = jobs.get_job(job_id)
-            profile = job.model_profile.value
-            main_key = "ollama_accuracy" if profile == "accuracy" else "ollama_editor"
-            StructuringExecutor(
-                jobs,
-                OllamaStructuringEngine.for_worker_default(
-                    model=resolve_active_model_target(
-                        validated.data_dir,
-                        profile=profile,
-                        key=main_key,
-                        fallback="qwen3:14b" if profile == "accuracy" else "qwen3:8b",
-                    ),
-                    editor_model=resolve_active_model_target(
-                        validated.data_dir,
-                        profile=profile,
-                        key="ollama_editor",
-                        fallback="qwen3:8b",
-                    ),
-                ),
-            ).resynthesize_document(job_id)
-
         runner(
             create_app(
                 store=jobs,
                 credential_verifier=security,
                 device_security_store=security,
-                summary_regenerator=regenerate_summary,
                 endpoint_mode=("local_only" if _is_loopback(validated.host) else "private_tls"),
                 tls_enabled=validated.ssl_certfile is not None,
             ),

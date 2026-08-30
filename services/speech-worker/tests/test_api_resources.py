@@ -28,6 +28,7 @@ from speech_capture_worker.structuring_execution import (
     SUMMARY_REVISION_SCHEMA_VERSION,
     SUMMARY_REVISION_STAGE,
 )
+from speech_capture_worker.summary_regeneration import SummaryRegenerationExecutor
 from speech_capture_worker.transcript import (
     SpeakerLabelStatus,
     TranscriptOutcome,
@@ -482,8 +483,9 @@ def test_summary_regeneration_api_uses_new_corrections_once(tmp_path) -> None:
         source_probe=_probe,
     ) as store:
 
-        def regenerate(job_id: str) -> None:
+        def regenerate(job_id: str, progress) -> str:
             calls.append(job_id)
+            progress("synthesizing")
             before_document = {"summary": {"text": "旧总览", "evidence": []}}
             after_document = {"summary": {"text": "新总览", "evidence": []}}
             before_checkpoint = {
@@ -518,12 +520,12 @@ def test_summary_regeneration_api_uses_new_corrections_once(tmp_path) -> None:
                     "diff_truncated": False,
                 },
             )
+            return "summary_revision_regenerated"
 
         client = TestClient(
             create_app(
                 store=store,
                 credential_verifier=_verifier("vault_primary"),
-                summary_regenerator=regenerate,
             )
         )
         upload = _create_upload(client)
@@ -560,6 +562,15 @@ def test_summary_regeneration_api_uses_new_corrections_once(tmp_path) -> None:
             headers={**AUTHORIZATION, "Idempotency-Key": "regenerate-summary-api-replay"},
             json={"expected_revision": revised_job["revision"]},
         )
+        queued = client.get(
+            f"/v1/jobs/{job_id}/summary-revisions",
+            headers=AUTHORIZATION,
+        )
+        assert SummaryRegenerationExecutor(
+            store,
+            data_dir=tmp_path,
+            regenerate=regenerate,
+        ).run_once() is True
         after = client.get(
             f"/v1/jobs/{job_id}/summary-revisions",
             headers=AUTHORIZATION,
@@ -569,11 +580,17 @@ def test_summary_regeneration_api_uses_new_corrections_once(tmp_path) -> None:
     assert before.json()["can_regenerate"] is True
     assert generated.status_code == 200, generated.text
     assert generated.json()["applied"] is True
-    assert generated.json()["revision"]["status"] == "pending"
+    assert generated.json()["regeneration"]["state"] == "queued"
     assert replayed.status_code == 200, replayed.text
     assert replayed.json()["applied"] is False
+    assert queued.json()["regeneration"]["state"] == "queued"
     assert calls == [job_id]
     assert after.json()["can_regenerate"] is False
+    assert after.json()["regeneration"]["state"] == "succeeded"
+    assert after.json()["regeneration"]["revision_key"] == (
+        "summary_revision_regenerated"
+    )
+    assert after.json()["revisions"][0]["status"] == "pending"
 
 
 def test_private_routes_require_authentication_and_redact_validation_input(tmp_path) -> None:

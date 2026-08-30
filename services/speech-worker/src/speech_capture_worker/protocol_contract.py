@@ -35,6 +35,7 @@ class ProtocolCapability(StrEnum):
     CONTENT_TYPE_OVERRIDE = "content_type_override"
     CORRECTION_LEDGER = "correction_ledger"
     SUMMARY_REVISIONS = "summary_revisions"
+    BACKGROUND_SUMMARY_REGENERATION = "background_summary_regeneration"
     EVIDENCE_LINKED_ARTIFACTS = "evidence_linked_artifacts"
     PUBLICATION_LEASES = "publication_leases"
     ATOMIC_VAULT_PUBLICATION = "atomic_vault_publication"

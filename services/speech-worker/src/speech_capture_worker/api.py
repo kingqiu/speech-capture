@@ -65,6 +65,7 @@ from speech_capture_worker.api_schemas import (
     Sha256String,
     SpeakerDisplayNameEnvelope,
     SpeakerDisplayNameRequestSchema,
+    SummaryRegenerationStatusSchema,
     SummaryRevisionDecisionEnvelope,
     SummaryRevisionDecisionRequestSchema,
     SummaryRevisionDraftEnvelope,
@@ -127,11 +128,14 @@ from speech_capture_worker.recording_metadata import (
 )
 from speech_capture_worker.redaction import public_error_message
 from speech_capture_worker.review_audio import REVIEW_AUDIO_FILENAME, ReviewAudioManager
+from speech_capture_worker.summary_regeneration import (
+    current_summary_regeneration,
+    enqueue_summary_regeneration,
+)
 from speech_capture_worker.summary_revisions import (
     SummaryRevisionStatus,
     decide_summary_revision,
     list_summary_revisions,
-    regenerate_summary_revision,
     save_summary_revision_draft,
 )
 from speech_capture_worker.transcript import JobSnapshot, TranscriptSegment
@@ -180,6 +184,9 @@ def create_app(
     endpoint_mode: str = "local_only",
     tls_enabled: bool = False,
 ) -> FastAPI:
+    # Retain the argument for source compatibility with embedded callers. Note
+    # regeneration is now durably queued for BackgroundProcessingService.
+    _ = summary_regenerator
     app = FastAPI(
         title="Speech Capture Worker API",
         summary="Versioned local and private-network speech processing API.",
@@ -920,6 +927,7 @@ def create_app(
     ) -> SummaryRevisionListResponse:
         _authorized_job(worker_store, principal, job_id)
         collection = list_summary_revisions(worker_store, job_id)
+        regeneration = current_summary_regeneration(worker_store, job_id)
         return SummaryRevisionListResponse(
             revisions=tuple(
                 SummaryRevisionSchema.model_validate(item.to_dict())
@@ -928,6 +936,11 @@ def create_app(
             current_version=collection.current_version,
             manual_section_markdown=collection.manual_section_markdown,
             can_regenerate=collection.can_regenerate,
+            regeneration=(
+                SummaryRegenerationStatusSchema.model_validate(regeneration.to_dict())
+                if regeneration is not None
+                else None
+            ),
         )
 
     @app.post(
@@ -945,22 +958,17 @@ def create_app(
         idempotency_key: Annotated[str, Header(alias="Idempotency-Key")],
     ) -> SummaryRevisionRegenerationEnvelope:
         _authorized_job(worker_store, principal, job_id)
-        if summary_regenerator is None:
-            raise ApiProblem(
-                503,
-                "SUMMARY_REGENERATION_UNAVAILABLE",
-                "Note regeneration is not configured for this Worker process.",
-            )
-        result = regenerate_summary_revision(
+        result = enqueue_summary_regeneration(
             worker_store,
             job_id,
             expected_revision=request.expected_revision,
             idempotency_key=idempotency_key,
-            regenerate=summary_regenerator,
         )
         return SummaryRevisionRegenerationEnvelope(
             job=_job_schema(result.job),
-            revision=SummaryRevisionSchema.model_validate(result.revision.to_dict()),
+            regeneration=SummaryRegenerationStatusSchema.model_validate(
+                result.request.to_dict()
+            ),
             applied=result.applied,
         )
 

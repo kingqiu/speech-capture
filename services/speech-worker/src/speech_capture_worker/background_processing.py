@@ -46,6 +46,7 @@ from speech_capture_worker.structuring_execution import (
     OllamaStructuringEngine,
     StructuringExecutor,
 )
+from speech_capture_worker.summary_regeneration import SummaryRegenerationExecutor
 
 LOGGER = logging.getLogger(__name__)
 VAD_MODEL_REVISION = "660b9e20307a2b0cdb400d0f80aadc04a701fc54"
@@ -362,9 +363,15 @@ class BackgroundProcessingService:
             with JobStore(self.data_dir / "worker.sqlite3") as store:
                 store.recover_interrupted_jobs()
                 executor = ContinuousJobExecutor(store, data_dir=self.data_dir)
+                summary_executor = SummaryRegenerationExecutor(
+                    store,
+                    data_dir=self.data_dir,
+                )
                 while not self._stop_event.is_set():
                     outcome = executor.run_once()
                     if outcome is BackgroundStepOutcome.ADVANCED:
+                        continue
+                    if summary_executor.run_once():
                         continue
                     self._stop_event.wait(self.poll_interval_seconds)
         except Exception:

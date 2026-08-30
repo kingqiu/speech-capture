@@ -486,11 +486,34 @@ class SummaryRevisionSchema(PublicSchema):
     draft_sha256: Sha256String | None
 
 
+class SummaryRegenerationStatusSchema(PublicSchema):
+    request_id: SafeIdentifier
+    state: Literal["queued", "running", "succeeded", "failed"]
+    phase: Literal[
+        "queued",
+        "preparing",
+        "synthesizing",
+        "quality_review",
+        "validating",
+        "completed",
+        "failed",
+    ]
+    requested_at: str
+    started_at: str | None
+    updated_at: str
+    finished_at: str | None
+    elapsed_seconds: float = Field(ge=0)
+    revision_key: SafeIdentifier | None
+    error_code: str | None
+    error_message: str | None
+
+
 class SummaryRevisionListResponse(PublicSchema):
     revisions: tuple[SummaryRevisionSchema, ...]
     current_version: int = Field(gt=0)
     manual_section_markdown: str
     can_regenerate: bool
+    regeneration: SummaryRegenerationStatusSchema | None
 
 
 class SummaryRevisionRegenerationRequestSchema(PublicSchema):
@@ -499,7 +522,7 @@ class SummaryRevisionRegenerationRequestSchema(PublicSchema):
 
 class SummaryRevisionRegenerationEnvelope(PublicSchema):
     job: JobSchema
-    revision: SummaryRevisionSchema
+    regeneration: SummaryRegenerationStatusSchema
     applied: bool
 
 

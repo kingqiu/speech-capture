@@ -1582,6 +1582,7 @@
           "content_type_override",
           "correction_ledger",
           "summary_revisions",
+          "background_summary_regeneration",
           "evidence_linked_artifacts",
           "publication_leases",
           "atomic_vault_publication",
@@ -2189,6 +2190,123 @@
         "title": "SpeakerLabelStatus",
         "type": "string"
       },
+      "SummaryRegenerationStatusSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "elapsed_seconds": {
+            "minimum": 0.0,
+            "title": "Elapsed Seconds",
+            "type": "number"
+          },
+          "error_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code"
+          },
+          "error_message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Message"
+          },
+          "finished_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Finished At"
+          },
+          "phase": {
+            "enum": [
+              "queued",
+              "preparing",
+              "synthesizing",
+              "quality_review",
+              "validating",
+              "completed",
+              "failed"
+            ],
+            "title": "Phase",
+            "type": "string"
+          },
+          "request_id": {
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$",
+            "title": "Request Id",
+            "type": "string"
+          },
+          "requested_at": {
+            "title": "Requested At",
+            "type": "string"
+          },
+          "revision_key": {
+            "anyOf": [
+              {
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Revision Key"
+          },
+          "started_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Started At"
+          },
+          "state": {
+            "enum": [
+              "queued",
+              "running",
+              "succeeded",
+              "failed"
+            ],
+            "title": "State",
+            "type": "string"
+          },
+          "updated_at": {
+            "title": "Updated At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "request_id",
+          "state",
+          "phase",
+          "requested_at",
+          "started_at",
+          "updated_at",
+          "finished_at",
+          "elapsed_seconds",
+          "revision_key",
+          "error_code",
+          "error_message"
+        ],
+        "title": "SummaryRegenerationStatusSchema",
+        "type": "object"
+      },
       "SummaryRevisionDecisionEnvelope": {
         "additionalProperties": false,
         "properties": {
@@ -2301,6 +2419,16 @@
             "title": "Manual Section Markdown",
             "type": "string"
           },
+          "regeneration": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SummaryRegenerationStatusSchema"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "revisions": {
             "items": {
               "$ref": "#/components/schemas/SummaryRevisionSchema"
@@ -2313,7 +2441,8 @@
           "revisions",
           "current_version",
           "manual_section_markdown",
-          "can_regenerate"
+          "can_regenerate",
+          "regeneration"
         ],
         "title": "SummaryRevisionListResponse",
         "type": "object"
@@ -2328,13 +2457,13 @@
           "job": {
             "$ref": "#/components/schemas/JobSchema"
           },
-          "revision": {
-            "$ref": "#/components/schemas/SummaryRevisionSchema"
+          "regeneration": {
+            "$ref": "#/components/schemas/SummaryRegenerationStatusSchema"
           }
         },
         "required": [
           "job",
-          "revision",
+          "regeneration",
           "applied"
         ],
         "title": "SummaryRevisionRegenerationEnvelope",

@@ -1,5 +1,5 @@
 // Generated Worker protocol wire types. Do not edit manually.
-export const OPENAPI_SHA256 = "51f281bb42687685c3499046ae13553c5aa54427c4daa5c06e5f3210df904e01" as const;
+export const OPENAPI_SHA256 = "464e1155558ad4ca57acec210d42ea848371e0af959281126dbad6e4ebdc34f8" as const;
 export const OPENAPI_VERSION = "3.1.0" as const;
 export const PROTOCOL_VERSION = "1.0.0" as const;
 
@@ -331,6 +331,7 @@ export type ProtocolCapability =
   | "content_type_override"
   | "correction_ledger"
   | "summary_revisions"
+  | "background_summary_regeneration"
   | "evidence_linked_artifacts"
   | "publication_leases"
   | "atomic_vault_publication"
@@ -465,6 +466,20 @@ export type SpeakerLabelStatus =
   | "confirmed"
   | "unavailable";
 
+export interface SummaryRegenerationStatusSchema {
+  readonly elapsed_seconds: number;
+  readonly error_code: string | null;
+  readonly error_message: string | null;
+  readonly finished_at: string | null;
+  readonly phase: "queued" | "preparing" | "synthesizing" | "quality_review" | "validating" | "completed" | "failed";
+  readonly request_id: string;
+  readonly requested_at: string;
+  readonly revision_key: string | null;
+  readonly started_at: string | null;
+  readonly state: "queued" | "running" | "succeeded" | "failed";
+  readonly updated_at: string;
+}
+
 export interface SummaryRevisionDecisionEnvelope {
   readonly applied: boolean;
   readonly job: JobSchema;
@@ -492,13 +507,14 @@ export interface SummaryRevisionListResponse {
   readonly can_regenerate: boolean;
   readonly current_version: number;
   readonly manual_section_markdown: string;
+  readonly regeneration: SummaryRegenerationStatusSchema | null;
   readonly revisions: ReadonlyArray<SummaryRevisionSchema>;
 }
 
 export interface SummaryRevisionRegenerationEnvelope {
   readonly applied: boolean;
   readonly job: JobSchema;
-  readonly revision: SummaryRevisionSchema;
+  readonly regeneration: SummaryRegenerationStatusSchema;
 }
 
 export interface SummaryRevisionRegenerationRequestSchema {

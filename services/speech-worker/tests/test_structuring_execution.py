@@ -19,6 +19,7 @@ from speech_capture_worker.alignment import (
 )
 from speech_capture_worker.asr_execution import AsrChunkExecutor, AsrRunOutcome
 from speech_capture_worker.content_profile_prompts import load_bundled_meeting_profile
+from speech_capture_worker.content_profiles import ProfileReference
 from speech_capture_worker.corrections import CorrectionField
 from speech_capture_worker.domain import JobState, ResourceStatus, UploadCreateRequest
 from speech_capture_worker.errors import InvalidJobRequest, StructuringFailed
@@ -1482,6 +1483,72 @@ def test_prompt_profile_change_resynthesizes_whole_document_without_reextracting
         assert engine.classify_calls == 0
         assert engine.extract_calls == 0
         assert engine.polish_calls == 0
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")
+def test_meeting_profile_identity_change_invalidates_document_without_reextracting(
+    tmp_path,
+) -> None:
+    with JobStore(
+        tmp_path / "worker.sqlite3",
+        source_probe=source_probe_for(95),
+    ) as store:
+        job = create_structuring_job(
+            store,
+            duration_seconds=95,
+            suffix="meeting-profile-refresh",
+        )
+        segment_id = store.get_job_snapshot(job.job_id).stable_segments[0].segment_id
+        findings = [
+            {
+                "kind": "topic",
+                "text": "平台规划。",
+                "evidence": [segment_id],
+                "confidence": 0.9,
+            }
+        ]
+        initial_engine = FakeStructuringEngine(findings=findings)
+        initial_engine.meeting_profile_reference = ProfileReference(
+            profile_id="speech-capture/meeting",
+            profile_version="2026-08-29.1",
+            bundle_sha256="sha256:" + ("1" * 64),
+        )
+        StructuringExecutor(
+            store,
+            initial_engine,
+            boundary_preflight=preflight(),
+        ).run(job.job_id)
+
+        engine = FakeStructuringEngine(findings=findings)
+        engine.meeting_profile_reference = ProfileReference(
+            profile_id="speech-capture/meeting",
+            profile_version="2026-08-29.2",
+            bundle_sha256="sha256:" + ("2" * 64),
+        )
+        result = StructuringExecutor(
+            store,
+            engine,
+            boundary_preflight=preflight(),
+        ).resynthesize_document(job.job_id)
+
+        assert result.outcome is StructuringOutcome.REGENERATED
+        assert engine.synthesize_calls == 1
+        assert engine.meeting_repair_calls == 1
+        assert engine.classify_calls == 0
+        assert engine.extract_calls == 0
+        assert engine.polish_calls == 0
+        checkpoint = next(
+            item
+            for item in store.list_checkpoints(job.job_id, stage="structuring")
+            if item.checkpoint_key == "structuring_result"
+        )
+        assert checkpoint.payload["content_profile_reference"] == (
+            engine.meeting_profile_reference.to_dict()
+        )
+        raw = json.loads(
+            (store.data_directory / checkpoint.payload["raw_relative_path"]).read_text("utf-8")
+        )
+        assert raw["content_profile_reference"] == engine.meeting_profile_reference.to_dict()
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")
