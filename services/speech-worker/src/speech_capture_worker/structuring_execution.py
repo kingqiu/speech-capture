@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
@@ -9,7 +10,7 @@ import re
 import threading
 import time
 import urllib.request
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from difflib import unified_diff
 from enum import StrEnum
@@ -18,7 +19,10 @@ from typing import Any, Protocol
 from uuid import uuid4
 
 from speech_capture_worker.audio_preprocessing import AudioPreprocessor, NormalizedAudioPlan
-from speech_capture_worker.content_profile_prompts import MeetingProfilePrompts
+from speech_capture_worker.content_profile_prompts import (
+    MeetingProfilePrompts,
+    load_bundled_meeting_profile,
+)
 from speech_capture_worker.content_profiles import ProfileBundle, ProfileReference
 from speech_capture_worker.corrections import CorrectionField, corrections_sha256
 from speech_capture_worker.domain import JobRecord, JobState, ResourceStatus
@@ -28,6 +32,17 @@ from speech_capture_worker.errors import (
     UploadStorageError,
 )
 from speech_capture_worker.job_store import JobStore
+from speech_capture_worker.meeting_invariant_validator import (
+    MeetingInvariantEvidenceSnapshot,
+    TrustedMeetingInvariantValidator,
+    _create_trusted_meeting_invariant_validator,
+)
+from speech_capture_worker.meeting_semantic_gate import (
+    MEETING_SEMANTIC_VALIDATORS,
+    MeetingSemanticGateError,
+    repair_meeting_semantic_edit,
+    require_meeting_semantic_edit,
+)
 from speech_capture_worker.note_prompt_profiles import (
     NOTE_PROMPT_VERSION,
     extraction_guidance,
@@ -646,8 +661,32 @@ class OllamaStructuringEngine:
             if meeting_profile is not None
             else None
         )
+        self._meeting_profile_semantic_validators = (
+            tuple(
+                validator
+                for validator in meeting_profile.validation_policy["registered_validators"]
+                if validator in MEETING_SEMANTIC_VALIDATORS
+            )
+            if meeting_profile is not None
+            else ()
+        )
         self.meeting_profile_reference: ProfileReference | None = (
             meeting_profile.reference if meeting_profile is not None else None
+        )
+
+    @classmethod
+    def for_worker_default(
+        cls,
+        *,
+        model: str = "qwen3:14b",
+        editor_model: str = "qwen3:8b",
+    ) -> OllamaStructuringEngine:
+        """Build the production engine with the exact repository-pinned meeting Profile."""
+
+        return cls(
+            model=model,
+            editor_model=editor_model,
+            meeting_profile=load_bundled_meeting_profile(),
         )
 
     def _extraction_profile_guidance(self, content_type: ContentType) -> str:
@@ -669,6 +708,35 @@ class OllamaStructuringEngine:
         if self._meeting_profile_prompts is None:
             return ""
         return self._meeting_profile_prompts.meeting_outcomes + "\n"
+
+    def finalize_meeting_semantics(
+        self,
+        baseline: dict[str, Any],
+        candidate: dict[str, Any],
+        segments: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Apply deterministic repairs and guards to the post-validation candidate."""
+
+        repaired = repair_meeting_semantic_edit(
+            baseline,
+            candidate,
+            segments=segments,
+            validators=self._meeting_profile_semantic_validators,
+        )
+        try:
+            require_meeting_semantic_edit(
+                baseline,
+                repaired,
+                segments=segments,
+                validators=self._meeting_profile_semantic_validators,
+            )
+        except MeetingSemanticGateError as exc:
+            raise StructuringFailed(
+                "The external meeting profile failed final semantic guards: "
+                + ", ".join(exc.result.issue_codes)
+                + "."
+            ) from exc
+        return repaired
 
     def set_recording_context(self, context: str | None) -> None:
         self.recording_context = normalize_recording_context(context)
@@ -966,8 +1034,30 @@ class OllamaStructuringEngine:
             num_ctx=GLOBAL_SYNTHESIS_CONTEXT_TOKENS,
             timeout_seconds=1200,
         )
+        retry_guidance = (
+            "\n上一次质量编辑输出未形成完整 JSON。请重新返回完整对象，保留所有可靠栏目，"
+            "确保字符串、数组和对象全部闭合，不要输出 JSON 之外的文字。"
+        )
         try:
-            return _parse_json_object(response)
+            candidate = repair_meeting_semantic_edit(
+                document,
+                _parse_json_object(response),
+                segments=quality_segments,
+                validators=self._meeting_profile_semantic_validators,
+            )
+            require_meeting_semantic_edit(
+                document,
+                candidate,
+                segments=quality_segments,
+                validators=self._meeting_profile_semantic_validators,
+            )
+            return candidate
+        except MeetingSemanticGateError as exc:
+            raise StructuringFailed(
+                "The external meeting profile failed deterministic semantic guards: "
+                + ", ".join(exc.result.issue_codes)
+                + "."
+            ) from exc
         except StructuringFailed as exc:
             if str(exc) not in {
                 "The Ollama engine did not return a JSON object.",
@@ -975,9 +1065,7 @@ class OllamaStructuringEngine:
             }:
                 raise
         retry_response = self._generate(
-            prompt
-            + "\n上一次质量编辑输出未形成完整 JSON。请重新返回完整对象，保留所有可靠栏目，"
-            "确保字符串、数组和对象全部闭合，不要输出 JSON 之外的文字。",
+            prompt + retry_guidance,
             format_schema=schema,
             model=self.editor_model,
             num_predict=8192,
@@ -985,7 +1073,26 @@ class OllamaStructuringEngine:
             timeout_seconds=1200,
             retry_attempt=1,
         )
-        return _parse_json_object(retry_response)
+        retry_candidate = repair_meeting_semantic_edit(
+            document,
+            _parse_json_object(retry_response),
+            segments=quality_segments,
+            validators=self._meeting_profile_semantic_validators,
+        )
+        try:
+            require_meeting_semantic_edit(
+                document,
+                retry_candidate,
+                segments=quality_segments,
+                validators=self._meeting_profile_semantic_validators,
+            )
+        except MeetingSemanticGateError as exc:
+            raise StructuringFailed(
+                "The external meeting profile failed deterministic semantic guards: "
+                + ", ".join(exc.result.issue_codes)
+                + "."
+            ) from exc
+        return retry_candidate
 
     def synthesize_meeting_topics(
         self,
@@ -3366,6 +3473,18 @@ class StructuringExecutor:
                     edited_document or repaired_document,
                     **validation_kwargs,
                 )
+                if quality_document is not None and classification.type is ContentType.MEETING:
+                    final_semantic_validator = getattr(
+                        self.engine,
+                        "finalize_meeting_semantics",
+                        None,
+                    )
+                    if callable(final_semantic_validator):
+                        document = final_semantic_validator(
+                            repaired_document,
+                            document,
+                            coverage_payload,
+                        )
                 if quality_document is not None:
                     if classification.type is ContentType.MEETING:
                         meeting_quality_repair_version = MEETING_QUALITY_REPAIR_VERSION
@@ -5943,6 +6062,35 @@ def _validate_document(
     if objective is not None:
         document["objective"] = objective
     return document
+
+
+def build_trusted_meeting_invariant_validator(
+    segments: Sequence[Mapping[str, Any]],
+) -> TrustedMeetingInvariantValidator:
+    """Bind the pure Worker meeting validator to one immutable evidence snapshot.
+
+    This adapter performs no task lookup, persistence, external I/O, model, or
+    network work.  It is the only supported constructor for the sealed
+    capability consumed by the B3.2 shadow bridge.
+    """
+
+    snapshot = MeetingInvariantEvidenceSnapshot.from_segments(segments)
+
+    def validate(document: Mapping[str, Any]) -> Mapping[str, Any]:
+        return _validate_document(
+            copy.deepcopy(dict(document)),
+            segment_ids=set(snapshot.segment_ids),
+            speaker_ids=set(snapshot.speaker_ids),
+            content_type=ContentType.MEETING,
+            segment_texts=dict(snapshot.segment_texts),
+            segment_speakers=dict(snapshot.segment_speakers),
+            segment_starts=dict(snapshot.segment_starts),
+        )
+
+    return _create_trusted_meeting_invariant_validator(
+        snapshot=snapshot,
+        validator=validate,
+    )
 
 
 def _validate_timeline_sections(

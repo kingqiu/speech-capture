@@ -140,7 +140,19 @@ def test_standalone_build_collects_dynamic_model_backends() -> None:
         "mlx_qwen3_asr",
         "pyannote.audio",
     )
-    assert build.DATA_PACKAGES == ("pyannote.audio",)
+    assert build.DATA_PACKAGES == ("pyannote.audio", "speech_capture_worker")
+    assert build.SHADOW_CANDIDATE_MODULES == (
+        "speech_capture_worker.meeting_field_repair_authorized_private_shadow",
+        "speech_capture_worker.meeting_field_repair_local_transport",
+        "speech_capture_worker.meeting_field_repair_profile",
+        "speech_capture_worker.meeting_field_repair_shadow",
+        "speech_capture_worker.meeting_field_repair_shadow_bridge",
+        "speech_capture_worker.meeting_field_repair_shadow_orchestrator",
+        "speech_capture_worker.meeting_field_repair_transport_shadow",
+        "speech_capture_worker.meeting_field_repairs",
+        "speech_capture_worker.meeting_invariant_validator",
+        "speech_capture_worker.meeting_semantic_gate",
+    )
 
 
 def _load_build_module():

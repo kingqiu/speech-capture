@@ -24,7 +24,19 @@ DYNAMIC_SUBMODULE_PACKAGES = (
     "mlx_qwen3_asr",
     "pyannote.audio",
 )
-DATA_PACKAGES = ("pyannote.audio",)
+DATA_PACKAGES = ("pyannote.audio", "speech_capture_worker")
+SHADOW_CANDIDATE_MODULES = (
+    "speech_capture_worker.meeting_field_repair_authorized_private_shadow",
+    "speech_capture_worker.meeting_field_repair_local_transport",
+    "speech_capture_worker.meeting_field_repair_profile",
+    "speech_capture_worker.meeting_field_repair_shadow",
+    "speech_capture_worker.meeting_field_repair_shadow_bridge",
+    "speech_capture_worker.meeting_field_repair_shadow_orchestrator",
+    "speech_capture_worker.meeting_field_repair_transport_shadow",
+    "speech_capture_worker.meeting_field_repairs",
+    "speech_capture_worker.meeting_invariant_validator",
+    "speech_capture_worker.meeting_semantic_gate",
+)
 
 
 def main() -> int:
@@ -104,6 +116,8 @@ def main() -> int:
         arguments.extend(("--collect-submodules", package))
     for package in DATA_PACKAGES:
         arguments.extend(("--collect-data", package))
+    for module in SHADOW_CANDIDATE_MODULES:
+        arguments.extend(("--hidden-import", module))
     purelib = Path(sysconfig.get_paths()["purelib"])
     qwen_package = purelib / "mlx_qwen3_asr"
     mlx_package = purelib / "mlx"

@@ -18,6 +18,20 @@ from typing import Any
 
 from speech_capture_worker import __version__ as WORKER_VERSION
 from speech_capture_worker.domain import SUPPORTED_CONTENT_TYPES
+from speech_capture_worker.meeting_field_repairs import (
+    MAX_FIELD_CALL_SECONDS,
+    MAX_HEARTBEAT_SECONDS,
+    MAX_PACKET_CHARACTERS,
+    MAX_PACKET_ESTIMATED_TOKENS,
+    MAX_PACKET_SEGMENTS,
+    MAX_PARSER_RETRIES_PER_REPAIR,
+    MAX_REPAIR_CALLS,
+    MAX_REPAIR_FIELD_CHARACTERS,
+    MAX_REPAIR_OUTPUT_TOKENS,
+    MAX_TOTAL_REPAIR_SECONDS,
+    MEETING_FIELD_REPAIR_KEYS,
+)
+from speech_capture_worker.meeting_semantic_gate import MEETING_SEMANTIC_VALIDATORS
 
 BUNDLE_SCHEMA_VERSION = "1.0.0"
 DOCUMENT_SCHEMA_ID = "speech-capture/structured-note"
@@ -26,7 +40,8 @@ DOCUMENT_SCHEMA_VERSION = "1.0.0"
 SUPPORTED_PROMPT_SLOTS = frozenset(
     {"extraction", "synthesis", "coverage_repair", "quality_edit", "named_repairs"}
 )
-SUPPORTED_NAMED_REPAIRS = frozenset({"meeting_outcomes"})
+SUPPORTED_FIELD_REPAIRS = MEETING_FIELD_REPAIR_KEYS
+SUPPORTED_NAMED_REPAIRS = frozenset({"meeting_outcomes", *SUPPORTED_FIELD_REPAIRS})
 SUPPORTED_MODEL_ROLES = frozenset({"primary", "editor"})
 SUPPORTED_EXECUTION_ROLES = frozenset(
     {"classification", "extraction", "synthesis", "quality_edit"}
@@ -37,6 +52,7 @@ SUPPORTED_VALIDATORS = frozenset(
         "meeting.decision.confirmed",
         "meeting.action.evidence_complete",
         "meeting.categories.nonduplicated",
+        *MEETING_SEMANTIC_VALIDATORS,
     }
 )
 SUPPORTED_DOCUMENT_FIELDS = frozenset(
@@ -243,6 +259,11 @@ def load_profile_bundle(
     execution_policy = _validate_execution_policy(
         _read_declared_json(bundle_root, manifest["execution_policy"], files=files)
     )
+    _validate_profile_cross_references(
+        content_type=content_type,
+        prompts=prompts,
+        execution_policy=execution_policy,
+    )
     validation_policy = _validate_validation_policy(
         _read_declared_json(bundle_root, manifest["validation_policy"], files=files)
     )
@@ -411,16 +432,15 @@ def _validate_document_policy(value: dict[str, Any]) -> dict[str, Any]:
 
 
 def _validate_execution_policy(value: dict[str, Any]) -> dict[str, Any]:
-    _require_exact_fields(
-        value,
-        {
-            "roles",
-            "batch_target_tokens",
-            "maximum_quality_passes",
-            "enabled_registered_repairs",
-        },
-        label="execution-policy.json",
-    )
+    legacy_fields = {
+        "roles",
+        "batch_target_tokens",
+        "maximum_quality_passes",
+        "enabled_registered_repairs",
+    }
+    extended_fields = legacy_fields | {"field_repairs"}
+    if set(value) not in {frozenset(legacy_fields), frozenset(extended_fields)}:
+        _require_exact_fields(value, extended_fields, label="execution-policy.json")
     roles = value["roles"]
     if not isinstance(roles, dict) or set(roles) != SUPPORTED_EXECUTION_ROLES:
         raise ProfileBundleError("execution roles must contain the registered role slots exactly.")
@@ -435,9 +455,142 @@ def _validate_execution_policy(value: dict[str, Any]) -> dict[str, Any]:
     ):
         raise ProfileBundleError("maximum_quality_passes is outside the registered safe range.")
     repairs = _string_list(value["enabled_registered_repairs"], "enabled_registered_repairs")
-    if set(repairs) - SUPPORTED_NAMED_REPAIRS:
+    if set(repairs) - {"meeting_outcomes"}:
         raise ProfileBundleError("execution policy enables an unknown repair.")
+    if "field_repairs" in value:
+        _validate_field_repairs(value["field_repairs"])
     return value
+
+
+def _validate_field_repairs(value: Any) -> None:
+    if not isinstance(value, dict):
+        raise ProfileBundleError("field_repairs must be a JSON object.")
+    _require_exact_fields(
+        value,
+        {"maximum_calls", "total_timeout_seconds", "heartbeat_seconds", "repairs"},
+        label="field_repairs",
+    )
+    _bounded_integer(
+        value["maximum_calls"],
+        label="field_repairs.maximum_calls",
+        minimum=0,
+        maximum=MAX_REPAIR_CALLS,
+    )
+    _bounded_number(
+        value["total_timeout_seconds"],
+        label="field_repairs.total_timeout_seconds",
+        maximum=MAX_TOTAL_REPAIR_SECONDS,
+    )
+    _bounded_number(
+        value["heartbeat_seconds"],
+        label="field_repairs.heartbeat_seconds",
+        maximum=MAX_HEARTBEAT_SECONDS,
+    )
+    repairs = value["repairs"]
+    if not isinstance(repairs, dict):
+        raise ProfileBundleError("field_repairs.repairs must be a JSON object.")
+    unknown = set(repairs) - SUPPORTED_FIELD_REPAIRS
+    if unknown:
+        raise ProfileBundleError(f"field_repairs enables an unknown repair: {sorted(unknown)!r}.")
+    if len(repairs) > MAX_REPAIR_CALLS:
+        raise ProfileBundleError("field_repairs enables too many registered repair types.")
+    if value["maximum_calls"] > 0 and not repairs:
+        raise ProfileBundleError("field_repairs with a call budget must enable a repair.")
+    if value["maximum_calls"] == 0 and repairs:
+        raise ProfileBundleError("field_repairs cannot enable repairs with a zero call budget.")
+    for repair_key, policy in repairs.items():
+        _validate_field_repair_policy(repair_key, policy)
+
+
+def _validate_field_repair_policy(repair_key: str, value: Any) -> None:
+    if not isinstance(value, dict):
+        raise ProfileBundleError(f"field_repairs.repairs[{repair_key!r}] must be an object.")
+    fields = {
+        "model_role",
+        "maximum_output_tokens",
+        "maximum_field_characters",
+        "maximum_evidence_segments",
+        "maximum_evidence_characters",
+        "maximum_evidence_tokens",
+        "call_timeout_seconds",
+        "maximum_parser_retries",
+    }
+    _require_exact_fields(value, fields, label=f"field_repairs.repairs[{repair_key!r}]")
+    if value["model_role"] != "editor":
+        raise ProfileBundleError("field repair model_role must be the registered editor role.")
+    _bounded_integer(
+        value["maximum_output_tokens"],
+        label="field repair maximum_output_tokens",
+        minimum=1,
+        maximum=MAX_REPAIR_OUTPUT_TOKENS,
+    )
+    _bounded_integer(
+        value["maximum_field_characters"],
+        label="field repair maximum_field_characters",
+        minimum=1,
+        maximum=MAX_REPAIR_FIELD_CHARACTERS,
+    )
+    _bounded_integer(
+        value["maximum_evidence_segments"],
+        label="field repair maximum_evidence_segments",
+        minimum=1,
+        maximum=MAX_PACKET_SEGMENTS,
+    )
+    _bounded_integer(
+        value["maximum_evidence_characters"],
+        label="field repair maximum_evidence_characters",
+        minimum=1,
+        maximum=MAX_PACKET_CHARACTERS,
+    )
+    _bounded_integer(
+        value["maximum_evidence_tokens"],
+        label="field repair maximum_evidence_tokens",
+        minimum=1,
+        maximum=MAX_PACKET_ESTIMATED_TOKENS,
+    )
+    _bounded_number(
+        value["call_timeout_seconds"],
+        label="field repair call_timeout_seconds",
+        maximum=MAX_FIELD_CALL_SECONDS,
+    )
+    _bounded_integer(
+        value["maximum_parser_retries"],
+        label="field repair maximum_parser_retries",
+        minimum=0,
+        maximum=MAX_PARSER_RETRIES_PER_REPAIR,
+    )
+
+
+def _validate_profile_cross_references(
+    *,
+    content_type: str,
+    prompts: Mapping[str, Any],
+    execution_policy: Mapping[str, Any],
+) -> None:
+    field_repairs = execution_policy.get("field_repairs")
+    named_repairs = prompts["named_repairs"]
+    configured_prompts = set(named_repairs) & SUPPORTED_FIELD_REPAIRS
+    if field_repairs is None:
+        if configured_prompts:
+            raise ProfileBundleError("Field repair prompts require a field_repairs policy.")
+        return
+    if content_type != "meeting":
+        raise ProfileBundleError("field_repairs is currently registered only for meetings.")
+    configured_repairs = set(field_repairs["repairs"])
+    if configured_prompts != configured_repairs:
+        raise ProfileBundleError(
+            "field_repairs and registered field repair prompts must match exactly."
+        )
+
+
+def _bounded_integer(value: Any, *, label: str, minimum: int, maximum: int) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
+        raise ProfileBundleError(f"{label} is outside the registered safe range.")
+
+
+def _bounded_number(value: Any, *, label: str, maximum: float) -> None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 < value <= maximum:
+        raise ProfileBundleError(f"{label} is outside the registered safe range.")
 
 
 def _validate_validation_policy(value: dict[str, Any]) -> dict[str, Any]:

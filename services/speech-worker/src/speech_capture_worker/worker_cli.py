@@ -1201,7 +1201,7 @@ def _dispatch(args: argparse.Namespace) -> int:
             main_key = "ollama_accuracy" if profile == "accuracy" else "ollama_editor"
             executor = StructuringExecutor(
                 store,
-                OllamaStructuringEngine(
+                OllamaStructuringEngine.for_worker_default(
                     model=args.model
                     or resolve_active_model_target(
                         args.data_dir,

@@ -100,7 +100,7 @@ def serve(config: ServerConfig, *, runner: Any | None = None) -> None:
             main_key = "ollama_accuracy" if profile == "accuracy" else "ollama_editor"
             StructuringExecutor(
                 jobs,
-                OllamaStructuringEngine(
+                OllamaStructuringEngine.for_worker_default(
                     model=resolve_active_model_target(
                         validated.data_dir,
                         profile=profile,

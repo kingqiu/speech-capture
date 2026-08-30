@@ -1,0 +1,44 @@
+{
+  "bundle_schema_version": "1.0.0",
+  "profile_id": "speech-capture/meeting",
+  "profile_version": "2026-08-29.1",
+  "content_type": "meeting",
+  "document_schema": {
+    "id": "speech-capture/structured-note",
+    "version": "1.0.0"
+  },
+  "engine_compatibility": {
+    "minimum": "0.1.0a0",
+    "maximum_exclusive": "0.2.0"
+  },
+  "prompts": {
+    "extraction": "extract.prompt.md",
+    "synthesis": "synthesize.prompt.md",
+    "coverage_repair": null,
+    "quality_edit": "quality.prompt.md",
+    "named_repairs": {
+      "meeting_outcomes": "meeting-outcomes.prompt.md"
+    }
+  },
+  "document_policy": "document-policy.json",
+  "execution_policy": "execution-policy.json",
+  "validation_policy": "validation-policy.json",
+  "renderer": "renderer.json",
+  "fixtures_manifest": "fixtures/manifest.json",
+  "fallback_profile": {
+    "profile_id": "speech-capture/meeting",
+    "profile_version": "builtin-2026-08-27.1"
+  },
+  "files": {
+    "document-policy.json": "sha256:dc797609ff84bf913ba16a5866f457a7fbf9f787b0c60f0166edf77808b11bde",
+    "execution-policy.json": "sha256:de460b3170fc084186c31821e405228ae3af9f62501da90689068440a2472d0e",
+    "extract.prompt.md": "sha256:907dce3442038c7dc4d8fd1bc8df4deb0d56700144f03901ec9e581105ee7e0c",
+    "fixtures/manifest.json": "sha256:01a36f69a6368e687d686e43a83ba29f4688d4e11c2302e575b015c3a6942815",
+    "meeting-outcomes.prompt.md": "sha256:2cc5b2a5bcd1e1dcee89c09dbd8d9b84d6b4d735b964780757a85fec8d18077e",
+    "quality.prompt.md": "sha256:d0cbdb5532c5c11c26d055070d23668ff1f7f4b38853dc833eca4443d6fe5f5f",
+    "renderer.json": "sha256:02bfbd0426446a9bf314f3baff3d02c53ce09fb8790ad1da6ca334bb2c765f12",
+    "synthesize.prompt.md": "sha256:044bd807a773e311273ed3866a2bad5f6cb69a10c86fc486cdafac90d2483e4f",
+    "validation-policy.json": "sha256:3f1456f10815d45397c6538ff45cf99e15760e05264e374704f463dc95237aff"
+  },
+  "bundle_sha256": "sha256:903bff654e1c112209610f876b529abce34aa7ab279964b5927334bb32c59c6f"
+}

@@ -2061,6 +2061,19 @@ def test_explicit_meeting_profile_supplies_all_four_prompt_slots(monkeypatch) ->
     assert "只核对会议结果栏目" in prompts[3]
 
 
+def test_worker_default_engine_pins_the_active_meeting_profile() -> None:
+    engine = OllamaStructuringEngine.for_worker_default(
+        model="qwen3:14b",
+        editor_model="qwen3:8b",
+    )
+
+    assert engine.meeting_profile_reference is not None
+    assert engine.meeting_profile_reference.profile_version == "2026-08-29.2"
+    assert engine.meeting_profile_reference.bundle_sha256 == (
+        "sha256:640495ce7db7aa8c624be3ad3b37f1bc82d003b8edfd7cd18cee364c8243e3c0"
+    )
+
+
 def test_meeting_profile_never_changes_nonmeeting_prompt_selection(monkeypatch) -> None:
     engine = OllamaStructuringEngine(
         model="qwen3:14b",
@@ -2192,6 +2205,145 @@ def test_meeting_quality_editor_retries_truncated_json(monkeypatch) -> None:
     assert requests[1]["num_predict"] == 8192
     assert requests[1]["retry_attempt"] == 1
     assert "上一次质量编辑输出未形成完整 JSON" in requests[1]["prompt"]
+
+
+def test_external_meeting_profile_repairs_lossless_semantic_regression(monkeypatch) -> None:
+    engine = OllamaStructuringEngine(
+        model="qwen3:14b",
+        editor_model="qwen3:8b",
+        meeting_profile=load_bundled_meeting_profile(),
+    )
+    baseline = {
+        "summary": {"text": "确认匹配规则和模板交付。", "evidence": ["seg_rule"]},
+        "highlights": [
+            {"text": "款式匹配必须达到 100%。", "evidence": ["seg_rule"]}
+        ],
+        "decisions": [
+            {"text": "款式匹配必须达到 100%。", "evidence": ["seg_rule"]}
+        ],
+        "actions": [
+            {
+                "task": "提交全部款式模板。",
+                "owner": "",
+                "deadline": "",
+                "evidence": ["seg_action"],
+            }
+        ],
+        "risks": [],
+        "open_questions": [],
+        "timeline_sections": [],
+        "speaker_summaries": [],
+    }
+    regressed = {
+        **baseline,
+        "summary": {"text": "会议达成多项决定并完成任务分配。", "evidence": ["seg_rule"]},
+        "decisions": [],
+        "actions": [],
+    }
+    requests = []
+
+    def generate(prompt, **kwargs):
+        requests.append({"prompt": prompt, **kwargs})
+        return json.dumps(regressed, ensure_ascii=False)
+
+    monkeypatch.setattr(engine, "_generate", generate)
+    result = engine.refine_meeting_document(
+        baseline,
+        [
+            {
+                "segment_id": "seg_rule",
+                "speaker_id": "speaker_1",
+                "text": "确认款式匹配必须达到 100%。",
+            },
+            {
+                "segment_id": "seg_action",
+                "speaker_id": "speaker_2",
+                "text": "请提交全部款式模板。",
+            },
+        ],
+    )
+
+    assert result == baseline
+    assert len(requests) == 1
+
+
+def test_external_meeting_profile_does_not_retry_unrepairable_semantic_failure(
+    monkeypatch,
+) -> None:
+    engine = OllamaStructuringEngine(
+        model="qwen3:14b",
+        editor_model="qwen3:8b",
+        meeting_profile=load_bundled_meeting_profile(),
+    )
+    baseline = {
+        "summary": {"text": "确认数据范围。", "evidence": ["seg_range"]},
+        "highlights": [],
+        "decisions": [],
+        "actions": [],
+        "risks": [],
+        "open_questions": [],
+        "timeline_sections": [
+            {
+                "title": "数据范围",
+                "summary": "数据范围覆盖 2 年。",
+                "details": [],
+                "start_segment_id": "seg_range",
+                "end_segment_id": "seg_range",
+            }
+        ],
+        "speaker_summaries": [],
+    }
+    requests = []
+
+    def generate(prompt, **kwargs):
+        requests.append({"prompt": prompt, **kwargs})
+        return json.dumps(baseline, ensure_ascii=False)
+
+    monkeypatch.setattr(engine, "_generate", generate)
+    with pytest.raises(StructuringFailed, match="important_quantitative_facts_not_promoted"):
+        engine.refine_meeting_document(
+            baseline,
+            [
+                {
+                    "segment_id": "seg_range",
+                    "speaker_id": "speaker_1",
+                    "text": "数据范围覆盖 2 年。",
+                }
+            ],
+        )
+
+    assert len(requests) == 1
+
+
+def test_external_meeting_profile_repairs_final_post_validation_summary() -> None:
+    engine = OllamaStructuringEngine(
+        model="qwen3:14b",
+        editor_model="qwen3:8b",
+        meeting_profile=load_bundled_meeting_profile(),
+    )
+    baseline = {
+        "summary": {"text": "确认数据规则。", "evidence": ["seg_rule"]},
+        "decisions": [],
+        "actions": [],
+        "risks": [],
+        "open_questions": [],
+        "highlights": [],
+        "timeline_sections": [],
+        "speaker_summaries": [],
+    }
+    post_validation = {
+        **baseline,
+        "summary": {"text": "会议最终达成多项决定。", "evidence": ["seg_rule"]},
+    }
+
+    repaired = engine.finalize_meeting_semantics(
+        baseline,
+        post_validation,
+        [{"segment_id": "seg_rule", "speaker_id": "speaker_1", "text": "确认规则。"}],
+    )
+
+    assert repaired["decisions"] == []
+    assert repaired["summary"]["text"] == baseline["summary"]["text"]
 
 
 @pytest.mark.parametrize(

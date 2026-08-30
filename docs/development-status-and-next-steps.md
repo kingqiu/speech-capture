@@ -4122,3 +4122,217 @@ Stage J 的新扩展，未经明确要求不 commit/push。
   3. 时间线中的明确规则、数字、交付物和冲突应提升到对应结构字段；
   4. 说话人角色与职责必须逐句受证据约束，禁止由单个片段扩展推断；
   5. 再次验证只复用既有转写与证据，不重跑真实音频，不写入正式版本或发布路径。
+
+## 113. 2026-08-29 B3.1 已建立最终语义门，真实长会议仍不具备启用条件
+
+- `65187eb` 已把 B1–B3 推送至 `origin/agent/worker-core`。B3.1 新工作区新增
+  `speech-capture/meeting@2026-08-29.1`，固定 hash 为
+  `903bff654e1c112209610f876b529abce34aa7ab279964b5927334bb32c59c6f`，旧 bundle 仍可加载；
+- 守门位置已从模型原始 JSON 移到严格 evidence/decision 校验后的最终文档，解决“原始候选有决议、
+  后处理清空决议，但摘要仍声称达成决定”的盲区；
+- 可无损确定的问题采用本地修复而非模型重试：恢复基线 evidence 结果、删除与最终结构矛盾的摘要句、
+  清空无直接依据的角色字段、让无依据的新说话人摘要回退到已发布基线；无法确定的问题直接安全停止；
+- 私有复验只读当前已发布结构和既有证据。旧原始候选经新边界处理后保留全部有证据的既有结果，引用
+  仍有效且正式产物指纹不变；这只证明守门和保留策略有效，不代表新版提示词质量已通过；
+- 新版提示词的真实下游 shadow 因语义失败进入旧的第二次整篇调用，累计超过 20 分钟后终止，没有生成
+  可验收候选。现已禁止语义整篇重试，仅保留 JSON 截断重试；Worker 全量 574 项测试及静态检查通过；
+- 当前结论：不得激活 B3.1。下一阶段应先输出并评审 B3.2 有界字段级质量编辑方案，把失败字段映射到
+  最小 evidence 包，提供可见子阶段进度和硬时限，再决定是否实现；不得用增大超时掩盖架构问题。
+
+## 114. 2026-08-29 B3.2 设计完成，执行路径尚未开始改造
+
+- 已完成 `docs/design/content-profile-b3-2-bounded-field-quality-edit-v1.md`，明确以不可变已验证基线、
+  确定性修复、失败码到注册 repair 的固定映射、最小 evidence 包、字段级严格 JSON 和最终整篇守门取代
+  全文质量重写；
+- Worker 保留执行硬上限和所有证据/发布权限。Profile 只能启用已注册 repair 并申请更小预算，不能提高
+  调用、segment、token、超时或重试上限，也不能把整篇 quality edit 作为失败降级路径；
+- 初版 repair 范围限定为量化事实提升、单说话人 grounding 和单主题 detail；摘要一致、结果保留、角色
+  清空等可确定问题继续本地处理。未触及字段必须字节级不变，局部结果只在内存原子合并；
+- 建议硬门为最多 3 次字段调用、单次 120 秒、10 秒心跳、语义重试为 0；完整授权长会议总阶段目标不
+  超过 180 秒。门槛待公开夹具和后续授权 shadow 实测，不构成已完成性能结果；
+- 本轮 B3.2 只修改设计与状态文档，没有实现新执行路径、运行私有样例、生成正式候选、采用、发布或切换
+  meeting 默认 Profile。下一步应先评审设计；获准实现后，严格按“公开合成契约与拒绝测试 → 字段局部
+  引擎 → 全量回归 → 再次授权的单次私有 shadow”顺序推进。
+
+## 115. 2026-08-29 B3.2 已实现规划、局部校验和原子内存合并
+
+- `meeting_field_repairs.py` 已实现稳定 failure code 注册表、最多 3 项的非重叠 repair planner、目标字段
+  canonical hash、最小 evidence packet 和 packet hash；它仍是未接生产路径的纯模块；
+- 公开合成测试证明 packet 不会因超限截断、speaker 只读取本人证据、未知/确定性 issue 不会误进模型，
+  并能在字段哈希变化时拒绝过期计划；
+- 三类严格结果 schema 和本地 validator 已完成：只允许目标字段，evidence 必须来自 packet，数字必须
+  出现在所引证据；speaker 不允许返回角色/组织，action 不允许生成 owner/deadline；
+- 合并先验证全部结果，之后只修改基线深拷贝；最后强制执行整篇 validator 并复核未触及字段 hash，任何
+  后置失败都不返回部分结果或修改基线；
+- 本轮没有调用模型、没有运行私有样例、没有创建新 bundle、候选、版本或发布；Worker 全量 597 项、
+  Ruff 与 `git diff --check` 通过；
+- 下一步为公开合成短调用 runner 与可观察性契约。只有它证明最多 3 次调用、单次硬超时、parser-only
+  重试和 10 秒心跳后，才可以建立新的固定 Profile bundle 并继续 shadow；B3.1 与 meeting 默认路径仍
+  保持未激活。
+
+## 116. 2026-08-29 B3.2 隔离短调用 runner 与心跳契约完成
+
+- `meeting_field_repair_shadow.py` 已完成公开合成隔离 runner；每次调用只获得目标 plan、局部 schema、
+  最小 packet 和 transport timeout，不读取完整 baseline；
+- 全局最多 3 次调用，parser-only retry 每项最多 1 且计入总预算；本地 schema/证据/字段失败以及最终
+  validator 失败均不重试。单次上限 120 秒、总阶段上限 180 秒，不允许 Profile 提高；
+- progress 只包含子阶段、完成数、repair key、字段类别、attempt、调用/重试计数和 elapsed；调用及 final
+  gate 阻塞期间用最多 10 秒的 daemon heartbeat，不记录内容；
+- transport timeout、返回后 elapsed timeout、总调用预算、语义不重试、final gate 拒绝、零计划零调用和
+  正式状态依赖隔离均有公开合成测试；Worker 全量 606 项及 Ruff、补丁格式检查通过；
+- 当前仍是未接生产路径的 fake-callable shadow 契约，没有真实模型、私有数据、文件输出、新 bundle、
+  候选、版本或发布。下一步是 ProfileBundle 的字段 repair 声明和一个新的未激活 meeting bundle，之后仍
+  只能先跑公开合成 shadow。
+
+## 117. 2026-08-29 B3.2 未激活字段修复 ProfileBundle 已完成
+
+- ProfileBundle 执行策略新增严格、可选的 `field_repairs` 形态，同时完整保留旧四字段形态，已有固定
+  Bundle 不需要迁移；两种形态都拒绝未知字段；
+- Worker 固定三种允许的 repair 和全部硬上限。新策略必须为每个启用 repair 提供同名短 prompt，角色只
+  能是 `editor`；调用、输出、字段、evidence、超时、心跳和 parser retry 只可收紧，不能提高；
+- 新增 `speech-capture/meeting@2026-08-29.2`，hash 为
+  `640495ce7db7aa8c624be3ad3b37f1bc82d003b8edfd7cd18cee364c8243e3c0`。它包含三条字段 prompt 和受限预算，
+  fallback 指向 `.1`；
+- 默认 loader 仍精确加载 `2026-08-29.1`，其 bundle/profile 文件哈希均由测试固定，因此现有会议提炼
+  行为没有变化；`.2` 只是可加载、未激活候选；
+- 配置超限、未知 key、prompt 缺失、prompt/policy 不一致及旧 Bundle 兼容均有测试。专项累计 62 项、
+  Worker 全量 620 项、Ruff 与 `git diff --check` 通过；没有真实模型、私有样例、正式状态或发布写入；
+- 下一步实现只读 Profile-to-shadow adapter：从已验证 `.2` 读取 prompt 和较小预算，构建隔离 runner
+  请求并用公开合成数据验证。仍不允许切换默认 resolver、运行私有内容、创建正式候选或发布。
+
+## 118. 2026-08-29 B3.2 Profile 配置已安全下传到隔离 runner
+
+- 新增只读 Profile adapter，把 `.2` 的三条短 prompt、角色、输出/字段/evidence 预算、超时、心跳、重试和
+  固定 Profile 指纹投影为不可变 shadow 配置；adapter 没有正式状态或发布依赖；
+- profiled runner 的单字段 request 含 plan、局部 schema、对应 prompt、`editor`、最大输出 token、实际
+  timeout 和 Profile 指纹，不含完整 baseline/document；
+- Profile 的较小字段限制会直接缩小 request schema，并在返回后再次校验；packet、计划数、parser retry、
+  单次/总超时和心跳预算也由 runner 复核并取 Worker/Profile 较小值；
+- 手工伪造超限 config、未知 repair、Profile 未启用 repair、packet 超限和零 retry 路径均有公开合成拒绝
+  测试；`.1` 因无字段策略会被 adapter 明确拒绝，不会意外进入该路径；
+- 重点测试累计 71 项，Worker 全量 629 项、Ruff 与 `git diff --check` 通过。没有真实模型、私有数据、任务
+  状态、候选、采用、发布或 Vault 写入，默认 resolver 仍未改变；
+- 下一步仅实现公开合成 transport recorder/fake envelope，验证请求参数映射以及取消、timeout 后无后台
+  调用残留。通过前不得连接 Ollama、当前任务或私有 shadow。
+
+## 119. 2026-08-29 B3.2 公开合成 transport 参数映射和收尾完成
+
+- field repair plan 已补充单目标 canonical 当前值；短调用因此能同时获得“要修的当前字段”和最小证据，
+  但仍不会读取完整会议文档。目标 hash 漂移校验保持不变；
+- 新增纯内存 canonical envelope/recorder，将 profiled request 映射为 prompt、不可信 JSON 输入、严格 schema、
+  角色、输出预算、timeout、attempt 与 Profile 指纹；当前没有真实模型 ID 或网络实现；
+- runner 增加协作式 cancellation check。公开合成测试确认调用前取消零 envelope，调用中取消和模拟 timeout
+  后 active call 与 heartbeat 均归零，且不会执行最终合并；
+- transport 模块依赖审计确认没有网络、文件系统或正式状态组件，也没有启动线程；
+- 重点测试累计 77 项、Worker 全量 635 项、Ruff 与 `git diff --check` 通过。`.2` 继续未激活，没有真实模型、
+  私有样例、candidate/revision、采用、发布或 Vault 写入；
+- 下一步先实现未连接运行路径的本地短调用 transport adapter，所有 I/O 可注入；只用 fake connection 证明
+  取消时强制关闭连接、响应 body 有上限且 JSON 外壳严格。此门通过前不运行真实 Ollama。
+
+## 120. 2026-08-29 B3.2 本地短调用 transport 已实现但仍未接线
+
+- 新增固定 loopback Ollama transport：只接受 `editor`，调用地址固定为
+  `127.0.0.1:11434/api/generate`，请求只含单目标当前值、最小 evidence、Profile 短 prompt、严格 schema
+  和已收紧的输出预算；模型名经过安全字符校验；
+- response 最大 256 KiB，并严格检查 HTTP/JSON 外壳、完成标志、正文与 metadata 类型；任何未知字段、
+  未完成或超限响应都 fail closed；
+- I/O 完全可注入。16 项公开合成 fake connection 测试覆盖精确请求映射、成功关闭、非法/超大响应、timeout、
+  阻塞调用取消时主动关闭底层连接，以及 transport monitor/runner heartbeat 无残留；没有真实网络调用；
+- 新模块没有被其他生产模块导入，也不依赖任务、checkpoint、候选、revision、artifact、publication、API、
+  Vault 或文件系统。默认 meeting 仍加载 `.1`，`.2` 继续未激活；
+- Worker 全量 651 项测试和全目录 Ruff 通过。本轮没有私有数据、正式状态、候选、采用、发布、Vault 写入，
+  也未 commit/push；
+- 下一步不是自动接线，而是等待项目所有者明确授权一次“公开合成、只读、无任务状态”的真实本地模型调用。
+  获权后也只能验证 transport 连通性、延迟、严格 schema 和取消收尾；不能直接运行私有会议或切默认路径。
+
+## 121. 2026-08-29 B3.2 公开合成真实本地短调用已通过
+
+- 项目所有者明确授权后，使用 `.2`、`qwen3:8b`、两个公开虚构片段和单个量化提升 plan 执行了恰好一次
+  `127.0.0.1:11434/api/generate`；没有读取私有任务或任何正式状态；
+- 调用耗时 11.357 秒，response 2,996 bytes，调用数 1、parser retry 0；严格外层 JSON、局部 schema、
+  evidence/数字约束、原子 merge 和 final validator 全部通过；
+- baseline 未改变；response 与 connection 各关闭一次，transport monitor 和 heartbeat 无残留；临时 smoke
+  脚本已清理，结果未落盘、未登记 candidate/revision、未采用、未发布；
+- 该结果不等于真实取消路径、私有长会议语义门或总性能门已通过。默认仍精确加载 `.1`，`.2` 仍未激活；
+- 下一步先设计显式 opt-in、只返回内存结果的 shadow bridge 及其 fail-closed 边界。设计和公开合成拒绝测试
+  通过后，才可以请求一次特定私有样例授权；不得直接接当前任务、发布链路或默认 resolver。
+
+## 122. 2026-08-29 B3.2 public-synthetic memory-only bridge 已完成
+
+- 新 bridge 只接受显式启用的 meeting/public_synthetic/memory_only/no-persistence capability，并精确固定
+  `.2` profile/version/hash；它不创建 transport，且没有生产入口引用；
+- 公开输入必须使用 `seg_public_*`、`speaker_public_*`，仅含三个 segment 字段，最多 32 段/16,000 字符；
+  baseline 与 issue 的所有 evidence/timeline/speaker reference 均须存在于同一公开输入；
+- baseline/segments/issues 会被深拷贝和 hash 固定，结果仅返回独立内存文档及无正文审计信息；输入变化、
+  capability 错误、旧/伪造 bundle、空 repair、包外证据都 fail closed；
+- trusted invariant validator 不得改写文档；随后 bridge 强制执行 `.2` 的 meeting semantic validators，
+  因此 no-op validator 不能绕过量化事实、结果保留、摘要一致性和说话人 grounding 门；
+- 新增 19 项测试，相关聚焦 90 项、Worker 全量 670 项和 Ruff 通过。无网络、文件系统、正式状态依赖或生产
+  import；本轮没有真实模型调用、私有内容、候选、版本、采用、发布、Vault 写入或默认切换；
+- 下一步先把现有 Worker 文档 invariant validator 包装为无状态、只读、不可改写的 trusted adapter，并用
+  公开合成数据证明它不依赖 JobStore/发布。通过后才讨论申请特定私有样例只读 shadow 授权。
+
+## 123. 2026-08-29 B3.2 发布候选已通过私有样例前审计
+
+- 新增 sealed trusted invariant validator：只能由 Worker 内部 factory 创建，绑定不可变 evidence snapshot，
+  任意 validator 注入、证据漂移、正式 invariant 失败或验证过程需规范化都会 fail closed；
+- 新增未接生产的单一 shadow orchestrator，只组合固定 `.2`、受支持 transport、planner、trusted validator、
+  semantic gate、进度和取消，不接 JobStore、candidate/revision、publication、API 或 Vault；
+- `.2` 三类 repair 共 15 项公开合成 E2E 矩阵通过；Worker 全量 696 项、B3.2 聚焦 116 项、standalone/profile
+  37 项、插件 80 项、Ruff、协议检查、TypeScript、生产构建和补丁格式检查均通过；
+- 修复了冻结包可能漏收隔离模块和 Profile data 的风险；候选 standalone 共 3,438 files / 1,298,518,623 bytes，
+  manifest SHA-256 为 `74d951f2a2ab67880197d7f66b769dbfc66718d4b9b3162f39ac6b771680d676`；
+- 默认仍为 `.1`，`.2` 没有生产 import。本轮没有私有输入、真实模型调用、正式状态、候选登记/采用、发布或
+  Vault 写入；审计结论仅为“可申请一次指定私有会议只读 shadow”，不允许切默认；
+- 下一步在一次集中授权后执行最多三次本地 editor 调用、180 秒总上限的私有只读质量/性能验收。验收结果
+  通过后仍需单独确认，才能讨论受控默认切换、回滚包和正式部署。
+
+## 124. 2026-08-29 私有 shadow 一次性授权门已预备但未使用
+
+- 新增未接生产的一次性私有验收 capability，只有显式授权 factory 可创建，并精确绑定授权引用、目标 Job、
+  baseline 和 evidence snapshot hash；重放、目标漂移、baseline 漂移或证据漂移均在模型前拒绝；
+- 私有 reference 完整性、1–3 次 repair 预算、180 秒总预算、shared cancellation source、正式 invariant 与四个
+  meeting semantic validators 均强制执行；返回仍只在内存，明确不具备 persistence authority；
+- 7 项新增测试覆盖成功、重放、无授权、伪造 capability、scope 漂移、证据越界和取消源不一致；Worker 全量
+  703 项、B3.2 聚焦 123 项通过；
+- standalone 已重新构建并在宿主 Mac 完整 verify；新 manifest SHA-256 为
+  `46367ee8a5bdb98e53e448eb677f79acbf8ecb0a2cb4224b825785b1d39a979e`，冻结 PYZ 中存在私有入口；
+- 本轮仍未读取私有会议、调用真实模型、登记/采用候选、发布、写 Vault 或切换 `.1` 默认。下一步仍是同一个
+  集中授权点，不需要新增零碎确认。
+
+## 125. 2026-08-29 最新私有会议的只读 shadow 已通过适用范围验收
+
+- 获得项目所有者明确授权后，只读加载最新会议的既有 `speech-record.json`；没有重跑音频，审计报告不保留
+  输入规模、正文、目标身份、私有路径或输入哈希；
+- 正式基线通过四个 meeting semantic validators，执行零计划 no-op：0 次模型调用、0 个变化字段、0.006 秒，
+  baseline/result hash 相同；私有 capability 已补充并测试安全 no-op 契约；
+- 只在进程内副本注入 speaker summary 与 topic details 两个退化，`.2` / `qwen3:8b` 用 2 次调用、0 次重试、
+  30.130 秒完成，且只改对应两个字段；两项 grounding/detail 检查通过；
+- 该会议的原始 evidence 没有符合当前量化 repair 契约的“数字＋单位”锚点，因此量化私有挑战为 N/A，没有
+  用纪要生成数字反向冒充证据；该类仍有公开合成 E2E 覆盖；
+- 调用前后任务状态、版本、Job 范围数据库行和产物指纹完全一致；没有 candidate/revision、采用、发布或
+  Vault 写入，文档不记录私有状态值、数量或联合哈希；
+- 最终 Worker 705 项、B3.2 聚焦 124 项、插件 80 项、Ruff、协议生成检查、TypeScript 与生产构建全部通过；
+  standalone 重建及宿主独立 verify 通过，共 3,438 files / 1,298,528,495 bytes，manifest SHA-256 为
+  `ea3c936748dc03c1eec841a44ae0bf0ca53a534f73ca0c3fb58fffeb20fb5004`；
+- 新增并通过 `.1 → .2 → .1` 原子回滚测试：新任务回到 `.1`，已 pin `.2` 的任务仍精确解析，failed
+  activation 保持当前和 last-known-good；
+- `.1` 仍是默认，`.2` 仍未接生产。准备工作已完成，现在只在最终“是否切默认并部署”的外部状态门等待一次
+  明确确认。
+
+## 126. 2026-08-30 meeting Profile `.2` 已受控切换并部署
+
+- 项目所有者完成最终授权后，将 repository meeting 默认从 `.1` 精确切换到 `.2`；`.1` bundle 和固定 hash
+  未修改，`.2` fallback 仍指向 `.1`；
+- 部署前发现并修复了一个关键接线缺口：后台 STRUCTURING、CLI `run-structuring` 和 API 重新提炼此前都直接
+  创建无 Profile 的引擎。三个入口现统一调用 `OllamaStructuringEngine.for_worker_default()`，防止“安装新包但
+  实际仍走旧/builtin 行为”；
+- Worker 全量 707 项、入口/Profile 聚焦 156 项、Ruff、standalone prerequisite 和 diff 检查通过；重建包
+  3,438 files / 1,298,528,751 bytes，manifest SHA-256 为
+  `6092d84af592bac9cc90995fdcb25df42f62c1474c672fb08b9a95e6c22c9d43`，宿主独立 verify 通过；
+- 部署时没有处理中任务。旧运行时以 `SpeechCaptureWorker.backup-20260830-pre-b3-2-default` 保留；新包与部署
+  目录 manifest hash 一致，冻结包内 `.2` identity 校验通过；
+- 新 Worker 的 health、capabilities、协议协商、模型、Ollama、Tailscale 和服务状态均通过，部署前后任务状态
+  分布完全一致且无处理中任务；没有重跑或改写任何既有会议；
+- `.2` 现用于新 meeting 结构化和明确发起的重新提炼。自动采用候选、自动发布、批量重写旧 Note 和改变 Vault
+  位置仍未授权，也未执行。

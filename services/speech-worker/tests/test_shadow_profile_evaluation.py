@@ -315,6 +315,7 @@ def test_repository_meeting_profile_participates_in_equivalent_synthetic_dual_re
     assert result.report.external_profile == profile.reference
     assert len(observed_profile_prompts) == 1
     assert "输出顺序和阅读逻辑" in observed_profile_prompts[0].synthesis
+    assert profile.profile_version == "2026-08-29.2"
 
 
 def test_shadow_report_exposes_semantic_and_artifact_mismatch(tmp_path: Path) -> None:

@@ -128,7 +128,7 @@ class ContinuousJobExecutor:
             profile = job.model_profile.value
             StructuringExecutor(
                 self.store,
-                OllamaStructuringEngine(
+                OllamaStructuringEngine.for_worker_default(
                     model=resolve_active_model_target(
                         self.data_dir,
                         profile=profile,

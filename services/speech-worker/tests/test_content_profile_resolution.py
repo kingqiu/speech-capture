@@ -124,6 +124,28 @@ def test_old_task_stays_on_exact_pin_after_new_activation(tmp_path: Path) -> Non
     assert resolver.resolve_pinned(old_pin).bundle is first
 
 
+def test_explicit_meeting_rollback_is_atomic_and_preserves_newer_task_pin(
+    tmp_path: Path,
+) -> None:
+    registry = ProfileBundleRegistry()
+    last_known_good = _bundle(tmp_path, version="2026-08-29.1", digest_character="1")
+    candidate = _bundle(tmp_path, version="2026-08-29.2", digest_character="2")
+    registry.register_validated(last_known_good)
+    registry.register_validated(candidate)
+    resolver = ContentProfileResolver(registry)
+
+    resolver.activate_meeting(last_known_good.reference)
+    resolver.activate_meeting(candidate.reference)
+    candidate_pin = resolver.resolve_for_new_task("meeting").pin
+    rollback = resolver.activate_meeting(last_known_good.reference)
+
+    assert rollback.generation == 3
+    assert rollback.active_meeting_reference == last_known_good.reference
+    assert resolver.resolve_for_new_task("meeting").bundle is last_known_good
+    assert resolver.resolve_pinned(candidate_pin).bundle is candidate
+    assert registry.last_known_good("meeting") is last_known_good
+
+
 def test_serialized_pin_resolves_exact_bundle_after_resolver_restart(tmp_path: Path) -> None:
     first_registry = ProfileBundleRegistry()
     meeting = _bundle(tmp_path, version="1.0.0", digest_character="7")

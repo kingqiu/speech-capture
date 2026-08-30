@@ -13,7 +13,7 @@ from pathlib import Path
 from speech_capture_worker.content_profiles import ProfileBundle, load_profile_bundle
 
 _BUNDLED_MEETING_PROFILE = (
-    Path(__file__).parent / "profile_bundles" / "meeting" / "2026-08-27.1"
+    Path(__file__).parent / "profile_bundles" / "meeting" / "2026-08-29.2"
 )
 _MAX_PROMPT_CHARACTERS = 32_000
 
