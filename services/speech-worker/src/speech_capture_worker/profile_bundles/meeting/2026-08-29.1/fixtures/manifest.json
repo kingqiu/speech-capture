@@ -1,0 +1,9 @@
+{
+  "fixture_schema_version": "1.0.0",
+  "fixtures": [
+    {
+      "id": "synthetic-meeting-semantic-gate",
+      "description": "不含真实用户、公司、音频或笔记内容的 B3.1 结果保留与一致性合成基线"
+    }
+  ]
+}

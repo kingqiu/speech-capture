@@ -1,0 +1,9 @@
+{
+  "fixture_schema_version": "1.0.0",
+  "fixtures": [
+    {
+      "id": "public-synthetic-meeting-b3",
+      "description": "不含真实用户、公司、音频、逐字稿或笔记内容的公开合成会议基线"
+    }
+  ]
+}

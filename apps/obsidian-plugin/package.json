@@ -1,0 +1,22 @@
+{
+  "name": "speech-capture-obsidian-plugin",
+  "version": "0.1.24",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc --noEmit && node esbuild.config.mjs production",
+    "dev": "node esbuild.config.mjs",
+    "package:alpha": "pnpm build && node scripts/package-alpha.mjs",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@noble/hashes": "2.2.0"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.1",
+    "obsidian": "1.13.1",
+    "typescript": "7.0.2",
+    "vitest": "4.1.10"
+  }
+}

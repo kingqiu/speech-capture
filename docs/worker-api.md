@@ -22,16 +22,22 @@ It gives the plugin one consistent interface for local and remote processing whi
 
 ## 3. Planned resources
 
-The exact OpenAPI schema will be produced during implementation. The design baseline reserves these resource groups:
+The canonical implemented schema is checked in at `packages/protocol/openapi.json`. Routes shown below are either
+implemented with their authentication and authorization boundaries or explicitly retained as later-stage reserved
+resources.
 
 ```text
 GET    /v1/health
 GET    /v1/capabilities
+POST   /v1/capabilities/negotiate
+GET    /v1/readiness
 
 POST   /v1/pairing/sessions
 POST   /v1/pairing/confirm
 GET    /v1/devices
 DELETE /v1/devices/{device_id}
+POST   /v1/devices/{device_id}/credential-rotations
+POST   /v1/device-credential-rotations/activate
 
 POST   /v1/uploads
 GET    /v1/uploads/{upload_id}
@@ -49,8 +55,12 @@ POST   /v1/jobs/{job_id}/retry
 GET    /v1/jobs/{job_id}/snapshot
 GET    /v1/jobs/{job_id}/events
 GET    /v1/jobs/{job_id}/artifacts
+GET    /v1/jobs/{job_id}/review-audio
+GET    /v1/jobs/{job_id}/review-audio/content
 
+GET    /v1/jobs/{job_id}/publication
 POST   /v1/jobs/{job_id}/publication-claims
+POST   /v1/jobs/{job_id}/publication-claims/release
 POST   /v1/jobs/{job_id}/publication-acknowledgements
 
 GET    /v1/models
@@ -61,11 +71,37 @@ GET    /v1/diagnostics/summary
 POST   /v1/diagnostics/export
 ```
 
+### 3.1 Implemented Stage F surface
+
+The checked-in OpenAPI now implements pairing, authenticated device management, two-phase credential rotation,
+uploads, jobs, lifecycle actions, bounded snapshots and updates, artifact listing, integrity-checked artifact
+download, time-aligned review audio with HTTP byte ranges, and an authenticated content-free readiness snapshot.
+Upload status includes exact missing part numbers; the update feed is bounded and deliberately excludes transcript
+text. Authenticated diagnostics expose only scoped counts, versions, health, resources, runtime availability, active
+model profile, and stable issue codes. Model management and diagnostic export remain reserved.
+
+The Stage I publication surface is now implemented. An authorized client can read the verified package plan, claim
+one durable publication lease using its authenticated device identity, release its own failed lease, and acknowledge
+the exact manifest after a complete Vault write. The status response exposes whether the active lease belongs to the
+caller without revealing another device identity. The Worker never accepts an absolute Vault path and does not write
+through the HTTP API: the current Obsidian client downloads and re-verifies the exact seven-file package, writes it to
+a sibling temporary directory in the current Vault, atomically renames it after verification, verifies the final
+directory, and only then sends the acknowledgement. Existing different content is treated as a conflict and is not
+claimed or overwritten; saving to a new location uses the same lease and verification rules.
+
+`POST /v1/jobs` also accepts an optional canonical `recording_date` (`YYYY-MM-DD`). It is validated as a real
+calendar date, returned on every job representation, and used only as initial metadata for derived artifacts. A later
+append-only recording-date correction may replace it; neither path mutates the source audio or raw ASR evidence.
+
 ## 4. Authentication
 
 ### Local
 
 Local calls still use an application credential. Loopback is not treated as proof of identity.
+
+Health, capability, and compatibility negotiation contain no job or user content. Pairing confirmation is also
+pre-authenticated but requires a short-lived, attempt-limited pairing secret. Stateful and private-data endpoints
+must not be added without credential checks.
 
 ### Remote
 
@@ -78,7 +114,24 @@ Remote access requires:
 
 Pairing creates a per-device revocable credential. Restarting or upgrading the Worker does not require pairing again. Reinstalling or deleting Worker security state does.
 
+The Worker Manager-facing pairing response also includes one short-lived `pairing_ticket`. It combines the public
+session locator and secret code into one pasteable value so the approved client presents only one `配对码` field.
+`POST /v1/pairing/confirm` accepts that single field while retaining the legacy `session_id` plus `pairing_code`
+form for compatibility; supplying both forms is rejected. The ticket inherits the same five-attempt, expiry, and
+single-consumption rules and is never stored in plaintext.
+
 Credentials are not stored in the synchronized Vault.
+
+The implemented server defaults to `127.0.0.1:8765`. Plain HTTP is rejected for non-loopback listeners; direct
+remote listeners require an explicit non-public IP plus a protected certificate/key pair. Wildcard and public
+binds are rejected. Tailscale Serve over the loopback listener is the recommended V1 deployment; see
+[Worker HTTPS and private-network setup](private-network-setup.md).
+
+The durable Worker security store retains only credential and pairing-secret digests plus explicit Vault allowlists.
+An authorized device can create a pairing session only within its own Vault scope, list only devices fully contained
+in that scope, and revoke those devices immediately. Rotation is a two-phase handoff: preparation leaves the old
+credential active; activation proves possession of the replacement and atomically switches credentials. A lost
+activation response is safely replayable with the now-active replacement token.
 
 ## 5. Idempotency
 
@@ -110,9 +163,165 @@ An upload manifest includes:
 
 The Worker records every accepted chunk checksum. Completion fails if any chunk is missing or if the assembled whole-file checksum differs.
 
-## 7. Job snapshot
+The implemented core contract further establishes:
 
-A job snapshot is bounded and contains:
+- part numbers are 1-based;
+- the default part size is 8 MiB, with a Worker-selected increase for very large sources;
+- the final part has the exact remaining length;
+- identical part retries are idempotent;
+- a part number cannot silently change checksum;
+- upload status reports received bytes, received part count, and exact missing part numbers;
+- persisted parts are rechecked during assembly rather than trusting database receipts alone;
+- `complete` requires a positive-duration audio stream reported by FFprobe;
+- assembled sources are atomically installed in private Worker storage;
+- absolute Worker paths are not returned to clients.
+
+Upload states are `uploading`, `verifying`, `complete`, and `failed`. An interrupted `verifying` state recovers to `uploading` while accepted parts remain valid.
+
+## 7. Verified job creation and scheduling
+
+The implemented core job contract requires a complete upload reference before a job can enter the real processing queue.
+
+- The job's Vault ID, filename, byte length, and SHA-256 must match the upload.
+- The private Worker source must still exist with the expected length.
+- Creation records the complete intake path through ordered job revisions and finishes at `queued`.
+- An idempotent retry returns the same job and does not duplicate intake events.
+- Unbound developer jobs are excluded from scheduling.
+- The Worker permits one active heavy-processing job by default.
+- Every scheduler pass runs a fresh resource preflight and persists its evidence.
+- Blocking resource pressure safely pauses the queued job; warnings remain visible and allow processing.
+
+This is currently a core and CLI contract. The corresponding HTTP request and response schemas will be added with FastAPI.
+
+### 7.1 Durable local ASR boundary
+
+The implemented core can now continue a claimed `preprocessing` job through deterministic audio preparation and one restart-safe ASR chunk per call.
+
+- The verified source is normalized privately to 16 kHz mono 16-bit PCM.
+- A versioned energy-aware plan accounts for every normalized frame exactly once.
+- Every model attempt writes immutable checksummed raw JSON before visible transcript segments.
+- Empty, truncated, discontinuous, or invalid-timestamp results are retained as rejected attempts and retried.
+- A succeeded raw attempt can be replayed after restart without invoking the model again.
+- Resource pressure is checked before every new model call and can safely pause the job.
+- Retry exhaustion records the exact failed range and produces `partial`, never a false complete state.
+
+Raw payload locations and content are not part of routine job or event responses. Future artifact authorization will govern raw evidence download.
+
+### 7.2 Durable alignment exit gate
+
+The implemented core now creates a private whole-transcript alignment report
+before entering diarization. The report independently states whether:
+
+- all planned chunks have matching immutable raw attempts and materialization records;
+- every transcribed segment has aligned timing;
+- stable outcomes account for the full verified source timeline;
+- the transcript contains any `inaudible` or `failed` range;
+- the job is safe to advance to speaker diarization.
+
+The report exposes only safe counts, durations, ranges, and issue codes. It does
+not expose transcript text through routine events or diagnostics. Estimated
+timing, missing evidence, uncovered ranges, and failed outcomes keep the job
+out of diarization. An explicitly reviewed `inaudible` range keeps
+`transcript_complete: false` but may continue through diarization so downstream
+artifacts can preserve an honest `partial` result.
+
+### 7.3 Conservative uncovered-range evidence
+
+The core developer boundary can analyze the unresolved ranges in the latest
+alignment report against the private normalized PCM. The persisted report is
+anchored to the alignment-report generation and checksum and contains only
+range boundaries, aggregate amplitude measurements, stable classifications,
+and reason codes.
+
+Only sufficiently long near-digital silence is reported as
+`definite_silence`. Audible, short, missing, or uncertain PCM is reported as
+`unresolved`; it is not assumed to be non-speech. This command does not expose
+transcript text, change stable transcript outcomes, or advance the job.
+
+### 7.4 Definite-silence timeline materialization
+
+The core can backfill only default-policy `definite_silence` as an aligned
+`non_speech` stable timeline outcome while the job is in `aligning`.
+
+Before each insertion, the store verifies that:
+
+- the exact range is marked `definite_silence` in the current gap checkpoint;
+- the gap checkpoint uses the fixed conservative materialization policy;
+- the gap checkpoint still references the current alignment report;
+- the complete source range maps to available PCM frames;
+- the inserted range does not overlap any stable segment.
+
+Backfilled ranges may appear before or between previously committed transcript
+segments. Their stable segment sequence remains append-only, while timeline
+consumers order them by source time. Each range receives a private
+materialization checkpoint linking the segment to the gap report, alignment
+report, normalized-audio checksum, and aggregate PCM evidence. Alignment is
+rerun after insertion so remaining unresolved ranges and stage readiness are
+immediately current.
+
+### 7.5 Explicit reviewed-gap materialization
+
+The core developer boundary can record a human-reviewed decision for one exact
+unresolved range as either aligned `non_speech` or aligned `inaudible`.
+
+The request carries an opaque review idempotency key, exact range boundaries,
+and the selected outcome. The Worker does not store reviewer identity or
+free-form notes. Before insertion it verifies that the complete range occurs
+exactly once in the current alignment report and binds the review checkpoint to
+that report's generation and payload SHA-256.
+
+A review key cannot later be rebound to another range or outcome. Per-range
+evidence and materialization checkpoints make retries and interruption repair
+idempotent. Alignment is refreshed immediately. An `inaudible` decision
+accounts for the timeline but keeps transcript completeness false. This
+boundary is explicit human evidence, not automatic audible-content
+classification.
+
+### 7.6 Controlled forced-alignment fallback
+
+The core developer boundary can process the next stable transcribed segment
+whose timing remains `estimated`. It does not retranscribe or replace text.
+
+Before model work, the Worker requires the current alignment report, exact
+normalized-audio plan, unchanged segment revision, and segment language or job
+language hint. It performs a fresh resource boundary check and runs the pinned
+`Qwen/Qwen3-ForcedAligner-0.6B` over only that segment's PCM and stable text.
+
+The returned word units must:
+
+- account for the normalized stable text without additions or omissions;
+- be finite, monotonic, non-overlapping, and inside the original segment range;
+- produce a positive outer range.
+
+The private word result is atomically stored and checksummed before the stable
+segment metadata changes. The Worker preserves segment ID, commit key, text,
+language, and speaker state; only start, end, timing status, and revision
+change. A durable checkpoint binds the evidence to the source alignment report,
+segment revision and text hash, normalized-audio checksum, model, frame range,
+and raw result checksum.
+
+After interruption, durable evidence is replayed without another model call.
+Whole-transcript finalization revalidates the private file; a manual `aligned`
+flag without matching evidence, or later evidence tampering, blocks
+diarization.
+
+### 7.7 Evidence-only speech-activity evaluation
+
+The developer boundary can run a revision-pinned `pyannote/segmentation` VAD
+candidate over the normalized audio and persist timing-only observations for
+the exact ranges that remain unresolved.
+
+The report binds detector and model versions to the current gap checkpoint,
+alignment checkpoint, and normalized-audio checksum. Returned regions must be
+finite, ordered, non-overlapping, and in bounds. Resource blocking happens
+before model work. The result never changes stable transcript outcomes or job
+state, and `no_speech_detected` is explicitly not treated as proof of
+`non_speech` or `inaudible`. Automatic materialization remains disabled until a
+representative labeled evaluation establishes an accepted decision policy.
+
+## 8. Job snapshot
+
+The implemented core snapshot is an internally consistent, bounded read containing:
 
 - identity and current revision;
 - stage and status;
@@ -128,7 +337,36 @@ A job snapshot is bounded and contains:
 
 Large artifacts are downloaded separately.
 
-## 8. Event stream
+Stable segments use independent `after_segment_sequence` and `segment_limit` pagination. The current core limit is 500 segments per snapshot page. The response returns `next_after_segment_sequence`, `has_more_segments`, and `latest_event_sequence`.
+
+Committed timeline outcomes are `transcribed`, `inaudible`, `non_speech`, or `failed`. Only `transcribed` carries text. Segment text stays stable while alignment and speaker metadata use guarded revisions.
+
+### 8.1 Review audio
+
+The preprocessing boundary creates a deterministic private review WAV from the verified 16 kHz normalized audio.
+It is 8 kHz, 8-bit, mono PCM (64 kbit/s payload), contains no metadata, and must preserve total timeline duration
+within 1 millisecond. The file and a checksum-bound private checkpoint live under the job directory and are not
+added to the Vault artifact package.
+
+`GET /v1/jobs/{job_id}/review-audio` returns only authorized metadata: media type, size, checksum, duration, PCM
+facts, a content path, byte-range support, and `job_lifetime` retention. The content endpoint reuses device bearer
+authentication and job Vault authorization. Standard byte ranges return `206`, `Accept-Ranges`, and
+`Content-Range`, so a client can seek without downloading the whole file. Missing, tampered, symlinked, or
+checksum-incompatible review audio is rejected without exposing its path or content.
+
+The personal MVP uses job-lifetime retention and a normal time slider. Optional waveform peaks, explicit expiry
+policies, and multi-client bandwidth controls remain later operational refinements; their absence does not permit
+public transport or publishing audio into the Vault.
+
+### 8.2 Worker readiness
+
+`GET /v1/readiness` is authenticated and contains no filenames, transcript text, paths, job content, endpoints, or
+credentials. It reports database health, storage readiness, FFmpeg/FFprobe availability, local Ollama reachability,
+the active validated model profile, disk reserve facts, memory/swap facts, per-profile `ready`/`warning`/`blocked`
+decisions, and stable issue codes. A reachable health endpoint is not treated as proof that a new job can start;
+the plugin uses this readiness result after authentication.
+
+## 9. Event stream
 
 Each event has:
 
@@ -156,7 +394,11 @@ job.failed
 
 Clients reconnect with the last acknowledged sequence number. If history has been compacted, the Worker returns a fresh snapshot and cursor.
 
-## 9. Error model
+The implemented SQLite update feed is bounded to at most 1,000 events per request and returns whether more events remain. State transitions and progressive updates share one monotonically increasing cursor.
+
+Routine update payloads do not contain transcript text. Segment and provisional events carry IDs, time ranges, generations, outcome, and text length; an authorized client reads actual text from the snapshot. This preserves reconnect behavior without leaking spoken content into routine event handling or diagnostics.
+
+## 10. Error model
 
 Errors contain:
 
@@ -172,11 +414,22 @@ Examples:
 ```text
 UPLOAD_CHECKSUM_MISMATCH
 SOURCE_UNDECODABLE
+AUDIO_NORMALIZATION_UNAVAILABLE
+AUDIO_NORMALIZATION_FAILED
+NORMALIZED_AUDIO_INVALID
+REVIEW_AUDIO_NOT_FOUND
+REVIEW_AUDIO_GENERATION_FAILED
+REVIEW_AUDIO_VERIFICATION_FAILED
 DISK_RESERVE_TOO_LOW
 MEMORY_PRESSURE_PAUSED
 MODEL_NOT_READY
 DIARIZATION_AUTH_REQUIRED
 ASR_TRUNCATED
+ASR_ATTEMPT_CONFLICT
+ASR_RESULT_REJECTED
+ASR_CHUNK_RETRIES_EXHAUSTED
+TRANSCRIPT_COMMIT_CONFLICT
+TRANSCRIPT_REVISION_CONFLICT
 WORKER_VERSION_INCOMPATIBLE
 PUBLICATION_TARGET_UNAVAILABLE
 PUBLICATION_CONFLICT
@@ -184,7 +437,7 @@ PUBLICATION_CONFLICT
 
 Error payloads never include secrets or transcript content.
 
-## 10. Compatibility
+## 11. Compatibility
 
 The plugin and Worker exchange:
 
@@ -195,7 +448,15 @@ The plugin and Worker exchange:
 
 A compatible older feature set may continue. An incompatible client is blocked before upload with a clear upgrade instruction.
 
-## 11. Provider independence
+The checked-in OpenAPI document is also the sole source for generated wire types:
+
+- `packages/protocol/generated/python/speech_capture_protocol.py`;
+- `packages/protocol/generated/typescript/speech-capture-protocol.ts`.
+
+Both outputs embed the source OpenAPI SHA-256. `packages/protocol/scripts/generate_types.py --check` fails when
+the schema and either language output drift apart.
+
+## 12. Provider independence
 
 No endpoint assumes Google Drive or another sync provider.
 

@@ -1,0 +1,9 @@
+{
+  "id": "speech-capture",
+  "name": "Speech Capture",
+  "version": "0.1.24",
+  "minAppVersion": "1.11.4",
+  "description": "把长录音安全地转成逐字稿和可用笔记。",
+  "author": "Speech Capture",
+  "isDesktopOnly": true
+}

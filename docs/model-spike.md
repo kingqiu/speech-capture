@@ -160,3 +160,5 @@ This baseline does not yet prove production quality:
 The isolated Python environment successfully imports pyannote.audio 4.0.7, torch, and torchcodec. The upstream doctor reports only the expected missing-token warning; no diarization inference or gated model download has been attempted.
 
 The next quality step is a private real recording supplied by the project owner. Its audio, reviewed transcript, and raw reports must remain outside Git.
+
+The validated probe boundary is now connected to the persistent Worker core for one-chunk-at-a-time execution. The Worker adds deterministic private PCM normalization, frame-complete chunk planning, raw-attempt durability, output rejection and retry, stable transcript materialization, progress, resource boundary pause, and restart replay. The probe remains the benchmark harness; it is not the durable job store.

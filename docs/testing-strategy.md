@@ -46,10 +46,17 @@ Scenarios include:
 - checksum mismatch;
 - media validation failure;
 - process restart during every major stage;
+- normalization-file corruption and deterministic rebuild;
+- crash after raw ASR commit but before transcript materialization;
+- retry of rejected and failed ASR chunks;
 - model crash and timeout;
 - partial diarization availability;
 - pause, resume, cancel, and retry;
 - artifact regeneration after transcript correction;
+- concurrent publication claim, lease expiry takeover, and restart recovery;
+- atomic seven-file Vault publication and post-write checksum verification;
+- interruption after atomic rename but before acknowledgement;
+- pre-existing user edits, sync-like conflicts, symlink escape, and corrupt Worker artifact rejection;
 - duplicate-source behavior.
 
 Model adapters also support deterministic fakes so reliability tests do not require expensive inference.
@@ -77,6 +84,12 @@ Exercise the plugin, Worker, Manager, and a temporary Vault:
 - reduced-motion mode;
 - narrow panes and long multilingual text;
 - screen-reader names for controls, progress, and status.
+- authenticated review-audio metadata and byte ranges, including seek, invalid ranges, Vault isolation, tampering,
+  symlink rejection, timeline equality, and private permissions;
+- authenticated readiness snapshots for ready, warning, and blocked profiles, with explicit checks that no source
+  name, path, transcript, credential, or private endpoint is returned;
+- one-field pairing-ticket confirmation, ambiguous-input rejection, expiry/single-use behavior, and exclusion of
+  the plaintext ticket from the security database and validation responses;
 
 ## 3. Audio coverage matrix
 
@@ -97,6 +110,15 @@ The private test set should span:
 
 Synthetic and openly licensed fixtures cover repository tests. Real personal recordings remain local and ignored by Git.
 
+For structured-note quality, each supported content type also has a scene-contract regression:
+
+- synthesis receives the complete corrected transcript;
+- every generated section carries valid transcript evidence;
+- section kinds are restricted to the selected content type;
+- rendered headings and semantics match that type instead of reusing meeting sections;
+- empty, irrelevant meeting-style sections are omitted;
+- synthetic contract tests do not count as human acceptance of real content quality.
+
 ## 4. Transcript completeness gates
 
 For each validated source:
@@ -109,6 +131,37 @@ For each validated source:
 - ASR output ending early is detected even if the model reports success;
 - unresolved intervals cause `partial`, not `complete`;
 - raw ASR output exists before cleanup or summarization.
+- normalized frame chunks are contiguous, non-overlapping, and end at the exact final frame;
+- container-duration rounding cannot make visible progress exceed the verified source duration.
+- every materialized chunk still references matching checksummed raw evidence;
+- estimated transcript timing blocks the alignment exit gate;
+- forced alignment preserves stable text and segment identity while revising only timing metadata;
+- forced-alignment words must account for the stable text and remain monotonic and in bounds;
+- private forced-alignment evidence is checksummed before metadata changes and replays after interruption;
+- missing, stale, incomplete, or tampered forced-alignment evidence blocks diarization;
+- forced alignment pauses before model work when the resource boundary is blocked;
+- uncovered ranges are persisted without transcript text and block diarization;
+- a complete report is idempotent across restart and advances exactly once.
+- uncovered-range PCM evidence is anchored to the exact alignment report and normalized-audio checksum;
+- only sufficiently long near-digital silence receives a definite classification;
+- short or audible PCM remains unresolved, and changed normalized audio invalidates prior measurement assumptions.
+- a source range truncated by the normalized PCM boundary remains unresolved even when all available samples are zero;
+- only current default-policy definite silence can become a stable `non_speech` outcome;
+- silence can be backfilled before or between existing text without changing stable segment IDs or cursors;
+- stale alignment evidence, custom thresholds, audible PCM, and overlapping ranges cannot authorize materialization;
+- alignment is refreshed after backfill so the remaining uncovered timeline is durable immediately.
+- a human-reviewed outcome must match one complete current unresolved range;
+- review keys are idempotent and cannot be rebound to another range or outcome;
+- stale review evidence and overlapping stable segments cannot authorize materialization;
+- reviewed `inaudible` accounts for time and permits downstream processing
+  without claiming a complete transcript;
+- interruption after a reviewed segment commit is repaired without duplicating the segment;
+- routine review checkpoints and CLI output contain no transcript or free-form reviewer text.
+- speech-activity candidates are pinned to immutable model revisions and fixed configurations;
+- detector regions must be finite, ordered, non-overlapping, non-empty, and within normalized audio;
+- VAD observations are bound to current gap/alignment evidence and never materialize stable outcomes;
+- resource blocking occurs before VAD model invocation, and no-gap runs do not load the model;
+- `no_speech_detected` remains an evaluation observation, not proof of non-speech or inaudibility.
 
 The core automated assertion is:
 
@@ -140,6 +193,14 @@ For a small, high-value subset, create:
 
 The gold-standard directory is excluded from Git and cloud processing.
 
+For VAD candidate evaluation, the implemented private manifest uses opaque
+dataset/sample IDs, relative audio paths, and explicit `speech` or
+`non_speech` millisecond ranges. Unlabeled ranges are excluded. The evaluator
+rejects escaping/symlinked paths, overlapping or out-of-bounds labels, changed
+source bytes, invalid detector regions, and incomplete policy configuration.
+Its `0600` report contains hashes and metrics but no audio path, filename, or
+transcript.
+
 ### 5.2 Metrics
 
 Possible quantitative measurements:
@@ -152,6 +213,9 @@ Possible quantitative measurements:
 - evidence precision;
 - unsupported critical-claim count;
 - unresolved-range accuracy.
+- speech miss rate and speech recall;
+- false-speech rate and non-speech specificity;
+- labeled speech/non-speech duration and sample-level error incidence.
 
 Human review also scores usefulness, clarity, omission severity, and whether uncertainty is represented honestly.
 
@@ -168,6 +232,9 @@ A summary passes only when:
 - the note remains useful at normal reading length.
 
 Thresholds will be set from the first measured local baseline rather than invented before the models are evaluated.
+The VAD evaluator therefore accepts no default thresholds: all rate limits and
+minimum labeled-duration requirements must be supplied together by the owner,
+and even a passing benchmark does not authorize automatic materialization.
 
 ## 6. Fault-injection plan
 
@@ -208,6 +275,9 @@ Before each release:
 - scan tracked files and build artifacts for credentials and private paths;
 - assert that routine logs omit transcript text;
 - inspect diagnostic redaction;
+- assert wildcard/public listeners fail closed and non-loopback listeners require TLS;
+- perform a real local TLS health check with a temporary certificate;
+- verify unexpected exceptions, persisted job failures, and diagnostic summaries never echo private content;
 - verify private fixture directories remain ignored;
 - test device revocation;
 - test path traversal and symlink escape;
@@ -227,3 +297,20 @@ Each release candidate produces a local redacted report containing:
 - manual review sign-off.
 
 The public repository may receive sanitized aggregate results, never private audio or transcript content.
+
+## 10. Stage I plugin submission contract
+
+The plugin submission tests use synthetic byte strings and synthetic task text only. They verify that:
+
+- source SHA-256 is computed through bounded slices rather than a whole-file allocation;
+- only Worker-reported missing parts are read and uploaded;
+- every uploaded part carries and receives confirmation of its SHA-256 and byte count;
+- upload and job idempotency keys are stable digests and do not expose recording context;
+- recording context is trimmed, and recording date and content type reach the job request;
+- task lists are scoped to the paired Vault, snapshots accept stable and provisional transcript data, and lifecycle
+  actions bind their idempotency key to the current revision;
+- UI connection recovery waits one minute between automatic attempts, stops after three failures, and only then
+  exposes the in-Obsidian manual reconnect action.
+
+No Stage I unit or screenshot fixture may contain a real filename, transcript, Vault name, endpoint, token, or audio
+sample. Visual comparisons must use the approved synthetic Stage H content at the same viewport width and theme.

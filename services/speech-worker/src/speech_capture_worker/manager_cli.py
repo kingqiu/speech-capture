@@ -1,0 +1,168 @@
+"""Local macOS Worker Manager command surface for launchd lifecycle operations."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import shutil
+import sys
+from collections.abc import Sequence
+from pathlib import Path
+
+from speech_capture_worker.diagnostic_bundle import build_diagnostic_bundle
+from speech_capture_worker.errors import InvalidJobRequest, WorkerCoreError
+from speech_capture_worker.launchd_service import (
+    DEFAULT_LAUNCHD_LABEL,
+    LaunchdServiceConfig,
+    LaunchdServiceManager,
+    default_agent_path,
+    default_data_dir,
+)
+from speech_capture_worker.manager_status import collect_manager_status
+from speech_capture_worker.model_activation import ModelActivationManager
+from speech_capture_worker.model_budget import (
+    calculate_model_download_budget,
+    presence_from_status,
+)
+from speech_capture_worker.model_validation import validate_model_profile
+from speech_capture_worker.redaction import public_cli_error_payload
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _build_parser().parse_args(argv)
+    try:
+        config = _config_from_args(args)
+        if args.command in {
+            "model-activate",
+            "model-switch",
+            "model-rollback",
+            "model-activation-status",
+        }:
+            activation = ModelActivationManager(config.data_dir)
+            if args.command == "model-activation-status":
+                payload = {"activation": activation.status().to_dict()}
+            else:
+                operation = getattr(
+                    activation,
+                    args.command.removeprefix("model-").replace("-", "_"),
+                )
+                result = operation(args.profile) if hasattr(args, "profile") else operation()
+                payload = {"activation": result.to_dict()}
+            print(json.dumps(payload, sort_keys=True))
+            return 0
+        if args.command == "model-verify":
+            report = validate_model_profile(args.profile)
+            print(json.dumps({"validation": report.to_dict()}, sort_keys=True))
+            return 0 if report.valid else 3
+        manager = LaunchdServiceManager()
+        if args.command == "diagnostic-bundle":
+            service = manager.status(config)
+            status = collect_manager_status(config, service)
+            activation = ModelActivationManager(config.data_dir).status()
+            validation = validate_model_profile("all")
+            result = build_diagnostic_bundle(
+                args.output,
+                status=status,
+                activation=activation,
+                validation=validation,
+                private_markers=(str(config.data_dir), str(Path.home())),
+            )
+            print(json.dumps({"diagnostic_bundle": result.to_dict()}, sort_keys=True))
+            return 0
+        if args.command in {"status", "model-budget"}:
+            service = manager.status(config)
+            status = collect_manager_status(config, service)
+            if args.command == "status":
+                payload = {"status": status.to_dict()}
+            else:
+                payload = {
+                    "budget": calculate_model_download_budget(
+                        args.profile,
+                        disk_total_bytes=status.resources.disk_total_bytes,
+                        disk_free_bytes=status.resources.disk_free_bytes,
+                        present=presence_from_status(status),
+                    ).to_dict()
+                }
+            print(json.dumps(payload, sort_keys=True))
+        else:
+            operation = getattr(manager, args.command)
+            service = operation(config)
+            print(json.dumps({"service": service.to_dict()}, sort_keys=True))
+        return 0
+    except WorkerCoreError as exc:
+        print(
+            json.dumps({"error": public_cli_error_payload(exc.code, exc.message)}),
+            file=sys.stderr,
+        )
+        return 2
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="speech-capture-manager",
+        description="Install and control the per-user Speech Capture Worker service.",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    for command in (
+        "install",
+        "start",
+        "stop",
+        "restart",
+        "status",
+        "uninstall",
+        "model-budget",
+        "model-verify",
+        "model-activate",
+        "model-switch",
+        "model-rollback",
+        "model-activation-status",
+        "diagnostic-bundle",
+    ):
+        subparser = subparsers.add_parser(command)
+        subparser.add_argument("--data-dir", type=Path, default=default_data_dir())
+        subparser.add_argument("--executable", type=Path)
+        subparser.add_argument("--host", default="127.0.0.1")
+        subparser.add_argument("--port", type=int, default=8765)
+        subparser.add_argument("--ssl-certfile", type=Path)
+        subparser.add_argument("--ssl-keyfile", type=Path)
+        if command in {
+            "model-budget",
+            "model-verify",
+            "model-activate",
+            "model-switch",
+        }:
+            subparser.add_argument(
+                "--profile",
+                choices=("accuracy", "speed", "all"),
+                default="accuracy",
+            )
+        if command == "diagnostic-bundle":
+            subparser.add_argument("--output", type=Path, required=True)
+    return parser
+
+
+def _config_from_args(args: argparse.Namespace) -> LaunchdServiceConfig:
+    executable = args.executable or _find_worker_executable()
+    return LaunchdServiceConfig(
+        executable=executable,
+        data_dir=args.data_dir,
+        agent_path=default_agent_path(label=DEFAULT_LAUNCHD_LABEL),
+        label=DEFAULT_LAUNCHD_LABEL,
+        host=args.host,
+        port=args.port,
+        ssl_certfile=args.ssl_certfile,
+        ssl_keyfile=args.ssl_keyfile,
+    )
+
+
+def _find_worker_executable() -> Path:
+    candidate = shutil.which("speech-capture-worker")
+    if candidate is None:
+        raise InvalidJobRequest(
+            "The Worker executable was not found; provide --executable explicitly."
+        )
+    return Path(candidate)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
