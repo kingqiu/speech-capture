@@ -20,6 +20,7 @@ import type {
 } from "../../../packages/protocol/generated/typescript/speech-capture-protocol";
 
 import {
+  connectionRecoveryLabel,
   nextConnectionAttempt,
   recoveryAfterFailure,
   type ConnectionAttemptMode,
@@ -655,15 +656,18 @@ export class SpeechWorkbenchView extends ItemView {
       const error = main.createDiv({ cls: "speech-capture-inline-warning" });
       if (this.connectionRecovery.state === "retrying") {
         error.createSpan({
-          text: `连接中断，系统将在 1 分钟后自动重试（已尝试 ${this.connectionRecovery.attemptsCompleted}/3 次）`
+          text: `远程网络暂时不稳定，系统将在 1 分钟后自动重试（已尝试 ${this.connectionRecovery.attemptsCompleted}/3 次）`
         });
       } else {
-        error.createSpan({ text: "三次自动重试仍未恢复，请手动重试。" });
+        error.createSpan({ text: "远程连接连续三次未恢复，请手动重试。" });
         const retry = error.createEl("button", {
           text: `重新连接${this.plugin.preferredWorker()?.displayName ?? " Worker"}`,
           attr: { type: "button" }
         });
         retry.addEventListener("click", () => void this.refreshJobs("manual"));
+      }
+      if (this.connectionRecovery.diagnostic) {
+        error.createEl("small", { text: this.connectionRecovery.diagnostic });
       }
     } else if (this.taskError) {
       main.createEl("p", {
@@ -977,7 +981,7 @@ export class SpeechWorkbenchView extends ItemView {
     });
     sourceCopy.createSpan({
       text: offline
-        ? "当前无法播放音频，逐字稿仍可阅读和修改"
+        ? "远程连接正在恢复，逐字稿仍可阅读和修改"
         : audioDeleted
           ? "原始音频已删除 · 逐字稿、证据和笔记仍可使用"
         : this.localAudioByJobId.has(snapshot.job.job_id)
@@ -995,7 +999,7 @@ export class SpeechWorkbenchView extends ItemView {
       slider.disabled = true;
       if (this.connectionRecovery?.state === "retrying") {
         sourceCopy.createEl("small", {
-          text: `系统将在 1 分钟后自动重试（已尝试 ${this.connectionRecovery.attemptsCompleted}/3 次）`
+          text: `远程网络暂时不稳定，系统将在 1 分钟后自动重试（已尝试 ${this.connectionRecovery.attemptsCompleted}/3 次）`
         });
       } else {
         const reconnect = source.createEl("button", {
@@ -2420,7 +2424,11 @@ export class SpeechWorkbenchView extends ItemView {
     this.assurance(
       facts,
       "wifi",
-      this.connectionRecovery ? "连接待恢复" : "连接稳定"
+      this.connectionRecovery?.state === "retrying"
+        ? "网络波动，正在恢复"
+        : this.connectionRecovery
+          ? "暂时无法连接"
+          : "连接稳定"
     );
     this.assurance(facts, "circle-check", "上传已完成");
     this.assurance(
@@ -3620,7 +3628,8 @@ export class SpeechWorkbenchView extends ItemView {
         this.connectionRecovery = recoveryAfterFailure(
           this.connectionRecovery,
           mode,
-          Date.now()
+          Date.now(),
+          error.diagnostic
         );
         this.render();
       } else if (this.viewMode === "task" || mode === "manual") {
@@ -5446,7 +5455,10 @@ export class SpeechWorkbenchView extends ItemView {
       return { text: `${workerName} · 正在检测`, className: "is-neutral" };
     }
     if (this.connectionRecovery) {
-      return { text: `${workerName} · 连接中断`, className: "is-warning" };
+      return {
+        text: `${workerName} · ${connectionRecoveryLabel(this.connectionRecovery)}`,
+        className: "is-warning"
+      };
     }
     if (this.viewMode === "task" && this.taskDetailMode === "publication") {
       switch (this.publicationState.state) {

@@ -30,7 +30,8 @@ import type {
 export class JobClientError extends Error {
   public constructor(
     public readonly code: "authentication" | "conflict" | "unavailable" | "invalid",
-    message: string
+    message: string,
+    public readonly diagnostic: string | null = null
   ) {
     super(message);
     this.name = "JobClientError";
@@ -514,7 +515,14 @@ function parseSuccess(response: WorkerTransportResponse): Record<string, unknown
     throw new JobClientError("conflict", "任务状态已发生变化，正在重新读取。");
   }
   if (response.status === 0 || response.status >= 500) {
-    throw new JobClientError("unavailable", "暂时无法连接 Worker。");
+    throw new JobClientError(
+      "unavailable",
+      "暂时无法连接 Worker。",
+      response.error ??
+        (response.status >= 500
+          ? `Worker 暂时返回服务错误（HTTP ${response.status.toString()}）`
+          : "远程网络请求未完成")
+    );
   }
   if (response.status !== 200 || !isRecord(response.json)) {
     throw new JobClientError("invalid", "Worker 未接受当前请求。");

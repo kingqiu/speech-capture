@@ -22,17 +22,27 @@ type NodeHttpsAgentConstructor = new (options: {
   readonly maxFreeSockets: number;
 }) => NodeHttpsAgent;
 
-const remoteHttpsAgent = new (
-  nodeHttpsAgentConstructor as unknown as NodeHttpsAgentConstructor
-)({
-  keepAlive: true,
-  keepAliveMsecs: 30_000,
-  maxSockets: 2,
-  maxFreeSockets: 1
-});
+let remoteHttpsAgent: NodeHttpsAgent | null = null;
+
+function getRemoteHttpsAgent(): NodeHttpsAgent {
+  remoteHttpsAgent ??= new (
+    nodeHttpsAgentConstructor as unknown as NodeHttpsAgentConstructor
+  )({
+    keepAlive: true,
+    keepAliveMsecs: 30_000,
+    maxSockets: 2,
+    maxFreeSockets: 1
+  });
+  return remoteHttpsAgent;
+}
+
+function resetRemoteHttpsAgent(): void {
+  remoteHttpsAgent?.destroy();
+  remoteHttpsAgent = null;
+}
 
 export function closeObsidianWorkerTransportPool(): void {
-  remoteHttpsAgent.destroy();
+  resetRemoteHttpsAgent();
 }
 
 export class ObsidianWorkerTransport implements WorkerTransport {
@@ -118,6 +128,7 @@ export class ObsidianWorkerTransport implements WorkerTransport {
           headers: response.headers
         };
       } catch {
+        resetRemoteHttpsAgent();
         return {
           status: 0,
           arrayBuffer: new ArrayBuffer(0),
@@ -194,7 +205,7 @@ async function requestJsonWithNodeHttps(
     readonly timeoutMs?: number;
   }
 ): Promise<WorkerTransportResponse> {
-  try {
+  const performRequest = async (): Promise<WorkerTransportResponse> => {
     const encodedBody =
       options.body !== undefined
         ? JSON.stringify(options.body)
@@ -231,11 +242,32 @@ async function requestJsonWithNodeHttps(
       }
     }
     return { status: response.status, json };
-  } catch (error) {
+  };
+
+  try {
+    return await performRequest();
+  } catch (firstError) {
+    resetRemoteHttpsAgent();
+    if (
+      (options.method ?? "GET") === "GET" &&
+      options.body === undefined &&
+      options.rawBody === undefined
+    ) {
+      try {
+        return await performRequest();
+      } catch (retryError) {
+        resetRemoteHttpsAgent();
+        return {
+          status: 0,
+          json: null,
+          error: describeRequestFailure(retryError, "桌面 HTTPS 网络层")
+        };
+      }
+    }
     return {
       status: 0,
       json: null,
-      error: describeRequestFailure(error, "桌面 HTTPS 网络层")
+      error: describeRequestFailure(firstError, "桌面 HTTPS 网络层")
     };
   }
 }
@@ -263,7 +295,7 @@ async function requestWithNodeHttps(
     const chunks: Uint8Array[] = [];
     const request = (nodeHttpsRequest as unknown as NodeHttpsRequestFactory)(
       new URL(path, `${worker.endpoint}/`),
-      { method: options.method, headers, agent: remoteHttpsAgent },
+      { method: options.method, headers, agent: getRemoteHttpsAgent() },
       (response) => {
         response.on("data", (chunk) => chunks.push(chunk));
         response.on("error", reject);
