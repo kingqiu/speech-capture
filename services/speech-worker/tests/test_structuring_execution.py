@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import io
 import json
@@ -2327,6 +2328,65 @@ def test_external_meeting_profile_repairs_lossless_semantic_regression(monkeypat
                 "speaker_id": "speaker_2",
                 "text": "请提交全部款式模板。",
             },
+        ],
+    )
+
+    assert result == baseline
+    assert len(requests) == 1
+
+
+def test_external_meeting_profile_restores_cross_speaker_evidence(monkeypatch) -> None:
+    engine = OllamaStructuringEngine(
+        model="qwen3:14b",
+        editor_model="qwen3:8b",
+        meeting_profile=load_bundled_meeting_profile(),
+    )
+    baseline = {
+        "summary": {"text": "确认数据范围。", "evidence": ["seg_1"]},
+        "highlights": [],
+        "decisions": [],
+        "actions": [],
+        "risks": [],
+        "open_questions": [],
+        "timeline_sections": [],
+        "speaker_summaries": [
+            {
+                "speaker_id": "speaker_1",
+                "display_name": "",
+                "affiliation": "",
+                "role": "",
+                "summary": "提出数据范围。",
+                "evidence": ["seg_1"],
+            },
+            {
+                "speaker_id": "speaker_2",
+                "display_name": "",
+                "affiliation": "",
+                "role": "",
+                "summary": "确认执行方式。",
+                "evidence": ["seg_2"],
+            },
+        ],
+    }
+    regressed = copy.deepcopy(baseline)
+    regressed["speaker_summaries"][0].update(
+        {
+            "summary": "确认执行方式。",
+            "evidence": ["seg_2"],
+        }
+    )
+    requests = []
+
+    def generate(prompt, **kwargs):
+        requests.append({"prompt": prompt, **kwargs})
+        return json.dumps(regressed, ensure_ascii=False)
+
+    monkeypatch.setattr(engine, "_generate", generate)
+    result = engine.refine_meeting_document(
+        baseline,
+        [
+            {"segment_id": "seg_1", "speaker_id": "speaker_1", "text": "提出数据范围。"},
+            {"segment_id": "seg_2", "speaker_id": "speaker_2", "text": "确认执行方式。"},
         ],
     )
 

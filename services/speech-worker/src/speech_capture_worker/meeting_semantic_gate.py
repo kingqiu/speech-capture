@@ -311,9 +311,28 @@ def _clear_unsupported_speaker_metadata(
             continue
         speaker_id = str(raw_item.get("speaker_id") or "")
         baseline_item = baseline_by_speaker.get(speaker_id, {})
+        evidence_ids = _evidence(raw_item)
+        has_self_evidence = any(
+            str(segment_by_id.get(segment_id, {}).get("speaker_id") or "") == speaker_id
+            for segment_id in evidence_ids
+        )
+        if evidence_ids and not has_self_evidence:
+            baseline_evidence = _evidence(baseline_item)
+            baseline_has_self_evidence = any(
+                str(segment_by_id.get(segment_id, {}).get("speaker_id") or "") == speaker_id
+                for segment_id in baseline_evidence
+            )
+            if baseline_has_self_evidence:
+                # A quality edit may accidentally attach another participant's
+                # evidence to this speaker.  The already validated baseline is
+                # the only lossless repair available here: restore that one
+                # summary instead of rejecting the entire regenerated Note.
+                raw_item.clear()
+                raw_item.update(copy.deepcopy(dict(baseline_item)))
+                continue
         evidence_text = "".join(
             str(segment_by_id.get(segment_id, {}).get("text") or "")
-            for segment_id in _evidence(raw_item)
+            for segment_id in evidence_ids
         )
         normalized_evidence = _normalized(evidence_text)
         for field in ("role", "affiliation"):

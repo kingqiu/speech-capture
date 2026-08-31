@@ -217,3 +217,31 @@ def test_deterministic_repair_falls_back_from_ungrounded_speaker_summary() -> No
 
     assert repaired["speaker_summaries"][0]["role"] == ""
     assert repaired["speaker_summaries"][0]["summary"] == "提出匹配规则。"
+
+
+def test_deterministic_repair_restores_cross_speaker_summary_from_baseline() -> None:
+    candidate = _candidate()
+    candidate["speaker_summaries"][0].update(
+        {
+            "role": "项目负责人",
+            "summary": "负责数据交付。",
+            "evidence": ["seg_3"],
+        }
+    )
+
+    repaired = repair_meeting_semantic_edit(
+        _baseline(),
+        candidate,
+        segments=_segments(),
+        validators=tuple(MEETING_SEMANTIC_VALIDATORS),
+    )
+    result = evaluate_meeting_semantic_edit(
+        _baseline(),
+        repaired,
+        segments=_segments(),
+        validators=tuple(MEETING_SEMANTIC_VALIDATORS),
+    )
+
+    assert repaired["speaker_summaries"] == _baseline()["speaker_summaries"]
+    assert result.passed is True
+    assert result.issue_codes == ()
