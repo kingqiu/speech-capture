@@ -143,10 +143,15 @@ export async function regenerateJobSummary(
   job: Pick<JobSchema, "job_id" | "revision">
 ): Promise<SummaryRevisionRegenerationEnvelope> {
   const body = { expected_revision: job.revision };
+  // A failed regeneration leaves the job revision unchanged.  Include one
+  // per-click nonce so a deliberate retry is not replayed as the prior failed
+  // request, while transport handling within this call still uses one stable
+  // idempotency key.
+  const requestNonce = globalThis.crypto.randomUUID();
   const idempotency = bytesToHex(
     sha256(
       new TextEncoder().encode(
-        `regenerate-summary\n${job.job_id}\n${job.revision.toString()}`
+        `regenerate-summary\n${job.job_id}\n${job.revision.toString()}\n${requestNonce}`
       )
     )
   );

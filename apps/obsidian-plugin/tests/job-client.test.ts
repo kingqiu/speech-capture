@@ -382,6 +382,53 @@ describe("job client", () => {
     expect(transport.requests[0]?.timeoutMs).toBe(15_000);
   });
 
+  it("uses a fresh idempotency key when retrying the same failed revision", async () => {
+    const failed = {
+      request_id: "regen_failed",
+      state: "failed",
+      phase: "failed",
+      requested_at: "2026-08-08T00:00:00Z",
+      started_at: "2026-08-08T00:00:01Z",
+      updated_at: "2026-08-08T00:01:00Z",
+      finished_at: "2026-08-08T00:01:00Z",
+      elapsed_seconds: 59,
+      revision_key: null,
+      error_code: "StructuringFailed",
+      error_message: "候选笔记生成失败。"
+    };
+    const queued = {
+      ...failed,
+      request_id: "regen_retry",
+      state: "queued",
+      phase: "queued",
+      started_at: null,
+      updated_at: "2026-08-08T00:02:00Z",
+      finished_at: null,
+      elapsed_seconds: 0,
+      error_code: null,
+      error_message: null
+    };
+    const transport = new QueueTransport([
+      response(200, { applied: false, job: JOB, regeneration: failed }),
+      response(200, { applied: true, job: JOB, regeneration: queued })
+    ]);
+
+    await regenerateJobSummary(transport, WORKER, "secret", JOB);
+    const retried = await regenerateJobSummary(
+      transport,
+      WORKER,
+      "secret",
+      JOB
+    );
+
+    const firstKey = transport.requests[0]?.headers?.["Idempotency-Key"];
+    const retryKey = transport.requests[1]?.headers?.["Idempotency-Key"];
+    expect(firstKey).toMatch(/^obsidian-[0-9a-f]{64}$/);
+    expect(retryKey).toMatch(/^obsidian-[0-9a-f]{64}$/);
+    expect(retryKey).not.toBe(firstKey);
+    expect(retried.regeneration.request_id).toBe("regen_retry");
+  });
+
   it("saves a version-bound human candidate Note draft", async () => {
     const revision = {
       revision_key: "summary_revision_draft",
