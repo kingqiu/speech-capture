@@ -19,6 +19,7 @@ const context = await esbuild.context({
     "@lezer/lr",
     "electron",
     "node:https",
+    "node:zlib",
     "obsidian"
   ],
   format: "cjs",

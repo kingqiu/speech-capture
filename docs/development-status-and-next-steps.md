@@ -4434,3 +4434,27 @@ Stage J 的新扩展，未经明确要求不 commit/push。
   Worker、安装插件、访问私人会议/Vault 或向远端外发文件；
 - 下一步进入插件侧只执行“检查更新 → 下载 → 本地校验 → 明确确认”的阶段，暂不执行安装。只有该阶段的
   状态机和损坏/断网测试通过后，才实现退出 Obsidian 后运行的最小 helper。
+
+## 133. 2026-09-19 插件端只读更新检查与确认阶段完成
+
+- 本阶段插件版本提升为 `0.1.26`，不覆盖已经发布且不可变的 `0.1.25` release；
+- 插件设置页新增明确标注“验证阶段”的更新入口，只使用当前首选 Worker 的既有配对凭据读取 latest 和固定
+  ZIP；未配对、授权失效、Worker 无 release、网络失败、元数据异常、版本倒退和 Obsidian 版本不兼容分别
+  给出确定状态，不把失败冒充成已更新；
+- 状态机覆盖 idle、checking、current、incompatible、available、downloading、awaiting confirmation、
+  confirmed 和 failed。切换/移除 Worker 会清空候选；重复点击不能越过“先检查、再下载、再确认”的顺序；
+- 下载校验要求响应 ETag 与内容 SHA-256 同候选元数据一致，限制 ZIP 总大小和单文件解压大小，并独立解析
+  ZIP 中央目录与本地条目；只接受精确的 `main.js`、`manifest.json`、`styles.css`，拒绝额外/重复/隐藏条目、
+  越界、符号链接、异常压缩、CRC、插件 ID、版本、最低应用版本和 `main.js` 哈希不一致；
+- 已验证候选和确认状态仅保留在插件进程内。当前实现不写插件目录、Vault、`data.json` 或任务内容，不重启
+  Obsidian，也明确显示“已确认但尚未安装”，因此不会把下载/确认谎报为加载完成；
+- 新增 6 项专项测试；插件当前 19 个测试文件共 91 项、严格 TypeScript 和生产构建通过。本批没有实际请求
+  Worker、下载真实 release、安装插件、访问私人会议/Vault 或向远端外发；
+- `0.1.26` 可复现构建与临时合成 Vault 安装演练通过：ZIP SHA-256 为
+  `bfad2ac961edf7b12337e8a62ad69171f2e96eb8d849436851b878a2c7b25476`，installer 为
+  `15138362d9fba0f9e22987f737ff12420b9ab8921d771a74756f8f6ac7c5afb8`，release manifest 为
+  `751c8a0de79671f583779ecb12bbf2c3f9ca9b20eae7f23484749e185a32c8f3`；损坏包安装前拒绝、设置保留、
+  重复 ID 目录移出扫描范围和旧版备份均通过；
+- 下一步实现最小外部 helper 和 Vault 外/活动插件外的持久 staging：必须在 Obsidian 完全退出后做同卷原子
+  替换、保留 `data.json`、把旧版和重复 ID 目录移出扫描范围，并在失败时恢复旧版。实现前先补事务日志和
+  helper 输入 schema 的拒绝测试，不把当前验证入口暴露为可用的一键安装。

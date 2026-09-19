@@ -55,7 +55,7 @@ version under `.obsidian/plugin-backups/`, and moves any duplicate `speech-captu
 `plugins/` directory so Obsidian cannot silently load an old backup as the installed version:
 
 ```bash
-/bin/zsh "$HOME/Downloads/install-speech-capture-0.1.25.zsh" "/full/path/to/the/actual/Vault"
+/bin/zsh "$HOME/Downloads/install-speech-capture-0.1.26.zsh" "/full/path/to/the/actual/Vault"
 ```
 
 `pnpm package:alpha` remains available when only a build and generated package are required; release candidates sent

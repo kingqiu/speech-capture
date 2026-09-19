@@ -76,6 +76,8 @@ export class SpeechCaptureSettingTab extends PluginSettingTab {
         });
     }
 
+    this.renderClientUpdateSettings(containerEl);
+
     const details = containerEl.createEl("details");
     details.createEl("summary", { text: "连接新的家中 Mac" });
     details.createEl("p", {
@@ -139,6 +141,146 @@ export class SpeechCaptureSettingTab extends PluginSettingTab {
         });
       });
   }
+
+  private renderClientUpdateSettings(containerEl: HTMLElement): void {
+    containerEl.createEl("h2", { text: "插件更新（验证阶段）" });
+    containerEl.createEl("p", {
+      text: "只从当前已配对 Worker 检查、下载并校验候选包。这个阶段不会覆盖插件文件，也不会重启 Obsidian。"
+    });
+    const worker = this.speechCapturePlugin.preferredWorker();
+    const token = worker
+      ? this.speechCapturePlugin.credentials.get(worker.id)
+      : null;
+    const state = this.speechCapturePlugin.clientUpdates.state;
+    const status = new Setting(containerEl)
+      .setName(clientUpdateName(state.phase))
+      .setDesc(clientUpdateDescription(state));
+
+    if (state.phase === "available") {
+      status.addButton((button) => {
+        button.setButtonText("下载并校验").setCta().onClick(async () => {
+          if (!worker || !token) {
+            new Notice("请先完成当前 Worker 的配对");
+            return;
+          }
+          const pending = this.speechCapturePlugin.clientUpdates.downloadAndVerify(
+            worker,
+            token
+          );
+          this.display();
+          await pending;
+          this.display();
+        });
+      });
+      status.addButton((button) => {
+        button.setButtonText("重新检查").onClick(() => {
+          void this.checkClientUpdate(worker, token);
+        });
+      });
+      return;
+    }
+    if (state.phase === "awaiting_confirmation") {
+      status.addButton((button) => {
+        button.setButtonText("确认此候选包").setWarning().onClick(() => {
+          this.speechCapturePlugin.clientUpdates.confirmPreparedUpdate();
+          this.display();
+        });
+      });
+      status.addButton((button) => {
+        button.setButtonText("取消").onClick(() => {
+          this.speechCapturePlugin.clientUpdates.reset();
+          this.display();
+        });
+      });
+      return;
+    }
+    if (state.phase === "checking" || state.phase === "downloading") {
+      status.addButton((button) => {
+        button
+          .setButtonText(state.phase === "checking" ? "正在检查…" : "正在校验…")
+          .setDisabled(true);
+      });
+      return;
+    }
+    status.addButton((button) => {
+      button
+        .setButtonText("检查更新")
+        .setDisabled(!worker || !token)
+        .onClick(() => {
+          void this.checkClientUpdate(worker, token);
+        });
+    });
+  }
+
+  private async checkClientUpdate(
+    worker: ReturnType<SpeechCapturePlugin["preferredWorker"]>,
+    token: string | null
+  ): Promise<void> {
+    if (!worker || !token) {
+      new Notice("请先完成当前 Worker 的配对");
+      return;
+    }
+    const pending = this.speechCapturePlugin.clientUpdates.check(worker, token);
+    this.display();
+    await pending;
+    this.display();
+  }
+}
+
+function clientUpdateName(
+  phase: SpeechCapturePlugin["clientUpdates"]["state"]["phase"]
+): string {
+  switch (phase) {
+    case "idle":
+      return "尚未检查";
+    case "checking":
+      return "正在检查候选版本";
+    case "current":
+      return "当前已是最新版本";
+    case "incompatible":
+      return "发现候选版本，但 Obsidian 版本不兼容";
+    case "available":
+      return "发现可下载的候选版本";
+    case "downloading":
+      return "正在下载并校验候选包";
+    case "awaiting_confirmation":
+      return "候选包校验通过，等待明确确认";
+    case "confirmed":
+      return "候选包已确认，但尚未安装";
+    case "failed":
+      return "更新检查未完成";
+  }
+}
+
+function clientUpdateDescription(
+  state: SpeechCapturePlugin["clientUpdates"]["state"]
+): string {
+  switch (state.phase) {
+    case "idle":
+      return "检查操作不会上传音频、逐字稿或笔记。";
+    case "checking":
+      return "正在通过当前 Worker 的已授权只读接口检查。";
+    case "current":
+      return `当前 ${state.currentVersion}，Worker 最新版本也是 ${state.latestVersion}。`;
+    case "incompatible":
+      return `候选 ${state.latestVersion} 需要 Obsidian ${state.minAppVersion} 或更高；当前应用版本为 ${state.appVersion}。`;
+    case "available":
+      return `当前 ${state.currentVersion}，候选 ${state.release.version}；下载前不会修改任何本地插件文件。`;
+    case "downloading":
+      return `正在验证 ${state.release.version} 的大小、SHA-256、ZIP 白名单和插件身份。`;
+    case "awaiting_confirmation":
+      return `版本 ${state.release.version} 已通过校验（${formatBytes(state.verification.archiveSizeBytes)}，SHA-256 ${state.verification.archiveSha256.slice(0, 12)}…）。确认只表示允许进入后续安装阶段，本版本仍不会覆盖或重启。`;
+    case "confirmed":
+      return `已确认 ${state.release.version}。当前运行版本仍是 ${state.currentVersion}；退出后事务安装尚未启用，不会谎报为更新完成。`;
+    case "failed":
+      return `${state.message} 活动插件未被修改。`;
+  }
+}
+
+function formatBytes(value: number): string {
+  return value >= 1024 * 1024
+    ? `${(value / (1024 * 1024)).toFixed(1)} MB`
+    : `${Math.ceil(value / 1024).toString()} KB`;
 }
 
 function remoteWorkerDraftError(

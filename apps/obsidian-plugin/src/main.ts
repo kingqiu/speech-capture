@@ -1,7 +1,11 @@
-import { Plugin, type WorkspaceLeaf } from "obsidian";
+import { apiVersion, Plugin, type WorkspaceLeaf } from "obsidian";
 
+import { ClientUpdateController } from "./client-update";
 import { WorkerCredentialStore } from "./credentials";
-import { closeObsidianWorkerTransportPool } from "./obsidian-worker-transport";
+import {
+  closeObsidianWorkerTransportPool,
+  ObsidianWorkerTransport
+} from "./obsidian-worker-transport";
 import {
   DEFAULT_SETTINGS,
   parseSettings,
@@ -15,6 +19,7 @@ import { SpeechWorkbenchView, WORKBENCH_VIEW_TYPE } from "./workbench-view";
 export default class SpeechCapturePlugin extends Plugin {
   public override settings: SpeechCaptureSettings = DEFAULT_SETTINGS;
   public credentials!: WorkerCredentialStore;
+  public clientUpdates!: ClientUpdateController;
 
   public override async onload(): Promise<void> {
     const storedSettings: unknown = await this.loadData();
@@ -23,6 +28,11 @@ export default class SpeechCapturePlugin extends Plugin {
       await this.saveData(this.settings);
     }
     this.credentials = new WorkerCredentialStore(this.app);
+    this.clientUpdates = new ClientUpdateController(
+      new ObsidianWorkerTransport(),
+      this.manifest.version,
+      apiVersion
+    );
     this.addSettingTab(new SpeechCaptureSettingTab(this.app, this));
 
     this.registerView(
@@ -95,6 +105,7 @@ export default class SpeechCapturePlugin extends Plugin {
   public async saveRemoteWorker(
     result: Extract<RemoteWorkerDraftResult, { readonly ok: true }>
   ): Promise<void> {
+    this.clientUpdates.reset();
     const worker = result.worker;
     this.settings = {
       ...this.settings,
@@ -114,6 +125,7 @@ export default class SpeechCapturePlugin extends Plugin {
     if (!this.settings.workers.some((worker) => worker.id === workerId)) {
       throw new Error("The selected Worker is not configured.");
     }
+    this.clientUpdates.reset();
     this.settings = { ...this.settings, preferredWorkerId: workerId };
     await this.saveData(this.settings);
     await this.notifyWorkerSettingsChanged();
@@ -126,6 +138,7 @@ export default class SpeechCapturePlugin extends Plugin {
     if (!worker || worker.kind !== "remote") {
       return;
     }
+    this.clientUpdates.reset();
     this.credentials.clear(workerId);
     const vaultIdsByWorker = { ...this.settings.vaultIdsByWorker };
     delete vaultIdsByWorker[workerId];
