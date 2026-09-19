@@ -6,6 +6,9 @@ import { remoteWorkerFromDraft } from "./settings";
 import { probeWorker } from "./worker-probe";
 
 export class SpeechCaptureSettingTab extends PluginSettingTab {
+  private updateStatusTimer: ReturnType<typeof setTimeout> | null = null;
+  private displayGeneration = 0;
+
   public constructor(
     app: App,
     private readonly speechCapturePlugin: SpeechCapturePlugin
@@ -14,6 +17,7 @@ export class SpeechCaptureSettingTab extends PluginSettingTab {
   }
 
   public override display(): void {
+    this.hide();
     const { containerEl } = this;
     containerEl.empty();
     containerEl.createEl("h2", { text: "语音处理设备" });
@@ -142,6 +146,25 @@ export class SpeechCaptureSettingTab extends PluginSettingTab {
       });
   }
 
+  public override hide(): void {
+    this.displayGeneration += 1;
+    if (this.updateStatusTimer !== null) clearTimeout(this.updateStatusTimer);
+    this.updateStatusTimer = null;
+  }
+
+  private watchPendingUpdate(): void {
+    const generation = this.displayGeneration;
+    this.updateStatusTimer = setTimeout(async () => {
+      await this.speechCapturePlugin.refreshClientUpdateStatus();
+      if (generation !== this.displayGeneration) return;
+      if (this.speechCapturePlugin.clientUpdates.state.phase === "waiting_for_exit") {
+        this.watchPendingUpdate();
+      } else {
+        this.display();
+      }
+    }, 1000);
+  }
+
   private renderClientUpdateSettings(containerEl: HTMLElement): void {
     containerEl.createEl("h2", { text: "插件更新" });
     containerEl.createEl("p", {
@@ -208,6 +231,7 @@ export class SpeechCaptureSettingTab extends PluginSettingTab {
       state.phase === "preparing_install" ||
       state.phase === "waiting_for_exit"
     ) {
+      if (state.phase === "waiting_for_exit") this.watchPendingUpdate();
       status.addButton((button) => {
         button
           .setButtonText(

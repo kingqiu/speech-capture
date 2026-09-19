@@ -197,6 +197,7 @@ sc_config="$sc_vault/$sc_config_name"
 sc_plugins="$sc_config/plugins"
 sc_plugin="$sc_plugins/speech-capture"
 sc_backup_root="$sc_config/plugin-backups"
+sc_validate_active() {
 if [[ ! -d "$sc_vault" || ! -d "$sc_config" || ! -d "$sc_plugin" || -L "$sc_plugin" ]]; then
   sc_fail "VAULT_MISMATCH" "请求中的 Vault 或活动插件目录不匹配。"
 fi
@@ -215,6 +216,8 @@ if [[ "$sc_active_id" != "speech-capture" || "$sc_active_version" != "$sc_from_v
       "$sc_active_main_sha256" != "$sc_current_main_sha256" ]]; then
   sc_fail "ACTIVE_PLUGIN_CHANGED" "活动插件在确认后发生了变化。"
 fi
+}
+sc_validate_active
 
 # macOS pgrep excludes ancestors unless -a is supplied. This helper is itself
 # launched by Obsidian, so excluding ancestors would allow a live replacement.
@@ -296,6 +299,9 @@ if [[ "$sc_package_id" != "speech-capture" || "$sc_package_version" != "$sc_to_v
   sc_fail "PACKAGE_IDENTITY_INVALID" "候选插件身份、版本或主文件校验失败。"
 fi
 
+# The app may have remained open for minutes. Revalidate immediately before
+# reading settings or moving any active/duplicate plugin directory.
+sc_validate_active
 sc_ready="$sc_stage/ready"
 /bin/mkdir "$sc_ready" || sc_fail "STAGING_CREATE_FAILED" "无法准备候选插件目录。"
 for sc_file in main.js manifest.json styles.css; do

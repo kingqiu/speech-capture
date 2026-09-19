@@ -154,33 +154,59 @@ export async function stageClientUpdate(
   }
 }
 
-export function launchClientUpdateHelper(plan: PreparedClientUpdate): void {
-  const spawn = nodeSpawn as unknown as (
+export async function launchClientUpdateHelper(plan: PreparedClientUpdate): Promise<void> {
+  const spawn = nodeSpawn as (
     command: string,
     args: readonly string[],
-    options: {
-      readonly detached: boolean;
-      readonly stdio: "ignore";
-    }
-  ) => { unref(): void };
+    options: { readonly detached: boolean; readonly stdio: "ignore" }
+  ) => {
+    once(event: "error", listener: (error: Error) => void): unknown;
+    once(event: "spawn", listener: () => void): unknown;
+    unref(): void;
+  };
   try {
-    const child = spawn("/bin/zsh", [plan.helperPath, plan.requestPath], {
-      detached: true,
-      stdio: "ignore"
+    await new Promise<void>((resolve, reject) => {
+      const child = spawn("/bin/zsh", [plan.helperPath, plan.requestPath], {
+        detached: true,
+        stdio: "ignore"
+      });
+      // spawn failures (e.g. EACCES) arrive asynchronously, not via try/catch.
+      child.once("error", reject);
+      child.once("spawn", () => {
+        child.unref();
+        resolve();
+      });
     });
-    child.unref();
   } catch {
+    const status = await latestStatus(null, plan.transactionId);
+    if (status?.state === "ready_to_apply") {
+      await writeFile(status.path, `${JSON.stringify({
+        schema_version: status.schema_version,
+        transaction_id: status.transaction_id,
+        plugin_id: status.plugin_id,
+        vault_scope_sha256: status.vault_scope_sha256,
+        from_version: status.from_version,
+        to_version: status.to_version,
+        main_sha256: status.main_sha256,
+        state: "failed",
+        phase: "failed",
+        error_code: "HELPER_LAUNCH_FAILED",
+        rolled_back: false
+      })}\n`, { encoding: "utf8", mode: 0o600 });
+      await discardTransactionPayload(status);
+    }
     throw new ClientUpdateInstallerError("无法启动退出后安装助手。");
   }
 }
 
 export async function reconcileClientUpdate(
   app: App,
-  currentVersion: string
+  currentVersion: string,
+  transactionId?: string
 ): Promise<ReconciledClientUpdate> {
   const vault = vaultContext(app);
   const currentVaultScope = vaultScope(vault);
-  const status = await latestStatus(currentVaultScope);
+  const status = await latestStatus(currentVaultScope, transactionId);
   if (status === null) {
     return null;
   }
@@ -308,7 +334,7 @@ interface ClientUpdateStatus {
   readonly modifiedAt: number;
 }
 
-async function latestStatus(vaultScopeSha256: string): Promise<ClientUpdateStatus | null> {
+async function latestStatus(vaultScopeSha256: string | null, transactionId?: string): Promise<ClientUpdateStatus | null> {
   const root = clientUpdateRoot();
   let names: string[];
   try {
@@ -318,7 +344,7 @@ async function latestStatus(vaultScopeSha256: string): Promise<ClientUpdateStatu
   }
   const statuses: ClientUpdateStatus[] = [];
   for (const name of names) {
-    if (!/^update_[0-9a-f]{32}$/.test(name)) {
+    if (!/^update_[0-9a-f]{32}$/.test(name) || (transactionId !== undefined && name !== transactionId)) {
       continue;
     }
     const path = join(root, name, "status.json");
@@ -330,7 +356,7 @@ async function latestStatus(vaultScopeSha256: string): Promise<ClientUpdateStatu
       const parsed: unknown = JSON.parse(await readFile(path, "utf8"));
       if (
         isClientUpdateStatus(parsed, name) &&
-        parsed.vault_scope_sha256 === vaultScopeSha256
+        (vaultScopeSha256 === null || parsed.vault_scope_sha256 === vaultScopeSha256)
       ) {
         statuses.push({ ...parsed, path, modifiedAt: stats.mtimeMs });
       }

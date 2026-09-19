@@ -76,6 +76,17 @@ exit 0
   assert.equal((await readJson(join(queryFailure.plugin, "manifest.json"))).version, "0.1.25");
   assert.equal(await readFile(join(queryFailure.plugin, "data.json"), "utf8"), queryFailure.data);
 
+  const changedWhileWaiting = await makeTransaction("changed-while-waiting", "0.1.25");
+  const changingProbe = join(changedWhileWaiting.transactionRoot, "process-probe.zsh");
+  await writeFile(changingProbe, `#!/bin/zsh
+print -r -- changed-by-another-installer > "\${0:A:h:h}/vault/.obsidian/plugins/speech-capture/main.js"
+exit 1
+`, { mode: 0o700 });
+  assert.throws(() => runHelper(changedWhileWaiting, { SPEECH_CAPTURE_HELPER_TEST_PROCESS_PROBE: changingProbe }), /Command failed/);
+  assert.equal((await readJson(join(changedWhileWaiting.transactionRoot, "status.json"))).error_code, "ACTIVE_PLUGIN_CHANGED");
+  assert.equal((await readJson(join(changedWhileWaiting.plugin, "manifest.json"))).version, "0.1.25");
+  assert.equal(await readFile(join(changedWhileWaiting.plugin, "main.js"), "utf8"), "changed-by-another-installer\n");
+
   const success = await makeTransaction("success", "0.1.25");
   const successOutput = runHelper(success);
   const successStatus = await readJson(join(success.transactionRoot, "status.json"));
@@ -196,6 +207,7 @@ exit 0
       processAncestorsIncluded: true,
       runningAppBlocksReplacement: true,
       processQueryFailureBlocksReplacement: true,
+      activePluginRecheckedAfterWaiting: true,
       shutdownSettingsPreserved: true,
       restartRequiredRecorded: true
     })

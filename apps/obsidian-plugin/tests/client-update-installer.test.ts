@@ -4,7 +4,7 @@ import { mkdir, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-const runtime = vi.hoisted(() => ({ home: "", vault: "" }));
+const runtime = vi.hoisted(() => ({ home: "", vault: "", spawn: vi.fn() }));
 const obsidian = vi.hoisted(() => {
   class SyntheticFileSystemAdapter {
     public getBasePath(): string {
@@ -15,6 +15,7 @@ const obsidian = vi.hoisted(() => {
 });
 
 vi.mock("node:os", () => ({ homedir: () => runtime.home }));
+vi.mock("node:child_process", () => ({ spawn: runtime.spawn }));
 vi.mock("obsidian", () => ({ FileSystemAdapter: obsidian.SyntheticFileSystemAdapter }));
 vi.mock("../scripts/client-update-helper.zsh", () => ({
   default: "#!/bin/zsh\nexit 0\n"
@@ -22,6 +23,7 @@ vi.mock("../scripts/client-update-helper.zsh", () => ({
 
 import {
   reconcileClientUpdate,
+  launchClientUpdateHelper,
   stageClientUpdate
 } from "../src/client-update-installer";
 import type { ConfirmedClientRelease } from "../src/client-update";
@@ -33,9 +35,42 @@ afterEach(async () => {
     await rm(temporaryRoot, { recursive: true, force: true });
   }
   temporaryRoot = "";
+  runtime.spawn.mockReset();
 });
 
 describe("client update installer staging", () => {
+  it("waits for spawn acknowledgement before claiming the helper is running", async () => {
+    const setup = await makeSetup();
+    const plan = await stageClientUpdate(setup.app as never, "0.1.25", candidate());
+    const child = syntheticChild();
+    runtime.spawn.mockReturnValue(child);
+    const pending = launchClientUpdateHelper(plan);
+    expect(child.unref).not.toHaveBeenCalled();
+    child.emit("spawn");
+    await expect(pending).resolves.toBeUndefined();
+    expect(child.unref).toHaveBeenCalledOnce();
+  });
+
+  it.each(["async", "sync"])("handles %s launch failure without an unhandled error or payload leak", async (mode) => {
+    const setup = await makeSetup();
+    const plan = await stageClientUpdate(setup.app as never, "0.1.25", candidate());
+    const child = syntheticChild();
+    const failure = new Error("synthetic private path must not leak");
+    if (mode === "sync") runtime.spawn.mockImplementation(() => { throw failure; });
+    else runtime.spawn.mockReturnValue(child);
+    const pending = launchClientUpdateHelper(plan);
+    const rejected = expect(pending).rejects.toThrow("无法启动退出后安装助手");
+    if (mode === "async") child.emit("error", failure);
+    await rejected;
+    expect(child.unref).not.toHaveBeenCalled();
+    expect(await readFile(join(setup.plugin, "main.js"), "utf8")).toBe("old-main");
+    await expect(readFile(plan.helperPath)).rejects.toThrow();
+    await expect(readFile(plan.requestPath)).rejects.toThrow();
+    const status = await readFile(join(plan.requestPath, "..", "status.json"), "utf8");
+    expect(JSON.parse(status)).toMatchObject({ state: "failed", error_code: "HELPER_LAUNCH_FAILED" });
+    expect(status).not.toContain("private path");
+  });
+
   it("stages a fixed request outside the Vault without changing the active plugin", async () => {
     const setup = await makeSetup();
     const before = await readFile(join(setup.plugin, "main.js"), "utf8");
@@ -242,6 +277,20 @@ describe("client update installer staging", () => {
     });
   });
 });
+
+function syntheticChild() {
+  const listeners = new Map<string, (error?: Error) => void>();
+  return {
+    unref: vi.fn(),
+    once: (event: string, listener: (error?: Error) => void) => listeners.set(event, listener),
+    emit(event: string, error?: Error) {
+      const listener = listeners.get(event);
+      if (!listener) throw new Error(`Unhandled child event: ${event}`);
+      listeners.delete(event);
+      listener(error);
+    }
+  };
+}
 
 function statusJson({
   transactionId,

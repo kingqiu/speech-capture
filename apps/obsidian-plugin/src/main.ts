@@ -195,7 +195,7 @@ export default class SpeechCapturePlugin extends Plugin {
         this.manifest.version,
         candidate
       );
-      launchClientUpdateHelper(plan);
+      await launchClientUpdateHelper(plan);
       this.clientUpdates.markWaitingForExit(
         plan.transactionId,
         plan.targetVersion
@@ -230,9 +230,18 @@ export default class SpeechCapturePlugin extends Plugin {
     );
   }
 
-  private async restoreClientUpdateStatus(): Promise<void> {
+  public async refreshClientUpdateStatus(): Promise<void> {
+    if (this.clientUpdates.state.phase !== "waiting_for_exit") return;
+    await this.restoreClientUpdateStatus(this.clientUpdates.state.transactionId);
+  }
+
+  private async restoreClientUpdateStatus(transactionId?: string): Promise<void> {
     try {
-      const result = await reconcileClientUpdate(this.app, this.manifest.version);
+      const result = await reconcileClientUpdate(this.app, this.manifest.version, transactionId);
+      // A worker change or a new operation must not receive stale async results.
+      if (transactionId !== undefined &&
+          (this.clientUpdates.state.phase !== "waiting_for_exit" ||
+           this.clientUpdates.state.transactionId !== transactionId)) return;
       if (result?.state === "loaded_verified") {
         this.clientUpdates.restoreLoadedVerification(result.previousVersion);
       } else if (result?.state === "rolled_back") {
