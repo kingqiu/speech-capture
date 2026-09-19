@@ -31,6 +31,8 @@ const archive = join(outputRoot, archiveName);
 const checksumFile = `${archive}.sha256`;
 const installerName = `install-${manifest.id}-${manifest.version}.zsh`;
 const installer = join(outputRoot, installerName);
+const recoveryName = `recover-${manifest.id}.zsh`;
+const recovery = join(outputRoot, recoveryName);
 const releaseManifestName = `${manifest.id}-${manifest.version}-release.json`;
 const releaseManifestPath = join(outputRoot, releaseManifestName);
 const releaseFiles = ["main.js", "manifest.json", "styles.css"];
@@ -80,7 +82,12 @@ await writeFile(installer, installerContents, "utf8");
 await chmod(installer, 0o755);
 execFileSync("/bin/zsh", ["-n", installer]);
 
+await cp(join(root, "scripts", "recover-plugin-backup.zsh"), recovery);
+await chmod(recovery, 0o755);
+execFileSync("/bin/zsh", ["-n", recovery]);
+
 const installerHash = await sha256(installer);
+const recoveryHash = await sha256(recovery);
 const releaseManifest = {
   schema_version: 1,
   plugin: {
@@ -120,7 +127,7 @@ await writeFile(
 const releaseManifestHash = await sha256(releaseManifestPath);
 await writeFile(
   checksumFile,
-  `${archiveHash}  ${archiveName}\n${installerHash}  ${installerName}\n${releaseManifestHash}  ${releaseManifestName}\n`,
+  `${archiveHash}  ${archiveName}\n${installerHash}  ${installerName}\n${recoveryHash}  ${recoveryName}\n${releaseManifestHash}  ${releaseManifestName}\n`,
   "utf8"
 );
 
@@ -129,9 +136,11 @@ console.log(
     archive,
     checksumFile,
     installer,
+    recovery,
     releaseManifest: releaseManifestPath,
     archiveSha256: archiveHash,
     installerSha256: installerHash,
+    recoverySha256: recoveryHash,
     releaseManifestSha256: releaseManifestHash,
     mainSha256: releaseHashes["main.js"],
     files: releaseFiles,

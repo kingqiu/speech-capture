@@ -4480,3 +4480,24 @@ Stage J 的新扩展，未经明确要求不 commit/push。
 - 本批没有访问正式 Vault、私人会议、真实 Worker release、远端设备或外部网络。下一步先在独立测试 Vault
   验证“新版完全无法加载时的人工恢复”，再进入远程测试 Vault 的 `N → N+1 → 回滚 N → 再升级 N+1`；在
   该闭环通过前，手工安装脚本仍是恢复路径，不能宣称自动更新已经可用。
+
+## 135. 2026-09-19 新版完全无法加载时的外部恢复路径完成
+
+- 新增与插件进程无关的 `recover-speech-capture.zsh`。它只接受两个显式参数：实际 Vault 绝对路径和该 Vault
+  `.obsidian/plugin-backups/` 下的准确备份目录名；不搜索磁盘、不选择“最新”、不跨 Vault，也不会在 Obsidian
+  运行时修改插件；
+- 恢复前校验备份目录边界、插件 ID、规范版本及 `main.js`/`manifest.json`/`styles.css`/可选 `data.json`
+  的普通文件属性。恢复时先把失败的新版本移入非扫描备份区，再同卷移动所选旧版；恢复中断或最终校验失败
+  会把原活动版本放回，不会留下空活动目录；
+- 合成 Vault 已覆盖成功恢复、设置保留、失败新版本保留、明确备份要求、路径穿越拒绝、不安全 `data.json`
+  拒绝和恢复中断回滚。恢复工具加入 `release:alpha`、可复现构建和 SHA-256 清单，但未改变 Worker 的只读
+  release manifest schema；
+- 插件版本提升为 `0.1.28`，完整发布门通过：20 个测试文件共 96 项、发布工具 3 项、TypeScript、生产构建、
+  可复现打包、临时安装、退出后 helper 故障矩阵和外部恢复矩阵。ZIP SHA-256 为
+  `023863018d2a329ba2e2a52a9bc93b8f90a8b3e6137c5f8f1dfd60069233f648`，installer 为
+  `07e8301e71b471d13c4288831de7c9d08140bf0c9a81c1bef5e66f830275d12d`，recovery 为
+  `5cca00a9b2a7efe281467bb70a17ccb0af0e16b72b2f00e0f10e6faa269208e3`，release manifest 为
+  `74666214447f111056089b38db6617412ac8bf200912547612545c9974b135dd`；
+- 本批仍未访问正式 Vault、私人会议、真实 Worker release 或远端设备。下一步是唯一剩余外部状态门：在独立
+  远程测试 Vault 执行 `N → N+1 → 回滚 N → 再升级 N+1` 并核对配对设置；需要针对本次 `0.1.28` 外发与测试
+  的明确授权，不能沿用旧版本的发送许可。

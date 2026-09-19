@@ -13,6 +13,7 @@ const archive = join(
   `${manifest.id}-${manifest.version}-alpha.zip`
 );
 const installer = join(root, "dist", `install-${manifest.id}-${manifest.version}.zsh`);
+const recovery = join(root, "dist", `recover-${manifest.id}.zsh`);
 const releaseManifest = join(
   root,
   "dist",
@@ -22,6 +23,7 @@ const releaseManifest = join(
 const first = {
   archive: await sha256(archive),
   installer: await sha256(installer),
+  recovery: await sha256(recovery),
   releaseManifest: await sha256(releaseManifest)
 };
 execFileSync(process.execPath, [join(root, "scripts", "package-alpha.mjs")], {
@@ -30,6 +32,7 @@ execFileSync(process.execPath, [join(root, "scripts", "package-alpha.mjs")], {
 const second = {
   archive: await sha256(archive),
   installer: await sha256(installer),
+  recovery: await sha256(recovery),
   releaseManifest: await sha256(releaseManifest)
 };
 
@@ -38,6 +41,7 @@ console.log(
   JSON.stringify({
     archiveSha256: second.archive,
     installerSha256: second.installer,
+    recoverySha256: second.recovery,
     releaseManifestSha256: second.releaseManifest,
     reproducible: true
   })

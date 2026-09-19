@@ -44,8 +44,8 @@ pnpm release:alpha
 The release command runs the complete plugin test suite, release-tool tests, strict type checking, the production
 build, package verification, a byte-for-byte reproducibility check, and a real installer smoke test in a temporary
 synthetic Vault. It refuses to package when `package.json`, `manifest.json`, and `versions.json` disagree. It writes
-the generated archive, its SHA-256 file, a machine-readable release manifest, and a version-bound installer under
-`dist/`. The archive contains exactly `speech-capture/main.js`,
+the generated archive, its SHA-256 file, a machine-readable release manifest, a version-bound installer, and an
+explicit-backup recovery tool under `dist/`. The archive contains exactly `speech-capture/main.js`,
 `speech-capture/manifest.json`, and `speech-capture/styles.css`; it never includes plugin settings, Vault IDs,
 credentials, audio, transcripts, Notes, databases, models, or source maps.
 
@@ -55,7 +55,14 @@ version under `.obsidian/plugin-backups/`, and moves any duplicate `speech-captu
 `plugins/` directory so Obsidian cannot silently load an old backup as the installed version:
 
 ```bash
-/bin/zsh "$HOME/Downloads/install-speech-capture-0.1.27.zsh" "/full/path/to/the/actual/Vault"
+/bin/zsh "$HOME/Downloads/install-speech-capture-0.1.28.zsh" "/full/path/to/the/actual/Vault"
+```
+
+If a newly installed plugin cannot load at all, keep Obsidian closed and restore one explicitly named backup; the
+recovery tool never guesses the Vault or backup:
+
+```bash
+/bin/zsh "$HOME/Downloads/recover-speech-capture.zsh" "/full/path/to/the/actual/Vault" "speech-capture-YYYYMMDD-HHMMSS-PID"
 ```
 
 `pnpm package:alpha` remains available when only a build and generated package are required; release candidates sent
