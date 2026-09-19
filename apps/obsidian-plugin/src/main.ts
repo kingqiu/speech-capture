@@ -1,6 +1,12 @@
 import { apiVersion, Plugin, type WorkspaceLeaf } from "obsidian";
 
 import { ClientUpdateController } from "./client-update";
+import {
+  ClientUpdateInstallerError,
+  launchClientUpdateHelper,
+  reconcileClientUpdate,
+  stageClientUpdate
+} from "./client-update-installer";
 import { WorkerCredentialStore } from "./credentials";
 import {
   closeObsidianWorkerTransportPool,
@@ -33,6 +39,7 @@ export default class SpeechCapturePlugin extends Plugin {
       this.manifest.version,
       apiVersion
     );
+    await this.restoreClientUpdateStatus();
     this.addSettingTab(new SpeechCaptureSettingTab(this.app, this));
 
     this.registerView(
@@ -173,6 +180,35 @@ export default class SpeechCapturePlugin extends Plugin {
     settings.openTabById(this.manifest.id);
   }
 
+  public async startConfirmedClientUpdate(): Promise<void> {
+    const candidate = this.clientUpdates.confirmedRelease();
+    if (candidate === null) {
+      this.clientUpdates.markInstallPreparationFailed(
+        "没有可安装的已确认候选包。"
+      );
+      return;
+    }
+    this.clientUpdates.markPreparingInstall();
+    try {
+      const plan = await stageClientUpdate(
+        this.app,
+        this.manifest.version,
+        candidate
+      );
+      launchClientUpdateHelper(plan);
+      this.clientUpdates.markWaitingForExit(
+        plan.transactionId,
+        plan.targetVersion
+      );
+    } catch (error) {
+      this.clientUpdates.markInstallPreparationFailed(
+        error instanceof ClientUpdateInstallerError
+          ? error.message
+          : "无法准备退出后插件更新。"
+      );
+    }
+  }
+
   private async activateWorkbench(): Promise<void> {
     const existing = this.app.workspace.getLeavesOfType(WORKBENCH_VIEW_TYPE)[0];
     const leaf = existing ?? this.app.workspace.getLeaf("tab");
@@ -192,5 +228,26 @@ export default class SpeechCapturePlugin extends Plugin {
             : Promise.resolve()
         )
     );
+  }
+
+  private async restoreClientUpdateStatus(): Promise<void> {
+    try {
+      const result = await reconcileClientUpdate(this.app, this.manifest.version);
+      if (result?.state === "loaded_verified") {
+        this.clientUpdates.restoreLoadedVerification(result.previousVersion);
+      } else if (result?.state === "rolled_back") {
+        this.clientUpdates.restoreRollback(
+          result.targetVersion,
+          result.errorCode
+        );
+      } else if (result?.state === "install_failed") {
+        this.clientUpdates.restoreInstallFailure(
+          result.targetVersion,
+          result.errorCode
+        );
+      }
+    } catch {
+      // Update diagnostics must never prevent the existing plugin from loading.
+    }
   }
 }

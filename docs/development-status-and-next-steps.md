@@ -4458,3 +4458,25 @@ Stage J 的新扩展，未经明确要求不 commit/push。
 - 下一步实现最小外部 helper 和 Vault 外/活动插件外的持久 staging：必须在 Obsidian 完全退出后做同卷原子
   替换、保留 `data.json`、把旧版和重复 ID 目录移出扫描范围，并在失败时恢复旧版。实现前先补事务日志和
   helper 输入 schema 的拒绝测试，不把当前验证入口暴露为可用的一键安装。
+
+## 134. 2026-09-19 插件受控退出后安装与回滚阶段完成
+
+- 新阶段使用独立版本 `0.1.27`，没有改写已经推送的 `0.1.26` 构建；确认候选后，插件只把 ZIP、固定请求和
+  隐私安全状态写入 Vault 外的用户级私有事务目录，并启动内嵌的最小 zsh helper；
+- helper 固定事务根、请求字段、规范版本、目标 ZIP 名称、Vault/config 作用域哈希、活动插件当前哈希、磁盘
+  空间、ZIP 白名单和内部身份。Obsidian 完全退出前不会替换活动插件；
+- 安装时保留 `data.json`，把重复同 ID 目录和旧插件整体移入 `.obsidian/plugin-backups/`，再以同卷 rename
+  启用候选；活动插件被并发改动、损坏包、空间不足、错误 Vault、自定义 config、重复目录迁移、备份后故障
+  和替换失败均有合成验证，修改后的失败路径会恢复旧插件；
+- 有效请求在退出后的安装失败会重新打开旧版 Vault。重开后只有运行中的插件版本、磁盘 manifest 与
+  `main.js` 哈希同时匹配，才记录并显示 `loaded_verified`；预修改失败、成功回滚和不同 Vault 的状态均分别
+  恢复为明确 UI 状态，不把下载、确认、落盘或旧缓存误报成更新完成；加载确认或最终失败后会清理事务中的
+  ZIP、helper 和残留请求，只保留很小的状态记录；
+- `release:alpha` 现把 helper 故障矩阵纳入发布门。插件 20 个测试文件共 96 项、发布工具 3 项、严格
+  TypeScript、生产构建、可复现打包、临时 Vault 安装及 helper 矩阵通过；`0.1.27` ZIP SHA-256 为
+  `1908e588c95c007c5cd738738af3af2cefae647c9dcf33715b9e4683ff2a09c2`，installer SHA-256 为
+  `1e8d16aee7bbbe5062ad311b817fdf50c2aab3abbf83e9c9722a23f2e8d00614`，release manifest SHA-256 为
+  `ee2b8b443bcfc8eda1c56567a7365c10675ccb3ce668c862b1d6531cc0c02d51`；
+- 本批没有访问正式 Vault、私人会议、真实 Worker release、远端设备或外部网络。下一步先在独立测试 Vault
+  验证“新版完全无法加载时的人工恢复”，再进入远程测试 Vault 的 `N → N+1 → 回滚 N → 再升级 N+1`；在
+  该闭环通过前，手工安装脚本仍是恢复路径，不能宣称自动更新已经可用。

@@ -31,6 +31,12 @@ export interface VerifiedClientRelease {
   readonly fileSha256: Readonly<Record<ReleaseFileName, string>>;
 }
 
+export interface ConfirmedClientRelease {
+  readonly release: ClientReleaseSchema;
+  readonly verification: VerifiedClientRelease;
+  readonly archiveBytes: Uint8Array;
+}
+
 export type ClientUpdateState =
   | { readonly phase: "idle" }
   | { readonly phase: "checking" }
@@ -56,6 +62,29 @@ export type ClientUpdateState =
       readonly currentVersion: string;
       readonly release: ClientReleaseSchema;
       readonly verification: VerifiedClientRelease;
+    }
+  | {
+      readonly phase: "preparing_install";
+      readonly currentVersion: string;
+      readonly release: ClientReleaseSchema;
+      readonly verification: VerifiedClientRelease;
+    }
+  | {
+      readonly phase: "waiting_for_exit";
+      readonly currentVersion: string;
+      readonly targetVersion: string;
+      readonly transactionId: string;
+    }
+  | {
+      readonly phase: "loaded_verified";
+      readonly currentVersion: string;
+      readonly previousVersion: string;
+    }
+  | {
+      readonly phase: "rolled_back";
+      readonly currentVersion: string;
+      readonly targetVersion: string;
+      readonly errorCode: string;
     }
   | {
       readonly phase: "failed";
@@ -241,6 +270,73 @@ export class ClientUpdateController {
     }
     this.state = { ...this.state, phase: "confirmed" };
     return this.state;
+  }
+
+  public confirmedRelease(): ConfirmedClientRelease | null {
+    if (this.state.phase !== "confirmed" || this.verifiedArchive === null) {
+      return null;
+    }
+    return {
+      release: this.state.release,
+      verification: this.state.verification,
+      archiveBytes: this.verifiedArchive.slice()
+    };
+  }
+
+  public markPreparingInstall(): ClientUpdateState {
+    if (this.state.phase !== "confirmed" || this.verifiedArchive === null) {
+      return this.failInvalid("没有可安装的已确认候选包。");
+    }
+    this.state = { ...this.state, phase: "preparing_install" };
+    return this.state;
+  }
+
+  public markWaitingForExit(
+    transactionId: string,
+    targetVersion: string
+  ): ClientUpdateState {
+    this.verifiedArchive = null;
+    this.state = {
+      phase: "waiting_for_exit",
+      currentVersion: this.currentVersion,
+      targetVersion,
+      transactionId
+    };
+    return this.state;
+  }
+
+  public markInstallPreparationFailed(message: string): ClientUpdateState {
+    this.verifiedArchive = null;
+    this.state = { phase: "failed", kind: "unavailable", message };
+    return this.state;
+  }
+
+  public restoreLoadedVerification(previousVersion: string): void {
+    this.verifiedArchive = null;
+    this.state = {
+      phase: "loaded_verified",
+      currentVersion: this.currentVersion,
+      previousVersion
+    };
+  }
+
+  public restoreRollback(targetVersion: string, errorCode: string): void {
+    this.verifiedArchive = null;
+    this.state = {
+      phase: "rolled_back",
+      currentVersion: this.currentVersion,
+      targetVersion,
+      errorCode
+    };
+  }
+
+  public restoreInstallFailure(targetVersion: string, errorCode: string): void {
+    this.verifiedArchive = null;
+    this.state = {
+      phase: "failed",
+      kind: "unavailable",
+      message: `目标 ${targetVersion} 安装未完成，当前版本未被替换。诊断码：${errorCode}。`
+    };
   }
 
   public reset(): void {

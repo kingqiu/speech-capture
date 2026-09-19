@@ -143,9 +143,9 @@ export class SpeechCaptureSettingTab extends PluginSettingTab {
   }
 
   private renderClientUpdateSettings(containerEl: HTMLElement): void {
-    containerEl.createEl("h2", { text: "插件更新（验证阶段）" });
+    containerEl.createEl("h2", { text: "插件更新" });
     containerEl.createEl("p", {
-      text: "只从当前已配对 Worker 检查、下载并校验候选包。这个阶段不会覆盖插件文件，也不会重启 Obsidian。"
+      text: "从当前已配对 Worker 获取候选包；下载、校验和确认不会修改插件。只有再次点击“退出后安装并重开”，并完全退出 Obsidian 后，独立助手才会备份旧版、原子替换并校验新版本。"
     });
     const worker = this.speechCapturePlugin.preferredWorker();
     const token = worker
@@ -194,10 +194,43 @@ export class SpeechCaptureSettingTab extends PluginSettingTab {
       });
       return;
     }
-    if (state.phase === "checking" || state.phase === "downloading") {
+    if (state.phase === "confirmed") {
+      status.addButton((button) => {
+        button.setButtonText("退出后安装并重开").setWarning().onClick(async () => {
+          const pending = this.speechCapturePlugin.startConfirmedClientUpdate();
+          this.display();
+          await pending;
+          this.display();
+          if (this.speechCapturePlugin.clientUpdates.state.phase === "waiting_for_exit") {
+            new Notice("更新助手已准备。请按 Command + Q 完全退出 Obsidian；安装后会重新打开当前 Vault。", 10_000);
+          }
+        });
+      });
+      status.addButton((button) => {
+        button.setButtonText("取消").onClick(() => {
+          this.speechCapturePlugin.clientUpdates.reset();
+          this.display();
+        });
+      });
+      return;
+    }
+    if (
+      state.phase === "checking" ||
+      state.phase === "downloading" ||
+      state.phase === "preparing_install" ||
+      state.phase === "waiting_for_exit"
+    ) {
       status.addButton((button) => {
         button
-          .setButtonText(state.phase === "checking" ? "正在检查…" : "正在校验…")
+          .setButtonText(
+            state.phase === "checking"
+              ? "正在检查…"
+              : state.phase === "downloading"
+                ? "正在校验…"
+                : state.phase === "preparing_install"
+                  ? "正在准备安装事务…"
+                  : "等待完全退出…"
+          )
           .setDisabled(true);
       });
       return;
@@ -247,6 +280,14 @@ function clientUpdateName(
       return "候选包校验通过，等待明确确认";
     case "confirmed":
       return "候选包已确认，但尚未安装";
+    case "preparing_install":
+      return "正在准备退出后安装事务";
+    case "waiting_for_exit":
+      return "更新助手正在等待 Obsidian 完全退出";
+    case "loaded_verified":
+      return "更新完成，已确认实际加载版本";
+    case "rolled_back":
+      return "更新失败，旧版本已恢复";
     case "failed":
       return "更新检查未完成";
   }
@@ -271,7 +312,15 @@ function clientUpdateDescription(
     case "awaiting_confirmation":
       return `版本 ${state.release.version} 已通过校验（${formatBytes(state.verification.archiveSizeBytes)}，SHA-256 ${state.verification.archiveSha256.slice(0, 12)}…）。确认只表示允许进入后续安装阶段，本版本仍不会覆盖或重启。`;
     case "confirmed":
-      return `已确认 ${state.release.version}。当前运行版本仍是 ${state.currentVersion}；退出后事务安装尚未启用，不会谎报为更新完成。`;
+      return `已确认 ${state.release.version}。点击安装后，助手只会在 Obsidian 完全退出时替换当前 Vault 的插件，并保留设置和旧版备份。`;
+    case "preparing_install":
+      return `正在把 ${state.release.version} 写入活动插件目录之外的私有暂存区；当前插件尚未改变。`;
+    case "waiting_for_exit":
+      return `目标 ${state.targetVersion} 已暂存。请按 Command + Q 完全退出 Obsidian；助手会在退出后安装、校验，并重新打开当前 Vault。`;
+    case "loaded_verified":
+      return `已从 ${state.previousVersion} 更新到 ${state.currentVersion}；活动 main.js、磁盘 manifest 与本次实际加载版本一致。`;
+    case "rolled_back":
+      return `目标 ${state.targetVersion} 安装失败，当前仍运行 ${state.currentVersion}；旧版已恢复。诊断码：${state.errorCode}。`;
     case "failed":
       return `${state.message} 活动插件未被修改。`;
   }
