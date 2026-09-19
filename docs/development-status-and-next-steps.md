@@ -4388,3 +4388,18 @@ Stage J 的新扩展，未经明确要求不 commit/push。
 - 本轮仍没有新增 Worker API、插件更新 UI、helper 生产入口或远端外发。下一实现顺序是先建立隔离的 Worker
   release store 与只读契约测试，再增加认证 latest/archive 接口；在远端升级/回滚闭环通过前，现有手工脚本
   继续作为恢复路径。
+
+## 130. 2026-09-19 Worker 客户端 release store 完成，尚未开放网络入口
+
+- 新增独立 `ClientReleaseStore`，固定存储在调用方指定的 client-release 根目录，不导入 JobStore、任务 artifact、
+  Vault 发布或删除模块；任务和发布生命周期不能删除或覆盖插件 release；
+- 管理员导入必须提供严格 `release.json`、对应 ZIP 和 installer。schema、插件 ID、规范 semver、macOS 桌面
+  边界、固定文件名、大小、SHA-256、ZIP 精确三文件白名单及 ZIP 内 manifest 身份全部复核；
+- release 版本不可变：相同字节重复导入幂等，不同字节不能覆盖同版本；latest 使用语义版本排序而非字符串
+  或修改时间；读取时重新校验磁盘内容，不把导入时通过等同于永久可信；
+- 路径穿越、符号链接、未知/私人字段、重复 JSON key、过大 manifest/archive/installer/file、ZIP 额外文件、
+  身份漂移、大小和哈希篡改均 fail closed；导入使用同卷 staging 和原子 rename；
+- 6 项新增专项测试通过，Worker 全量 716 项、完整 Ruff 检查通过；没有读取私人数据、安装
+  release、修改现有 Worker 数据目录或向远端设备外发；
+- 下一步只增加认证的 latest/archive 只读 API 与协议类型。管理员导入 CLI、插件下载 UI、helper 和自动更新
+  仍未实现，也不得由普通配对设备获得 release 写权限。
