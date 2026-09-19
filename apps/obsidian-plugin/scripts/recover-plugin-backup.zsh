@@ -47,8 +47,14 @@ sc_smoke_test="${SPEECH_CAPTURE_RECOVERY_SMOKE_TEST:-0}"
 if [[ "$sc_smoke_test" == "1" && "$sc_vault" != /private/tmp/speech-capture-recovery-test.*/* ]]; then
   sc_fail "恢复演练标记只能用于 /private/tmp 下的测试 Vault。"
 fi
-if [[ "$sc_smoke_test" != "1" ]] && /usr/bin/pgrep -x Obsidian >/dev/null 2>&1; then
-  sc_fail "Obsidian 仍在运行。请先按 Command + Q 完全退出，再重新运行本命令。"
+if [[ "$sc_smoke_test" != "1" ]]; then
+  /usr/bin/pgrep -a -x Obsidian >/dev/null 2>&1
+  sc_probe_status=$?
+  case "$sc_probe_status" in
+    0) sc_fail "Obsidian 仍在运行。请先按 Command + Q 完全退出，再重新运行本命令。" ;;
+    1) ;;
+    *) sc_fail "无法查询 Obsidian 运行状态，未执行恢复。" ;;
+  esac
 fi
 if [[ ! -d "$sc_vault" || ! -d "$sc_config" || ! -d "$sc_plugins" || ! -d "$sc_backup_root" ]]; then
   sc_fail "指定路径不是包含插件备份的有效 Obsidian Vault。"

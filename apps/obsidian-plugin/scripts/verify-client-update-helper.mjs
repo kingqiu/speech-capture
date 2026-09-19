@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
+import { setTimeout as delay } from "node:timers/promises";
 import {
   chmod,
   cp,
@@ -31,6 +32,50 @@ const release = JSON.parse(
 const temporaryRoot = await mkdtemp("/private/tmp/speech-capture-helper-test.");
 
 try {
+  // Exercise the real wait loop instead of bypassing it in all smoke tests.
+  // The probe also requires -a: macOS otherwise excludes the launching app.
+  const waiting = await makeTransaction("wait-for-exit", "0.1.25");
+  const probe = join(waiting.transactionRoot, "process-probe.zsh");
+  await writeFile(probe, `#!/bin/zsh
+[[ "$*" == "-a -x Obsidian" ]] || exit 3
+[[ -f "\${0:A:h}/exited" ]] && exit 1
+exit 0
+`, { mode: 0o700 });
+  const child = spawn("/bin/zsh", [waiting.helper, join(waiting.transactionRoot, "request.json")], {
+    env: { ...process.env, SPEECH_CAPTURE_HELPER_SMOKE_TEST: "1", SPEECH_CAPTURE_HELPER_TEST_PROCESS_PROBE: probe },
+    stdio: "ignore"
+  });
+  const completed = new Promise((resolve, reject) => {
+    child.once("error", reject);
+    child.once("exit", (code) => resolve(code));
+  });
+  try {
+    await eventually(async () => assert.equal((await readJson(join(waiting.transactionRoot, "status.json"))).state, "waiting_for_exit"));
+    await delay(1200);
+    assert.equal(child.exitCode, null);
+    assert.equal((await readJson(join(waiting.plugin, "manifest.json"))).version, "0.1.25");
+    assert.equal(await readFile(join(waiting.plugin, "data.json"), "utf8"), waiting.data);
+    assert.equal((await readdir(waiting.plugins)).includes("speech-capture.old"), true);
+    // Changes saved by Obsidian during shutdown must survive the update.
+    await writeFile(join(waiting.plugin, "data.json"), "{\"saved_at_exit\":true}\n");
+    await writeFile(join(waiting.transactionRoot, "exited"), "");
+    await eventually(() => assert.notEqual(child.exitCode, null));
+    assert.equal(await completed, 0);
+    assert.equal((await readJson(join(waiting.plugin, "manifest.json"))).version, manifest.version);
+    assert.equal(await readFile(join(waiting.plugin, "data.json"), "utf8"), "{\"saved_at_exit\":true}\n");
+  } finally {
+    if (child.exitCode === null) child.kill("SIGTERM");
+    await completed;
+  }
+
+  const queryFailure = await makeTransaction("process-query-failure", "0.1.25");
+  const failingProbe = join(queryFailure.transactionRoot, "process-probe.zsh");
+  await writeFile(failingProbe, "#!/bin/zsh\nexit 3\n", { mode: 0o700 });
+  assert.throws(() => runHelper(queryFailure, { SPEECH_CAPTURE_HELPER_TEST_PROCESS_PROBE: failingProbe }), /Command failed/);
+  assert.equal((await readJson(join(queryFailure.transactionRoot, "status.json"))).error_code, "PROCESS_QUERY_FAILED");
+  assert.equal((await readJson(join(queryFailure.plugin, "manifest.json"))).version, "0.1.25");
+  assert.equal(await readFile(join(queryFailure.plugin, "data.json"), "utf8"), queryFailure.data);
+
   const success = await makeTransaction("success", "0.1.25");
   const successOutput = runHelper(success);
   const successStatus = await readJson(join(success.transactionRoot, "status.json"));
@@ -148,11 +193,25 @@ try {
       installedVersion: installed.version,
       insufficientSpaceRejectedBeforeMutation: true,
       mismatchedVaultScopeRejected: true,
+      processAncestorsIncluded: true,
+      runningAppBlocksReplacement: true,
+      processQueryFailureBlocksReplacement: true,
+      shutdownSettingsPreserved: true,
       restartRequiredRecorded: true
     })
   );
 } finally {
   await rm(temporaryRoot, { recursive: true, force: true });
+}
+
+async function eventually(check) {
+  const deadline = Date.now() + 15000;
+  while (true) {
+    try { return await check(); } catch (error) {
+      if (Date.now() >= deadline) throw error;
+      await delay(100);
+    }
+  }
 }
 
 async function makeTransaction(

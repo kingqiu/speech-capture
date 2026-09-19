@@ -145,7 +145,7 @@ export class SpeechCaptureSettingTab extends PluginSettingTab {
   private renderClientUpdateSettings(containerEl: HTMLElement): void {
     containerEl.createEl("h2", { text: "插件更新" });
     containerEl.createEl("p", {
-      text: "从当前已配对 Worker 获取候选包；下载、校验和确认不会修改插件。只有再次点击“退出后安装并重开”，并完全退出 Obsidian 后，独立助手才会备份旧版、原子替换并校验新版本。"
+      text: "检查更新、下载校验后，只需确认一次，再完全退出 Obsidian。助手会保留设置、备份旧版并安装，随后自动重开当前笔记库；无需切换到终端。"
     });
     const worker = this.speechCapturePlugin.preferredWorker();
     const token = worker
@@ -179,24 +179,12 @@ export class SpeechCaptureSettingTab extends PluginSettingTab {
       });
       return;
     }
-    if (state.phase === "awaiting_confirmation") {
+    if (state.phase === "awaiting_confirmation" || state.phase === "confirmed") {
       status.addButton((button) => {
-        button.setButtonText("确认此候选包").setWarning().onClick(() => {
-          this.speechCapturePlugin.clientUpdates.confirmPreparedUpdate();
-          this.display();
-        });
-      });
-      status.addButton((button) => {
-        button.setButtonText("取消").onClick(() => {
-          this.speechCapturePlugin.clientUpdates.reset();
-          this.display();
-        });
-      });
-      return;
-    }
-    if (state.phase === "confirmed") {
-      status.addButton((button) => {
-        button.setButtonText("退出后安装并重开").setWarning().onClick(async () => {
+        button.setButtonText("确认更新，退出后安装").setWarning().onClick(async () => {
+          if (this.speechCapturePlugin.clientUpdates.state.phase === "awaiting_confirmation") {
+            this.speechCapturePlugin.clientUpdates.confirmPreparedUpdate();
+          }
           const pending = this.speechCapturePlugin.startConfirmedClientUpdate();
           this.display();
           await pending;
@@ -310,7 +298,7 @@ function clientUpdateDescription(
     case "downloading":
       return `正在验证 ${state.release.version} 的大小、SHA-256、ZIP 白名单和插件身份。`;
     case "awaiting_confirmation":
-      return `版本 ${state.release.version} 已通过校验（${formatBytes(state.verification.archiveSizeBytes)}，SHA-256 ${state.verification.archiveSha256.slice(0, 12)}…）。确认只表示允许进入后续安装阶段，本版本仍不会覆盖或重启。`;
+      return `版本 ${state.release.version} 已通过校验（${formatBytes(state.verification.archiveSizeBytes)}，SHA-256 ${state.verification.archiveSha256.slice(0, 12)}…）。确认后请完全退出 Obsidian；安装完成会自动重开，设置与旧版备份会保留。`;
     case "confirmed":
       return `已确认 ${state.release.version}。点击安装后，助手只会在 Obsidian 完全退出时替换当前 Vault 的插件，并保留设置和旧版备份。`;
     case "preparing_install":

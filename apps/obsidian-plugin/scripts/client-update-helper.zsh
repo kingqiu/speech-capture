@@ -216,11 +216,28 @@ if [[ "$sc_active_id" != "speech-capture" || "$sc_active_version" != "$sc_from_v
   sc_fail "ACTIVE_PLUGIN_CHANGED" "活动插件在确认后发生了变化。"
 fi
 
-if [[ "$sc_smoke_test" != "1" ]]; then
+# macOS pgrep excludes ancestors unless -a is supplied. This helper is itself
+# launched by Obsidian, so excluding ancestors would allow a live replacement.
+sc_process_probe=/usr/bin/pgrep
+if [[ "$sc_smoke_test" == "1" && -n "${SPEECH_CAPTURE_HELPER_TEST_PROCESS_PROBE:-}" ]]; then
+  sc_process_probe="${SPEECH_CAPTURE_HELPER_TEST_PROCESS_PROBE:A}"
+  if [[ "$sc_process_probe" != "$sc_transaction_root/process-probe.zsh" ||
+        ! -x "$sc_process_probe" || -L "$sc_process_probe" ]]; then
+    sc_fail "PROCESS_QUERY_FAILED" "测试进程探针路径无效。"
+  fi
+fi
+if [[ "$sc_smoke_test" != "1" || "$sc_process_probe" != /usr/bin/pgrep ]]; then
   sc_write_status "waiting_for_exit" "waiting_for_exit" "" false || \
     sc_fail "STATUS_WRITE_FAILED" "无法记录等待退出状态。"
   sc_wait_count=0
-  while /usr/bin/pgrep -x Obsidian >/dev/null 2>&1; do
+  while true; do
+    "$sc_process_probe" -a -x Obsidian >/dev/null 2>&1
+    sc_probe_status=$?
+    case "$sc_probe_status" in
+      1) break ;;
+      0) ;;
+      *) sc_fail "PROCESS_QUERY_FAILED" "无法确认 Obsidian 已退出，未执行安装。" ;;
+    esac
     if [[ "$sc_wait_count" -ge 600 ]]; then
       sc_fail "OBSIDIAN_EXIT_TIMEOUT" "等待 Obsidian 退出超时。"
     fi
