@@ -4352,3 +4352,22 @@ Stage J 的新扩展，未经明确要求不 commit/push。
 - 项目所有者已明确授权向 `jims-m3-pro` 外发本次 ZIP 与安装脚本；Tailscale file send 成功退出，设备随后
   通过 DERP(sfo) 连续回应 3 次。文件已发送并等待远端收件箱落盘确认；尚未安装。安装时必须显式传入
   实际打开的 Vault 路径，并在完全退出 Obsidian 后执行。
+
+## 128. 2026-09-19 0.1.25 重试修复已推送，可靠插件发布链第一阶段完成
+
+- 修复同一 revision 的重新提炼首次失败后，后续人工点击仍复用旧 idempotency key、Worker 因而返回旧失败
+  请求的问题；每次明确点击现在生成新的请求 nonce，同一次网络调用内仍保持稳定 key；
+- 插件版本 `0.1.25` 与回归测试已在 `dd19792` 提交并推送到 `origin/agent/worker-core`；插件 18 个测试文件
+  共 85 项、严格 TypeScript 和生产构建通过；
+- `release:alpha` 现在统一执行插件测试、发布工具测试、版本一致性检查、类型检查、生产构建、打包、可复现
+  构建检查和临时 Vault 安装演练；`package.json`、`manifest.json`、`versions.json` 不一致时拒绝发布；
+- ZIP 内仍只允许 `main.js`、`manifest.json`、`styles.css`。固定文件时间后，同一源码连续两次构建的 ZIP 与
+  installer SHA-256 完全相同；
+- 生成的安装脚本必须显式接收实际 Vault 路径，要求 Obsidian 完全退出，绑定 ZIP 与 `main.js` 哈希，保留
+  `data.json`，把旧版本备份到 `.obsidian/plugin-backups/`，并把其他同 ID 插件目录移出活动 `plugins/`，
+  防止 Obsidian 扫描备份目录后继续加载旧版；
+- 临时合成 Vault 演练确认版本替换、设置保留、旧版备份和重复目录清理均成功；篡改 ZIP 会在任何插件写入
+  前被拒绝，原有插件保持不变；
+- 本阶段没有访问正式 Vault、私有逐字稿或音频，也没有向远端设备再次外发新构建。下一步先完成远端
+  `0.1.25` 的实际加载与“失败后再次生成候选”端到端确认，再设计插件内受控更新入口；不得静默更新、
+  自动选择 Vault 或绕过用户确认。

@@ -6,7 +6,8 @@
   "scripts": {
     "build": "tsc --noEmit && node esbuild.config.mjs production",
     "dev": "node esbuild.config.mjs",
-    "package:alpha": "pnpm build && node scripts/package-alpha.mjs",
+    "package:alpha": "tsc --noEmit && node esbuild.config.mjs production && node scripts/package-alpha.mjs",
+    "release:alpha": "vitest run && node --test scripts/release-support.node-test.mjs && tsc --noEmit && node esbuild.config.mjs production && node scripts/package-alpha.mjs && node scripts/verify-alpha-reproducible.mjs && node scripts/verify-alpha-install.mjs",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },

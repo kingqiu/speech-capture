@@ -2,6 +2,20 @@
 
 The roadmap is ordered by risk. Dates are intentionally omitted until the model and long-audio performance have been measured on the target Mac.
 
+## Current execution focus — 2026-09-19
+
+- Phase 4 has passed local real-recording acceptance and is complete for the personal-Alpha scope.
+- Phase 5's remote submit, reconnect, review, regeneration, and publication flows are operational. The remaining
+  personal-Alpha work is release/update reliability rather than another transport redesign.
+- Phase 6 is ongoing through evidence-bound content Profiles, regeneration safety, fault regression, and private
+  quality gates.
+- Phase 7 has started with a reproducible plugin release command and a version-bound, explicit-Vault, rollback-safe
+  installer. A user-facing controlled updater, signed/notarized Worker distribution, and fresh-Mac lifecycle tests
+  remain later milestones.
+
+The detailed historical stage log remains in `development-status-and-next-steps.md`; older per-phase status paragraphs
+below describe their original entry state and should not override this current focus block.
+
 ## Phase 0 — Design baseline
 
 Status: complete.
@@ -100,7 +114,8 @@ synthetic-data screenshot comparison for each key page; material implementation 
 
 Goal: implement the approved same-Mac plugin workflow.
 
-Entry status: ready. The final backend test, protocol-generation, and private-data audit passed on 2026-08-03.
+Status: complete for personal Alpha. Two separately authorized real-recording acceptances passed, including a
+multi-speaker meeting. The final backend test, protocol-generation, and private-data audit passed on 2026-08-03.
 Implementation must start from the approved shell and synthetic states, not from a newly invented page structure.
 
 - Obsidian source selection, optional free-form context, and submission;
@@ -120,6 +135,9 @@ Exit condition: a user can process, review, and publish real recordings locally 
 ## Phase 5 — Remote personal alpha
 
 Goal: submit from another Obsidian desktop and continue independently.
+
+Status: functional; update and release hardening is in progress. Remote private-network health, persistent pairing,
+resumable upload, detached processing, reconnect, review, regeneration, and atomic Vault publication have passed.
 
 - HTTPS Worker endpoint configuration;
 - recommended Tailscale setup;

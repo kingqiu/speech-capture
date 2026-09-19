@@ -38,12 +38,27 @@ pnpm build
 Build the desktop-only personal Alpha package on macOS:
 
 ```bash
-pnpm package:alpha
+pnpm release:alpha
 ```
 
-The command runs the production build and writes a generated archive plus SHA-256 file under `dist/`. The archive
-contains exactly `speech-capture/main.js`, `speech-capture/manifest.json`, and `speech-capture/styles.css`; it never
-includes plugin settings, Vault IDs, credentials, audio, transcripts, Notes, databases, models, or source maps.
+The release command runs the complete plugin test suite, release-tool tests, strict type checking, the production
+build, package verification, a byte-for-byte reproducibility check, and a real installer smoke test in a temporary
+synthetic Vault. It refuses to package when `package.json`, `manifest.json`, and `versions.json` disagree. It writes
+the generated archive, its SHA-256 file, and a version-bound installer under `dist/`. The archive contains exactly `speech-capture/main.js`,
+`speech-capture/manifest.json`, and `speech-capture/styles.css`; it never includes plugin settings, Vault IDs,
+credentials, audio, transcripts, Notes, databases, models, or source maps.
+
+The installer requires one explicit Vault path and refuses to guess. Obsidian must be fully closed. It verifies the
+archive and installed `main.js`, preserves `data.json`, replaces the plugin directory atomically, keeps the prior
+version under `.obsidian/plugin-backups/`, and moves any duplicate `speech-capture` plugin IDs out of the active
+`plugins/` directory so Obsidian cannot silently load an old backup as the installed version:
+
+```bash
+/bin/zsh "$HOME/Downloads/install-speech-capture-0.1.25.zsh" "/full/path/to/the/actual/Vault"
+```
+
+`pnpm package:alpha` remains available when only a build and generated package are required; release candidates sent
+to another Mac must use `pnpm release:alpha`.
 
 For a manual personal-Alpha installation, extract the `speech-capture` directory into the target Vault's
 `.obsidian/plugins/` directory, then enable **Speech Capture** under Obsidian's Community plugins settings. Open

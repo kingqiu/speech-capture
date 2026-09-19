@@ -1,0 +1,162 @@
+#!/bin/zsh
+
+set -u
+set -o pipefail
+
+sc_version="@@VERSION@@"
+sc_archive_name="@@ARCHIVE_NAME@@"
+sc_archive_sha256="@@ARCHIVE_SHA256@@"
+sc_main_sha256="@@MAIN_SHA256@@"
+sc_script_dir="${0:A:h}"
+sc_archive="$sc_script_dir/$sc_archive_name"
+sc_stage=""
+sc_backup_target=""
+
+sc_cleanup() {
+  if [[ -n "${sc_stage:-}" && -d "$sc_stage" ]]; then
+    /bin/rm -rf -- "$sc_stage"
+  fi
+}
+
+sc_fail() {
+  echo
+  echo "安装失败：$1"
+  echo "插件没有被报告为更新成功；请把本终端中的完整信息发回来。"
+  exit 1
+}
+
+trap 'sc_cleanup' EXIT HUP INT TERM
+
+if [[ "$#" -ne 1 ]]; then
+  echo "用法："
+  echo "/bin/zsh \"$0\" \"/完整/Vault/路径\""
+  echo
+  echo "必须明确指定 Obsidian 实际打开的 Vault，脚本不会猜测或自动选择。"
+  exit 2
+fi
+
+sc_vault="${1:A}"
+sc_config="$sc_vault/.obsidian"
+sc_plugins="$sc_config/plugins"
+sc_plugin="$sc_plugins/speech-capture"
+sc_backup_root="$sc_config/plugin-backups"
+
+sc_smoke_test="${SPEECH_CAPTURE_INSTALL_SMOKE_TEST:-0}"
+if [[ "$sc_smoke_test" == "1" && "$sc_vault" != /private/tmp/speech-capture-install-test.*/* ]]; then
+  sc_fail "安装演练标记只能用于 /private/tmp 下的测试 Vault。"
+fi
+if [[ "$sc_smoke_test" != "1" ]] && /usr/bin/pgrep -x Obsidian >/dev/null 2>&1; then
+  sc_fail "Obsidian 仍在运行。请先按 Command + Q 完全退出，再重新运行本命令。"
+fi
+
+if [[ ! -d "$sc_vault" || ! -d "$sc_config" ]]; then
+  sc_fail "指定路径不是有效的 Obsidian Vault：$sc_vault"
+fi
+if [[ -L "$sc_plugin" ]]; then
+  sc_fail "插件目录是符号链接，无法安全替换：$sc_plugin"
+fi
+if [[ ! -f "$sc_archive" ]]; then
+  sc_fail "安装包与脚本不在同一目录：$sc_archive"
+fi
+
+sc_actual_archive_sha256="$(/usr/bin/shasum -a 256 "$sc_archive" | /usr/bin/awk '{print $1}')"
+if [[ "$sc_actual_archive_sha256" != "$sc_archive_sha256" ]]; then
+  sc_fail "安装包 SHA-256 校验不通过。期望 $sc_archive_sha256，实际 $sc_actual_archive_sha256"
+fi
+
+if ! /bin/mkdir -p "$sc_plugins" "$sc_backup_root"; then
+  sc_fail "无法创建插件或备份目录。"
+fi
+
+sc_stage="$(/usr/bin/mktemp -d "$sc_config/.speech-capture-installing.XXXXXX")" || \
+  sc_fail "无法创建同卷安装暂存目录。"
+if ! /usr/bin/ditto -x -k "$sc_archive" "$sc_stage/unpacked"; then
+  sc_fail "无法解压安装包。"
+fi
+
+sc_source="$sc_stage/unpacked/speech-capture"
+for sc_file in main.js manifest.json styles.css; do
+  if [[ ! -f "$sc_source/$sc_file" ]]; then
+    sc_fail "安装包缺少 $sc_file。"
+  fi
+done
+
+sc_package_version="$(/usr/bin/plutil -extract version raw -o - "$sc_source/manifest.json" 2>/dev/null)"
+sc_package_id="$(/usr/bin/plutil -extract id raw -o - "$sc_source/manifest.json" 2>/dev/null)"
+sc_package_main_sha256="$(/usr/bin/shasum -a 256 "$sc_source/main.js" | /usr/bin/awk '{print $1}')"
+if [[ "$sc_package_version" != "$sc_version" || "$sc_package_id" != "speech-capture" ]]; then
+  sc_fail "安装包 manifest 校验不通过（id=$sc_package_id, version=$sc_package_version）。"
+fi
+if [[ "$sc_package_main_sha256" != "$sc_main_sha256" ]]; then
+  sc_fail "安装包 main.js 校验不通过。"
+fi
+
+sc_ready="$sc_stage/ready"
+if ! /bin/mkdir -p "$sc_ready"; then
+  sc_fail "无法建立插件暂存目录。"
+fi
+for sc_file in main.js manifest.json styles.css; do
+  if ! /usr/bin/ditto "$sc_source/$sc_file" "$sc_ready/$sc_file"; then
+    sc_fail "暂存 $sc_file 失败。"
+  fi
+done
+if [[ -f "$sc_plugin/data.json" ]]; then
+  if ! /usr/bin/ditto "$sc_plugin/data.json" "$sc_ready/data.json"; then
+    sc_fail "保留现有 data.json 失败。"
+  fi
+fi
+
+sc_timestamp="$(/bin/date '+%Y%m%d-%H%M%S')-$$"
+sc_duplicate_count=0
+while IFS= read -r -d '' sc_other_manifest; do
+  sc_other_dir="${sc_other_manifest:h}"
+  if [[ "$sc_other_dir" == "$sc_plugin" ]]; then
+    continue
+  fi
+  sc_other_id="$(/usr/bin/plutil -extract id raw -o - "$sc_other_manifest" 2>/dev/null)"
+  if [[ "$sc_other_id" == "speech-capture" ]]; then
+    sc_duplicate_target="$sc_backup_root/${sc_other_dir:t}.duplicate-$sc_timestamp-$sc_duplicate_count"
+    if ! /bin/mv "$sc_other_dir" "$sc_duplicate_target"; then
+      sc_fail "无法把重复插件移出加载目录：$sc_other_dir"
+    fi
+    sc_duplicate_count=$((sc_duplicate_count + 1))
+  fi
+done < <(/usr/bin/find "$sc_plugins" -mindepth 2 -maxdepth 2 -name manifest.json -print0)
+
+if [[ -d "$sc_plugin" ]]; then
+  sc_backup_target="$sc_backup_root/speech-capture-$sc_timestamp"
+  if ! /bin/mv "$sc_plugin" "$sc_backup_target"; then
+    sc_fail "无法备份当前插件目录。"
+  fi
+fi
+
+if ! /bin/mv "$sc_ready" "$sc_plugin"; then
+  if [[ -n "$sc_backup_target" && -d "$sc_backup_target" ]]; then
+    /bin/mv "$sc_backup_target" "$sc_plugin" 2>/dev/null
+  fi
+  sc_fail "无法原子启用新插件，已尝试恢复旧版本。"
+fi
+
+sc_installed_version="$(/usr/bin/plutil -extract version raw -o - "$sc_plugin/manifest.json" 2>/dev/null)"
+sc_installed_sha256="$(/usr/bin/shasum -a 256 "$sc_plugin/main.js" | /usr/bin/awk '{print $1}')"
+if [[ "$sc_installed_version" != "$sc_version" || "$sc_installed_sha256" != "$sc_main_sha256" ]]; then
+  /bin/rm -rf -- "$sc_plugin"
+  if [[ -n "$sc_backup_target" && -d "$sc_backup_target" ]]; then
+    /bin/mv "$sc_backup_target" "$sc_plugin" 2>/dev/null
+  fi
+  sc_fail "安装后版本或 main.js 校验失败，已尝试恢复旧版本。"
+fi
+
+echo
+echo "Speech Capture $sc_version 已安装并校验通过。"
+echo "实际 Vault：$sc_vault"
+echo "插件目录：$sc_plugin"
+echo "main.js SHA-256：$sc_installed_sha256"
+echo "已有 data.json 和配对设置已保留。"
+if [[ -n "$sc_backup_target" ]]; then
+  echo "旧版本备份：$sc_backup_target"
+fi
+if [[ "$sc_duplicate_count" -gt 0 ]]; then
+  echo "已把 $sc_duplicate_count 个重复插件目录移到：$sc_backup_root"
+fi
+echo "现在重新打开 Obsidian，并确认工作台显示 Speech Capture $sc_version。"

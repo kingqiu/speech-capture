@@ -1,25 +1,44 @@
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  cp,
+  mkdir,
+  readFile,
+  rm,
+  utimes,
+  writeFile
+} from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import {
+  assertReleaseMetadata,
+  expandInstallerTemplate
+} from "./release-support.mjs";
+
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const manifest = JSON.parse(await readFile(join(root, "manifest.json"), "utf8"));
-if (manifest.id !== "speech-capture" || typeof manifest.version !== "string") {
-  throw new Error("The Obsidian manifest is not a valid Speech Capture release.");
-}
+const packageJson = JSON.parse(await readFile(join(root, "package.json"), "utf8"));
+const versions = JSON.parse(await readFile(join(root, "versions.json"), "utf8"));
+assertReleaseMetadata(manifest, packageJson, versions);
 
 const outputRoot = join(root, "dist");
 const packageDirectory = join(outputRoot, manifest.id);
-const archive = join(outputRoot, `${manifest.id}-${manifest.version}-alpha.zip`);
+const archiveName = `${manifest.id}-${manifest.version}-alpha.zip`;
+const archive = join(outputRoot, archiveName);
 const checksumFile = `${archive}.sha256`;
+const installerName = `install-${manifest.id}-${manifest.version}.zsh`;
+const installer = join(outputRoot, installerName);
 const releaseFiles = ["main.js", "manifest.json", "styles.css"];
+const reproducibleTimestamp = new Date("2000-01-01T00:00:00.000Z");
 
 await rm(outputRoot, { recursive: true, force: true });
 await mkdir(packageDirectory, { recursive: true });
 for (const name of releaseFiles) {
-  await cp(join(root, name), join(packageDirectory, name));
+  const packagedFile = join(packageDirectory, name);
+  await cp(join(root, name), packagedFile);
+  await utimes(packagedFile, reproducibleTimestamp, reproducibleTimestamp);
 }
 
 execFileSync(
@@ -39,17 +58,40 @@ if (JSON.stringify(archiveEntries) !== JSON.stringify(expectedEntries)) {
   throw new Error(`Unexpected Alpha package entries: ${archiveEntries.join(", ")}`);
 }
 
-const hashes = [];
+const releaseHashes = {};
 for (const name of releaseFiles) {
-  hashes.push(`${await sha256(join(packageDirectory, name))}  ${manifest.id}/${name}`);
+  releaseHashes[name] = await sha256(join(packageDirectory, name));
 }
-hashes.push(`${await sha256(archive)}  ${archive.split("/").at(-1)}`);
-await writeFile(checksumFile, `${hashes.join("\n")}\n`, "utf8");
+const archiveHash = await sha256(archive);
+const installerTemplate = await readFile(
+  join(root, "scripts", "install-alpha.zsh.in"),
+  "utf8"
+);
+const installerContents = expandInstallerTemplate(installerTemplate, {
+  VERSION: manifest.version,
+  ARCHIVE_NAME: archiveName,
+  ARCHIVE_SHA256: archiveHash,
+  MAIN_SHA256: releaseHashes["main.js"]
+});
+await writeFile(installer, installerContents, "utf8");
+await chmod(installer, 0o755);
+execFileSync("/bin/zsh", ["-n", installer]);
+
+const installerHash = await sha256(installer);
+await writeFile(
+  checksumFile,
+  `${archiveHash}  ${archiveName}\n${installerHash}  ${installerName}\n`,
+  "utf8"
+);
 
 console.log(
   JSON.stringify({
     archive,
     checksumFile,
+    installer,
+    archiveSha256: archiveHash,
+    installerSha256: installerHash,
+    mainSha256: releaseHashes["main.js"],
     files: releaseFiles,
     version: manifest.version
   })
