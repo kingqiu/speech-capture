@@ -4501,3 +4501,23 @@ Stage J 的新扩展，未经明确要求不 commit/push。
 - 本批仍未访问正式 Vault、私人会议、真实 Worker release 或远端设备。下一步是唯一剩余外部状态门：在独立
   远程测试 Vault 执行 `N → N+1 → 回滚 N → 再升级 N+1` 并核对配对设置；需要针对本次 `0.1.28` 外发与测试
   的明确授权，不能沿用旧版本的发送许可。
+
+## 136. 2026-09-19 宿主 Worker 发布能力部署完成，远端收件阻断
+
+- 项目所有者已明确授权 `0.1.28` 的宿主导入、向 `jims-m3-pro` 外发及独立远程测试 Vault 的
+  `N → N+1 → 回滚 N → 再升级 N+1`；执行前只读确认 Worker 没有上传、排队或处理中任务，现有任务为
+  9 条已发布和 1 条历史失败；
+- 旧宿主运行时不包含 `client-release-import` / `client-release-status`。当前源码重新构建出的 Apple Silicon
+  独立运行包通过 `--verify`，包含 3438 个文件、总计 1298551615 字节，runtime manifest SHA-256 为
+  `69759fb4e95d82e62ca9b85a6f84e374879f843029b2990128888e4c3ec43637`；
+- 部署前完整旧运行时保留为 `SpeechCaptureWorker.backup-20260919-pre-client-release`。新运行时启动后
+  launchd、8765 端口、模型缓存、Ollama 和 Tailscale 状态均正常，任务状态与数量未变化；
+- `0.1.28` 已通过本机管理员命令导入真实 Worker release store，随后 `client-release-status` 重新校验并报告
+  latest `0.1.28`；ZIP、installer 和 release manifest 的文件名、大小及哈希均与第 135 节发布结果一致；
+- `jims-m3-pro` 在 Tailscale 控制面显示 `active; relay \"lax\"`，也出现在 `file cp --targets`，但数据面 ping
+  连续超时。批量发送五个文件与单独发送小型 release manifest 都得到“目标不应答”，约 40 秒后返回
+  `502 Bad Gateway`；Tailscale SSH 的只读主机名探测同样无响应并已中止。因此不能把本轮记为已送达，远端
+  Vault 也尚未被访问或修改；
+- 下一步只剩外部设备门：让远端 Mac 保持唤醒并恢复 Tailscale 数据面后，重新发送 ZIP、checksum、installer、
+  recovery 和 release manifest；确认收件后再执行真实升级—回滚—再升级，逐次核对加载版本、`data.json`
+  与持久配对。宿主 Worker 不需要再次构建或导入。
