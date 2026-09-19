@@ -1,0 +1,48 @@
+{
+  "roles": {
+    "classification": "editor",
+    "extraction": "editor",
+    "synthesis": "primary",
+    "quality_edit": "editor"
+  },
+  "batch_target_tokens": 4800,
+  "maximum_quality_passes": 1,
+  "enabled_registered_repairs": ["meeting_outcomes"],
+  "field_repairs": {
+    "maximum_calls": 3,
+    "total_timeout_seconds": 180,
+    "heartbeat_seconds": 10,
+    "repairs": {
+      "meeting_quantitative_promotion": {
+        "model_role": "editor",
+        "maximum_output_tokens": 1024,
+        "maximum_field_characters": 1200,
+        "maximum_evidence_segments": 24,
+        "maximum_evidence_characters": 12000,
+        "maximum_evidence_tokens": 4000,
+        "call_timeout_seconds": 120,
+        "maximum_parser_retries": 1
+      },
+      "meeting_speaker_grounding": {
+        "model_role": "editor",
+        "maximum_output_tokens": 1024,
+        "maximum_field_characters": 1200,
+        "maximum_evidence_segments": 24,
+        "maximum_evidence_characters": 12000,
+        "maximum_evidence_tokens": 4000,
+        "call_timeout_seconds": 120,
+        "maximum_parser_retries": 1
+      },
+      "meeting_topic_detail": {
+        "model_role": "editor",
+        "maximum_output_tokens": 1024,
+        "maximum_field_characters": 1200,
+        "maximum_evidence_segments": 24,
+        "maximum_evidence_characters": 12000,
+        "maximum_evidence_tokens": 4000,
+        "call_timeout_seconds": 120,
+        "maximum_parser_retries": 1
+      }
+    }
+  }
+}

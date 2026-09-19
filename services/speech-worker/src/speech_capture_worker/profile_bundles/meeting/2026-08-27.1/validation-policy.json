@@ -1,0 +1,12 @@
+{
+  "registered_validators": [
+    "meeting.context.sufficient",
+    "meeting.decision.confirmed",
+    "meeting.action.evidence_complete",
+    "meeting.categories.nonduplicated"
+  ],
+  "thresholds": {
+    "minimum_context_facets": 2,
+    "single_context_minimum_characters": 80
+  }
+}

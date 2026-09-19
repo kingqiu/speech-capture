@@ -12,9 +12,21 @@ The interface must make five things immediately clear:
 4. whether the transcript is provisional or durable;
 5. what the user needs to do next.
 
-Detailed visual design will follow after the processing contract is implemented and tested.
+Detailed visual design follows after the processing contract is implemented and tested, and before any user-facing Obsidian page code is written.
 
-## 2. Reference direction
+## 2. Design-before-code gate
+
+The Obsidian frontend has an explicit approval gate:
+
+1. stabilize the Worker and protocol states needed by the personal V1;
+2. design the page architecture, flows, state matrix, and data mappings;
+3. generate key interaction visuals through the GPT Image capability provided by Codex;
+4. review and revise the designs with the project owner;
+5. begin frontend implementation only after explicit approval.
+
+The complete deliverables, visual set, safety rules, and approval criteria are defined in [Obsidian Frontend Design Gate](frontend-design-gate.md). Until that gate passes, backend and protocol work may continue, but the task workbench and transcript reader pages remain unimplemented.
+
+## 3. Reference direction
 
 The visual language should align with [Reading Capture](https://github.com/kingqiu/reading-capture-plugin), especially its restrained information density, state clarity, and Obsidian-native behavior.
 
@@ -30,9 +42,9 @@ The first visual baseline is:
 
 Speech Capture may share principles and tokens with Reading Capture. It should not copy implementation code without an explicit license and dependency review.
 
-## 3. Two main surfaces
+## 4. Two main surfaces
 
-### 3.1 Task workbench
+### 4.1 Task workbench
 
 The task workbench is optimized for submission, progress, warnings, and control.
 
@@ -48,7 +60,7 @@ It contains:
 - pause, resume, cancel, retry, and open-result actions;
 - separate `processed` and `published` status.
 
-### 3.2 Transcript reader
+### 4.2 Transcript reader
 
 The reader is optimized for evidence review.
 
@@ -65,7 +77,7 @@ It contains:
 
 Task operations should not crowd the reading surface after publication.
 
-## 4. Primary flow
+## 5. Primary flow
 
 ```mermaid
 flowchart LR
@@ -79,7 +91,7 @@ flowchart LR
 
 The default path should require few decisions. Advanced model and transport controls remain available without dominating the first screen.
 
-## 5. Progressive transcript behavior
+## 6. Progressive transcript behavior
 
 - Stable committed segments use normal transcript styling.
 - The active tail is labeled `临时结果` and uses a subtle distinct treatment.
@@ -91,7 +103,7 @@ The default path should require few decisions. Advanced model and transport cont
 
 The preview is useful immediately but never presented as the final evidence artifact.
 
-## 6. State language
+## 7. State language
 
 Status labels describe both the system state and the next action:
 
@@ -111,7 +123,7 @@ Status labels describe both the system state and the next action:
 
 Messages avoid vague labels such as `Something went wrong`.
 
-## 7. Resource warnings
+## 8. Resource warnings
 
 Warnings appear in context and remain available in task history.
 
@@ -124,7 +136,7 @@ Examples:
 
 The product never suggests that it cleaned user files. Cleanup actions target only explicitly listed Worker-owned data.
 
-## 8. First-run Worker setup
+## 9. First-run Worker setup
 
 The macOS Worker Manager guides the user through:
 
@@ -140,7 +152,7 @@ The macOS Worker Manager guides the user through:
 
 Each step can report `ready`, `optional`, `needs action`, or `blocked`.
 
-## 9. Settings organization
+## 10. Settings organization
 
 Plugin settings are grouped by user intent:
 
@@ -155,7 +167,7 @@ Plugin settings are grouped by user intent:
 
 Secrets are never displayed after entry. The UI shows presence, scope, and revoke or replace actions.
 
-## 10. Accessibility and Obsidian fit
+## 11. Accessibility and Obsidian fit
 
 - Use Obsidian variables and components where practical.
 - Support light and dark themes, even if the primary reference is dark.
@@ -166,6 +178,8 @@ Secrets are never displayed after entry. The UI shows presence, scope, and revok
 - Keep controls usable in narrow sidebars and detached windows.
 - Use localized plain language; V1 starts with Simplified Chinese and English-ready message keys.
 
-## 11. Deferred visual work
+## 12. Design production sequence
 
-High-fidelity wireframes, component specifications, empty states, animation, and final tokens will be designed after the first end-to-end processing spike. The UI should be validated against real long transcript behavior rather than placeholder paragraphs alone.
+After the backend contract is stable, the design phase produces high-fidelity interaction images, component specifications, empty and failure states, motion behavior, and final tokens. Visuals use synthetic content for privacy, while state sizing is validated with representative long-transcript fixtures.
+
+The project owner reviews this complete design set before implementation. Approval is a prerequisite for Obsidian page development, not a final polish step after the pages already exist.

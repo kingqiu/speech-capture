@@ -27,8 +27,17 @@ V1 assumes a private network such as Tailscale.
 - Pairing is confirmed on the Worker host and can be revoked by device.
 - A Worker restricts each device to approved Vault identities and operations.
 - Routine Worker restart or upgrade preserves pairing.
+- The Worker defaults to loopback-only HTTP. Non-loopback binds require an explicit non-public IP and a protected
+  TLS certificate/key pair; wildcard and public listeners are rejected.
 
 A reinstall, explicit reset of security state, or loss of the processing host requires new pairing.
+
+The implemented API foundation already enforces authentication and per-principal Vault allowlists for every private
+resource and redacts request-validation input. Durable pairing stores only token digests in a private `0600`
+security database; short-lived codes are attempt-limited and consumed once. Client-side OS-protected token storage
+remains later Obsidian work. Worker-side credential rotation is implemented as a two-phase switch: preparing a
+replacement does not revoke the current token, and activation atomically promotes the replacement so a lost HTTP
+response cannot leave both credentials unusable.
 
 ## 4. Credential handling
 
@@ -77,6 +86,10 @@ Local routine logs may contain:
 - retry and recovery actions.
 
 They must not contain transcript text, source bytes, prompts containing transcript material, credentials, full local paths, or original filenames when a pseudonym is sufficient.
+
+The reconnect event feed follows the same boundary: it carries segment IDs, time ranges, outcomes, generations, speaker state, and text length, but transcript text is read only through the authorized bounded snapshot.
+
+Normalized PCM and raw model-attempt JSON stay under the private Worker job directory with restrictive permissions, Worker-relative database paths, atomic writes, and SHA-256 verification. Routine attempt metadata exposes no transcript text or absolute path.
 
 Diagnostic export is user initiated, previewable, redacted, and saved locally. Sending it anywhere is a separate user action.
 
@@ -138,6 +151,12 @@ Atomic writes and artifact hashes prevent a half-written directory from being ma
 - Model activation is separate from model download.
 - The previous working model remains available until the new profile passes a local health check.
 - Rollback does not delete job evidence.
+
+The Stage G Manager now enforces this model boundary with full revision and content-hash validation before an
+atomic activation record changes. It retains one complete prior profile for revalidated rollback. The private state
+uses a process lock, restrictive permissions, no-follow reads, file and directory fsync, and rejects unknown model
+identity combinations. Activated MLX execution uses the pinned snapshot path while persisted job evidence keeps the
+canonical public model ID; model cache paths are not copied into job records or Manager output.
 
 ## 12. Security review gates
 

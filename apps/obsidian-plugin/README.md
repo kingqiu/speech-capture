@@ -1,6 +1,11 @@
 # Speech Capture Obsidian Plugin
 
-Status: design only; no installable build exists yet.
+Status: the Stage I local workflow has passed two separately authorized real-recording acceptances, including a
+multi-speaker meeting. Stage J remote personal Alpha is in progress. Remote Worker configuration, private-HTTPS
+validation, per-Worker Vault authorization, and legacy settings migration are implemented; real laptop-to-home-Mac
+private-network health, pairing persistence, resumable two-part upload, detached home processing, remote reconnect,
+and atomic Vault publication have passed. Large-file upload hardening is now in progress before a formal Vault is
+used.
 
 The plugin is the client and Vault publisher for Speech Capture. It will:
 
@@ -15,6 +20,64 @@ The plugin is the client and Vault publisher for Speech Capture. It will:
 
 Large model inference does not run inside the Obsidian process.
 
-Planned implementation: TypeScript, Obsidian API, shared generated protocol types, and `pnpm`.
+Implementation: TypeScript, Obsidian API, shared generated protocol types, and `pnpm`.
+
+Development commands from this directory:
+
+```bash
+pnpm install
+pnpm test
+pnpm build
+```
+
+`main.js` is a local build output and remains ignored by Git. Worker bearer credentials use Obsidian's
+`secretStorage`; `data.json` contains only non-secret preferences and Worker endpoint metadata.
+
+## Personal Alpha package
+
+Build the desktop-only personal Alpha package on macOS:
+
+```bash
+pnpm release:alpha
+```
+
+The release command runs the complete plugin test suite, release-tool tests, strict type checking, the production
+build, package verification, a byte-for-byte reproducibility check, and a real installer smoke test in a temporary
+synthetic Vault. It refuses to package when `package.json`, `manifest.json`, and `versions.json` disagree. It writes
+the generated archive, its SHA-256 file, a machine-readable release manifest, a version-bound installer, and an
+explicit-backup recovery tool under `dist/`. The archive contains exactly `speech-capture/main.js`,
+`speech-capture/manifest.json`, and `speech-capture/styles.css`; it never includes plugin settings, Vault IDs,
+credentials, audio, transcripts, Notes, databases, models, or source maps.
+
+The installer requires one explicit Vault path and refuses to guess. Obsidian must be fully closed. It verifies the
+archive and installed `main.js`, preserves `data.json`, replaces the plugin directory atomically, keeps the prior
+version under `.obsidian/plugin-backups/`, and moves any duplicate `speech-capture` plugin IDs out of the active
+`plugins/` directory so Obsidian cannot silently load an old backup as the installed version:
+
+```bash
+/bin/zsh "$HOME/Downloads/install-speech-capture-0.1.28.zsh" "/full/path/to/the/actual/Vault"
+```
+
+If a newly installed plugin cannot load at all, keep Obsidian closed and restore one explicitly named backup; the
+recovery tool never guesses the Vault or backup:
+
+```bash
+/bin/zsh "$HOME/Downloads/recover-speech-capture.zsh" "/full/path/to/the/actual/Vault" "speech-capture-YYYYMMDD-HHMMSS-PID"
+```
+
+`pnpm package:alpha` remains available when only a build and generated package are required; release candidates sent
+to another Mac must use `pnpm release:alpha`.
+
+For a manual personal-Alpha installation, extract the `speech-capture` directory into the target Vault's
+`.obsidian/plugins/` directory, then enable **Speech Capture** under Obsidian's Community plugins settings. Open
+**Speech Capture: 管理处理设备** to choose the local Worker or add a home Worker through its private HTTPS URL.
+Remote HTTP endpoints and URLs containing credentials, query parameters, or fragments are rejected before a
+connection is attempted. Desktop remote HTTPS uses Node's certificate-validating transport because Obsidian's
+`requestUrl` closes Tailscale Serve connections; local loopback requests continue to use the Obsidian API. Large
+binary transfers use a longer inactivity timeout and report progress inside each Worker upload part. Pairing
+requests reuse a private HTTPS connection, respect network backpressure, and retry a disconnected part at one-minute
+intervals up to three times before exposing the existing manual retry. Pairing credentials are saved only through
+Obsidian Secret Storage. Worker upload staging reserves disk for both resumable parts and atomic assembly, then
+releases redundant part bytes after the verified source is committed.
 
 See the root [product requirements](../../docs/product-requirements.md), [architecture](../../docs/architecture.md), and [UI direction](../../docs/ui-direction.md).

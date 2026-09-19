@@ -1,0 +1,88 @@
+{
+  "title": "合成数据治理会议",
+  "objective": {
+    "text": "确认合成数据校验规则和后续责任。",
+    "evidence": ["seg_0001"]
+  },
+  "summary": {
+    "text": "团队确认先固定公开合成基线，再验证配置加载和文档适配。",
+    "evidence": ["seg_0001", "seg_0002"]
+  },
+  "context": [
+    {
+      "kind": "purpose",
+      "title": "测试目的",
+      "text": "本记录只包含虚构内容，用于验证结构契约。",
+      "evidence": ["seg_0001"]
+    },
+    {
+      "kind": "organization",
+      "title": "测试团队",
+      "text": "测试团队负责公开合成基线的验证。",
+      "evidence": ["seg_0001", "seg_0002"]
+    }
+  ],
+  "highlights": [
+    {
+      "text": "现有内嵌路径继续作为默认路径。",
+      "evidence": ["seg_0002"]
+    }
+  ],
+  "topics": [
+    {
+      "title": "迁移边界",
+      "summary": "第一批只建立加载与适配能力。",
+      "details": [
+        {
+          "text": "不接入实际 Note 生成。",
+          "evidence": ["seg_0002"]
+        }
+      ],
+      "evidence": ["seg_0001", "seg_0002"]
+    }
+  ],
+  "scene_sections": [],
+  "discussion_threads": [],
+  "timeline_sections": [
+    {
+      "title": "确认测试范围",
+      "summary": "先确定边界，再建立合成基线。",
+      "details": ["确认不使用真实音频。"],
+      "start_segment_id": "seg_0001",
+      "end_segment_id": "seg_0002"
+    }
+  ],
+  "speaker_summaries": [
+    {
+      "speaker_id": "speaker_01",
+      "display_name": "测试主持人",
+      "affiliation": "",
+      "role": "",
+      "summary": "要求迁移不得改变当前输出。",
+      "evidence": ["seg_0001"]
+    }
+  ],
+  "decisions": [
+    {
+      "text": "B1 不接入运行时。",
+      "evidence": ["seg_0002"]
+    }
+  ],
+  "actions": [
+    {
+      "task": "完成严格 loader 和 adapter 测试。",
+      "owner": "测试团队",
+      "deadline": "",
+      "evidence": ["seg_0002"]
+    }
+  ],
+  "risks": [],
+  "open_questions": [],
+  "chapters": [
+    {
+      "title": "迁移边界",
+      "summary": "第一批只建立加载与适配能力。",
+      "evidence": ["seg_0001", "seg_0002"]
+    }
+  ]
+}

@@ -1,0 +1,22 @@
+{
+  "schema_version": "1.0.0",
+  "dataset_id": "private-vad-v1",
+  "samples": [
+    {
+      "sample_id": "sample-001",
+      "audio": "sample-001.m4a",
+      "labels": [
+        {
+          "start_ms": 0,
+          "end_ms": 12500,
+          "class": "speech"
+        },
+        {
+          "start_ms": 12500,
+          "end_ms": 13900,
+          "class": "non_speech"
+        }
+      ]
+    }
+  ]
+}

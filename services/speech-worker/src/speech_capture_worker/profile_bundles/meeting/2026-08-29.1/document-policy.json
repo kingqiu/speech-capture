@@ -1,0 +1,10 @@
+{
+  "required_nonempty": ["title", "objective", "summary", "timeline_sections"],
+  "allowed_empty": ["decisions", "actions", "risks", "open_questions"],
+  "body_source": "topics",
+  "field_limits": {
+    "highlights": 8,
+    "topics": 10,
+    "speaker_summaries": 16
+  }
+}

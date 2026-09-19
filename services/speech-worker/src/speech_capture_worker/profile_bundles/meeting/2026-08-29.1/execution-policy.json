@@ -1,0 +1,11 @@
+{
+  "roles": {
+    "classification": "editor",
+    "extraction": "editor",
+    "synthesis": "primary",
+    "quality_edit": "editor"
+  },
+  "batch_target_tokens": 4800,
+  "maximum_quality_passes": 1,
+  "enabled_registered_repairs": ["meeting_outcomes"]
+}

@@ -11,20 +11,32 @@ requires-python = ">=3.11,<3.14"
 license = "PolyForm-Noncommercial-1.0.0"
 authors = [{name = "Speech Capture contributors"}]
 dependencies = [
+  "fastapi==0.139.2",
   "mlx-qwen3-asr[aligner]==0.3.5",
+  "numpy>=1.26,<3",
+  "psutil>=7.0,<8",
+  "uvicorn==0.51.0",
 ]
 
 [project.optional-dependencies]
 dev = [
+  "httpx2>=2,<3",
   "pytest>=8.0",
   "ruff>=0.9",
 ]
 diarization = [
   "pyannote.audio>=4.0.4,<5",
+  "omegaconf>=2.3,<3",
+]
+packaging = [
+  "pyinstaller==6.21.0",
 ]
 
 [project.scripts]
 speech-capture-asr-probe = "speech_capture_worker.asr_probe:main"
+speech-capture-vad-probe = "speech_capture_worker.vad_probe:main"
+speech-capture-worker = "speech_capture_worker.worker_cli:main"
+speech-capture-manager = "speech_capture_worker.manager_cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/speech_capture_worker"]
