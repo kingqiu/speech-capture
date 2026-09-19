@@ -4371,3 +4371,20 @@ Stage J 的新扩展，未经明确要求不 commit/push。
 - 本阶段没有访问正式 Vault、私有逐字稿或音频，也没有向远端设备再次外发新构建。下一步先完成远端
   `0.1.25` 的实际加载与“失败后再次生成候选”端到端确认，再设计插件内受控更新入口；不得静默更新、
   自动选择 Vault 或绕过用户确认。
+
+## 129. 2026-09-19 受控更新发布清单与实施设计完成
+
+- 发布产物新增稳定 `release.json`，只包含 schema、插件版本与兼容性、固定文件名、大小、ZIP 白名单条目和
+  SHA-256，不包含 Vault、设备、用户、网络或内容信息；该清单已加入可复现构建比较和 checksum 校验；
+- 当前 `0.1.25` 可复现产物 SHA-256：ZIP
+  `bb887e9e995f2eba5b76ddd5e32354d520fd20a140d30f4fec22e64f4cd5c1d0`，installer
+  `2e199118bed3bb11a317f210c0406cda98c79624363f35da06ddeb408844b57b`，release manifest
+  `8ac4b10449b8005d6831a33fdba43c8a82d88d89b61ae7b92416c7cb487585f3`；
+- 新增 `docs/design/plugin-controlled-update-v1.md`，确定个人 Alpha 后续采用“已配对 Worker 只读 release
+  store → 插件下载与校验 → 用户明确确认 → Obsidian 退出期间最小 helper 原子替换 → 重开后加载确认 →
+  必要时回滚”的边界；
+- 设计禁止静默安装、猜测 Vault、普通设备上传 release、运行中直接覆盖并谎报已加载，也禁止把 SHA-256
+  当作 friend-ready 阶段的最终签名方案；进入外部预览前仍需离线签名与内置公钥；
+- 本轮仍没有新增 Worker API、插件更新 UI、helper 生产入口或远端外发。下一实现顺序是先建立隔离的 Worker
+  release store 与只读契约测试，再增加认证 latest/archive 接口；在远端升级/回滚闭环通过前，现有手工脚本
+  继续作为恢复路径。

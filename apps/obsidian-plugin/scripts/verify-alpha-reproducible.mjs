@@ -13,17 +13,24 @@ const archive = join(
   `${manifest.id}-${manifest.version}-alpha.zip`
 );
 const installer = join(root, "dist", `install-${manifest.id}-${manifest.version}.zsh`);
+const releaseManifest = join(
+  root,
+  "dist",
+  `${manifest.id}-${manifest.version}-release.json`
+);
 
 const first = {
   archive: await sha256(archive),
-  installer: await sha256(installer)
+  installer: await sha256(installer),
+  releaseManifest: await sha256(releaseManifest)
 };
 execFileSync(process.execPath, [join(root, "scripts", "package-alpha.mjs")], {
   stdio: "ignore"
 });
 const second = {
   archive: await sha256(archive),
-  installer: await sha256(installer)
+  installer: await sha256(installer),
+  releaseManifest: await sha256(releaseManifest)
 };
 
 assert.deepEqual(second, first, "Two builds from the same inputs must be byte-identical.");
@@ -31,6 +38,7 @@ console.log(
   JSON.stringify({
     archiveSha256: second.archive,
     installerSha256: second.installer,
+    releaseManifestSha256: second.releaseManifest,
     reproducible: true
   })
 );

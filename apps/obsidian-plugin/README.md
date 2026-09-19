@@ -44,7 +44,8 @@ pnpm release:alpha
 The release command runs the complete plugin test suite, release-tool tests, strict type checking, the production
 build, package verification, a byte-for-byte reproducibility check, and a real installer smoke test in a temporary
 synthetic Vault. It refuses to package when `package.json`, `manifest.json`, and `versions.json` disagree. It writes
-the generated archive, its SHA-256 file, and a version-bound installer under `dist/`. The archive contains exactly `speech-capture/main.js`,
+the generated archive, its SHA-256 file, a machine-readable release manifest, and a version-bound installer under
+`dist/`. The archive contains exactly `speech-capture/main.js`,
 `speech-capture/manifest.json`, and `speech-capture/styles.css`; it never includes plugin settings, Vault IDs,
 credentials, audio, transcripts, Notes, databases, models, or source maps.
 
