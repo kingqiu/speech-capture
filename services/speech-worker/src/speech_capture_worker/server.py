@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from speech_capture_worker.api import create_app
+from speech_capture_worker.client_release_store import ClientReleaseStore
 from speech_capture_worker.device_security import DeviceSecurityStore
 from speech_capture_worker.errors import InvalidJobRequest
 from speech_capture_worker.job_store import JobStore
@@ -88,6 +89,7 @@ def serve(config: ServerConfig, *, runner: Any | None = None) -> None:
         runner(
             create_app(
                 store=jobs,
+                client_release_store=ClientReleaseStore(validated.data_dir / "client-releases"),
                 credential_verifier=security,
                 device_security_store=security,
                 endpoint_mode=("local_only" if _is_loopback(validated.host) else "private_tls"),

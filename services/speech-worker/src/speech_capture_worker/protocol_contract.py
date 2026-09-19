@@ -42,6 +42,7 @@ class ProtocolCapability(StrEnum):
     REVIEW_AUDIO_RANGES = "review_audio_ranges"
     WORKER_READINESS = "worker_readiness"
     JOB_DATA_DELETION = "job_data_deletion"
+    CLIENT_RELEASES = "client_releases"
 
 
 SUPPORTED_CAPABILITIES = tuple(ProtocolCapability)

@@ -27,6 +27,10 @@ class ClientReleaseError(ValueError):
     """Raised when a client release cannot be trusted or stored immutably."""
 
 
+class ClientReleaseNotFound(ClientReleaseError):
+    """Raised when an otherwise valid release version is not installed."""
+
+
 @dataclass(frozen=True, slots=True)
 class ClientPluginRelease:
     plugin_id: str
@@ -109,7 +113,7 @@ class ClientReleaseStore:
         release_root = self.root / _PLUGIN_ID / version
         manifest_path = release_root / f"{_PLUGIN_ID}-{version}-release.json"
         if not manifest_path.is_file() or manifest_path.is_symlink():
-            raise ClientReleaseError(f"release {version} is not installed")
+            raise ClientReleaseNotFound(f"release {version} is not installed")
         manifest_bytes = _read_bounded(manifest_path, _MAX_MANIFEST_BYTES, "release manifest")
         payload = _load_strict_json(manifest_bytes)
         parsed = _parse_release_manifest(payload)

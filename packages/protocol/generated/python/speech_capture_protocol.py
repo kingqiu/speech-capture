@@ -2,7 +2,7 @@
 
 from typing import Final, Literal, NotRequired, TypeAlias, TypedDict
 
-OPENAPI_SHA256: Final = "464e1155558ad4ca57acec210d42ea848371e0af959281126dbad6e4ebdc34f8"
+OPENAPI_SHA256: Final = "2ff8f0263f54aa3c6e9e1bec3c422f3ef3c1be517c3e4000fa5e15fff1720172"
 OPENAPI_VERSION: Final = "3.1.0"
 PROTOCOL_VERSION: Final = "1.0.0"
 
@@ -68,6 +68,7 @@ ProtocolCapability: TypeAlias = Literal[
     'review_audio_ranges',
     'worker_readiness',
     'job_data_deletion',
+    'client_releases',
 ]
 
 SpeakerLabelStatus: TypeAlias = Literal[
@@ -118,6 +119,11 @@ class ArtifactSchema(TypedDict):
     download_path: str
     media_type: Literal['text/markdown', 'application/json']
     name: Literal['transcript.raw.json', 'transcript.md', 'speech-record.json', 'note.md', 'note.evidence.md', 'timeline.md', 'artifact-manifest.json']
+    sha256: str
+    size_bytes: int
+
+class ClientReleaseArchiveSchema(TypedDict):
+    filename: str
     sha256: str
     size_bytes: int
 
@@ -463,6 +469,16 @@ class CapabilitiesResponse(TypedDict):
     protocol: VersionRangeSchema
     worker_version: str
 
+class ClientReleaseSchema(TypedDict):
+    archive: ClientReleaseArchiveSchema
+    desktop_only: Literal[True]
+    main_sha256: str
+    min_app_version: str
+    plugin_id: Literal['speech-capture']
+    release_manifest_sha256: str
+    schema_version: Literal[1]
+    version: str
+
 class CompatibilityRequestSchema(TypedDict):
     artifact_schema: VersionRangeSchema
     protocol: VersionRangeSchema
@@ -617,6 +633,8 @@ __all__ = [
     "ArtifactListResponse",
     "ArtifactSchema",
     "CapabilitiesResponse",
+    "ClientReleaseArchiveSchema",
+    "ClientReleaseSchema",
     "CompatibilityIssue",
     "CompatibilityRequestSchema",
     "CompatibilityResponse",

@@ -105,6 +105,8 @@ def test_openapi_is_versioned_strict_and_has_stable_operation_ids() -> None:
     assert set(schema["paths"]) == {
         "/v1/capabilities",
         "/v1/capabilities/negotiate",
+        "/v1/client-releases/speech-capture/latest",
+        "/v1/client-releases/speech-capture/{version}/archive",
         "/v1/device-credential-rotations/activate",
         "/v1/devices",
         "/v1/devices/{device_id}",
@@ -164,6 +166,7 @@ def test_openapi_is_versioned_strict_and_has_stable_operation_ids() -> None:
     }
     assert private_operations == {
         "completeUpload",
+        "downloadSpeechCaptureReleaseArchive",
         "acknowledgeJobPublication",
         "activateDeviceCredentialRotation",
         "cancelJob",
@@ -176,6 +179,7 @@ def test_openapi_is_versioned_strict_and_has_stable_operation_ids() -> None:
         "deleteJobSourceAudio",
         "downloadJobArtifact",
         "getJob",
+        "getLatestSpeechCaptureRelease",
         "getDiagnosticsSummary",
         "getJobSnapshot",
         "getJobUpdates",

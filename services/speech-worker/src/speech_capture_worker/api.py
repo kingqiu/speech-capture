@@ -7,7 +7,7 @@ from uuid import uuid4
 
 from fastapi import Depends, FastAPI, Header, Query, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from speech_capture_worker import __version__
@@ -20,6 +20,8 @@ from speech_capture_worker.api_schemas import (
     ArtifactName,
     ArtifactSchema,
     CapabilitiesResponse,
+    ClientReleaseArchiveSchema,
+    ClientReleaseSchema,
     CompatibilityRequestSchema,
     CompatibilityResponse,
     CorrectionListResponse,
@@ -80,10 +82,17 @@ from speech_capture_worker.api_schemas import (
     UploadPartEnvelope,
     UploadPartSchema,
     UploadSchema,
+    VersionString,
     WorkerReadinessResponse,
 )
 from speech_capture_worker.artifact_access import load_artifact_package
 from speech_capture_worker.audio_preprocessing import AudioPreprocessor
+from speech_capture_worker.client_release_store import (
+    ClientPluginRelease,
+    ClientReleaseError,
+    ClientReleaseNotFound,
+    ClientReleaseStore,
+)
 from speech_capture_worker.corrections import CorrectionField, encode_segment_review
 from speech_capture_worker.device_security import DeviceSecurityStore
 from speech_capture_worker.domain import (
@@ -177,6 +186,7 @@ class ApiProblem(RuntimeError):
 def create_app(
     *,
     store: JobStore | None = None,
+    client_release_store: ClientReleaseStore | None = None,
     credential_verifier: CredentialAuthenticator | None = None,
     device_security_store: DeviceSecurityStore | None = None,
     readiness_provider: Callable[[], WorkerReadinessSnapshot] | None = None,
@@ -287,9 +297,19 @@ def create_app(
             )
         return store
 
+    def require_client_release_store() -> ClientReleaseStore:
+        if client_release_store is None:
+            raise ApiProblem(
+                503,
+                "CLIENT_RELEASE_STORE_NOT_CONFIGURED",
+                "The client release store is not configured.",
+            )
+        return client_release_store
+
     Principal = Annotated[ApiPrincipal, Depends(require_principal)]
     BearerToken = Annotated[str, Depends(require_bearer_token)]
     Store = Annotated[JobStore, Depends(require_store)]
+    ReleaseStore = Annotated[ClientReleaseStore, Depends(require_client_release_store)]
 
     @app.get(
         "/v1/health",
@@ -335,6 +355,76 @@ def create_app(
             )
         )
         return CompatibilityResponse.model_validate(result.to_dict())
+
+    @app.get(
+        "/v1/client-releases/speech-capture/latest",
+        response_model=ClientReleaseSchema,
+        operation_id="getLatestSpeechCaptureRelease",
+        tags=["client-releases"],
+        responses=PRIVATE_ERROR_RESPONSES,
+    )
+    def get_latest_speech_capture_release(
+        _principal: Principal,
+        releases: ReleaseStore,
+    ) -> ClientReleaseSchema:
+        try:
+            release = releases.latest_release()
+        except ClientReleaseError as exc:
+            raise ApiProblem(
+                503,
+                "CLIENT_RELEASE_UNAVAILABLE",
+                "The client release could not be verified.",
+            ) from exc
+        if release is None:
+            raise ApiProblem(
+                404,
+                "CLIENT_RELEASE_NOT_FOUND",
+                "No Speech Capture client release is available.",
+            )
+        return _client_release_schema(release)
+
+    @app.get(
+        "/v1/client-releases/speech-capture/{version}/archive",
+        operation_id="downloadSpeechCaptureReleaseArchive",
+        tags=["client-releases"],
+        responses={
+            **PRIVATE_ERROR_RESPONSES,
+            200: {"content": {"application/zip": {}}},
+        },
+    )
+    def download_speech_capture_release_archive(
+        version: VersionString,
+        _principal: Principal,
+        releases: ReleaseStore,
+        if_none_match: Annotated[str | None, Header(max_length=256)] = None,
+    ) -> Response:
+        try:
+            release = releases.get_release(version)
+        except ClientReleaseNotFound as exc:
+            raise ApiProblem(
+                404,
+                "CLIENT_RELEASE_NOT_FOUND",
+                "The requested Speech Capture client release is unavailable.",
+            ) from exc
+        except ClientReleaseError as exc:
+            raise ApiProblem(
+                503,
+                "CLIENT_RELEASE_UNAVAILABLE",
+                "The requested Speech Capture client release could not be verified.",
+            ) from exc
+        headers = {
+            "Cache-Control": "private, immutable",
+            "ETag": f'"{release.archive_sha256}"',
+            "X-Content-SHA256": release.archive_sha256,
+        }
+        if _etag_matches(if_none_match, release.archive_sha256):
+            return Response(status_code=304, headers=headers)
+        return FileResponse(
+            release.archive_path,
+            media_type="application/zip",
+            filename=release.archive_path.name,
+            headers=headers,
+        )
 
     @app.post(
         "/v1/pairing/confirm",
@@ -1379,6 +1469,30 @@ def create_app(
         )
 
     return app
+
+
+def _client_release_schema(release: ClientPluginRelease) -> ClientReleaseSchema:
+    return ClientReleaseSchema(
+        schema_version=1,
+        plugin_id="speech-capture",
+        version=release.version,
+        min_app_version=release.min_app_version,
+        desktop_only=True,
+        archive=ClientReleaseArchiveSchema(
+            filename=release.archive_path.name,
+            sha256=release.archive_sha256,
+            size_bytes=release.archive_size_bytes,
+        ),
+        main_sha256=release.main_sha256,
+        release_manifest_sha256=release.release_manifest_sha256,
+    )
+
+
+def _etag_matches(if_none_match: str | None, sha256: str) -> bool:
+    if if_none_match is None:
+        return False
+    expected = f'"{sha256}"'
+    return any(candidate.strip() in {"*", expected} for candidate in if_none_match.split(","))
 
 
 def _error_response(

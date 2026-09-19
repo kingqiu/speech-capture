@@ -120,6 +120,25 @@ class ApiErrorResponse(PublicSchema):
     error: ApiErrorSchema
 
 
+class ClientReleaseArchiveSchema(PublicSchema):
+    filename: str = Field(
+        pattern=r"^speech-capture-(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-alpha\.zip$"
+    )
+    sha256: Sha256String
+    size_bytes: int = Field(gt=0)
+
+
+class ClientReleaseSchema(PublicSchema):
+    schema_version: Literal[1]
+    plugin_id: Literal["speech-capture"]
+    version: VersionString
+    min_app_version: VersionString
+    desktop_only: Literal[True]
+    archive: ClientReleaseArchiveSchema
+    main_sha256: Sha256String
+    release_manifest_sha256: Sha256String
+
+
 class PairingConfirmRequestSchema(PublicSchema):
     pairing_ticket: str | None = Field(
         default=None,

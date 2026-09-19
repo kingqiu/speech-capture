@@ -4403,3 +4403,18 @@ Stage J 的新扩展，未经明确要求不 commit/push。
   release、修改现有 Worker 数据目录或向远端设备外发；
 - 下一步只增加认证的 latest/archive 只读 API 与协议类型。管理员导入 CLI、插件下载 UI、helper 和自动更新
   仍未实现，也不得由普通配对设备获得 release 写权限。
+
+## 131. 2026-09-19 Worker 客户端 release 只读 API 完成
+
+- Worker server 现把独立 `ClientReleaseStore` 固定接在 `<data-dir>/client-releases`，不复用 JobStore、任务
+  artifact 或 Vault 发布路径；没有增加任何网络导入、覆盖或删除 release 的接口；
+- 新增两条仅限已认证配对设备的 GET 接口：`latest` 返回版本、兼容性和内容哈希，`archive` 只按规范
+  semver 下载固定 ZIP；两者都不会返回宿主路径、installer、Vault、设备或内容信息；
+- archive 在每次读取时重新执行 release store 的完整校验，返回强 ETag、SHA-256 和 private/immutable cache
+  边界，并支持 `If-None-Match` 的 304；不存在返回 404，磁盘内容篡改或无法验证返回脱敏 503；
+- 协议 capability 新增 `client_releases`，OpenAPI 和 Python/TypeScript 生成类型已同步；未配对、错误令牌、
+  空 store、缺失版本、篡改包、条件请求、响应隐私和“仅 GET、无远程写入口”均有专项测试；
+- Worker 全量 720 项、完整 Ruff、协议生成检查、插件 85 项、TypeScript 与生产构建通过。没有导入真实
+  release、部署 Worker、读取私人会议/Vault、安装插件或向远端外发文件；
+- 下一步先增加仅限宿主本机管理员执行的 release 导入命令及审计输出，再实现插件内“检查、下载、校验、
+  明确确认”界面；helper、退出后安装和回滚仍在后续门内，手工脚本继续作为恢复路径。

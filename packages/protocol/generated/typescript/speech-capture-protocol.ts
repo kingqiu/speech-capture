@@ -1,5 +1,5 @@
 // Generated Worker protocol wire types. Do not edit manually.
-export const OPENAPI_SHA256 = "464e1155558ad4ca57acec210d42ea848371e0af959281126dbad6e4ebdc34f8" as const;
+export const OPENAPI_SHA256 = "2ff8f0263f54aa3c6e9e1bec3c422f3ef3c1be517c3e4000fa5e15fff1720172" as const;
 export const OPENAPI_VERSION = "3.1.0" as const;
 export const PROTOCOL_VERSION = "1.0.0" as const;
 
@@ -44,6 +44,23 @@ export interface CapabilitiesResponse {
   readonly model_profiles: ReadonlyArray<string>;
   readonly protocol: VersionRangeSchema;
   readonly worker_version: string;
+}
+
+export interface ClientReleaseArchiveSchema {
+  readonly filename: string;
+  readonly sha256: string;
+  readonly size_bytes: number;
+}
+
+export interface ClientReleaseSchema {
+  readonly archive: ClientReleaseArchiveSchema;
+  readonly desktop_only: true;
+  readonly main_sha256: string;
+  readonly min_app_version: string;
+  readonly plugin_id: "speech-capture";
+  readonly release_manifest_sha256: string;
+  readonly schema_version: 1;
+  readonly version: string;
 }
 
 export type CompatibilityIssue =
@@ -337,7 +354,8 @@ export type ProtocolCapability =
   | "atomic_vault_publication"
   | "review_audio_ranges"
   | "worker_readiness"
-  | "job_data_deletion";
+  | "job_data_deletion"
+  | "client_releases";
 
 export interface ProtocolLimitsSchema {
   readonly default_upload_chunk_size_bytes: number;
