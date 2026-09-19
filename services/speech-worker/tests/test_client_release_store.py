@@ -86,6 +86,18 @@ def test_import_is_verified_immutable_and_latest_is_semantic(tmp_path: Path) -> 
     assert not (tmp_path / "worker" / "artifacts").exists()
 
 
+def test_import_result_distinguishes_new_and_idempotent_release(tmp_path: Path) -> None:
+    store = ClientReleaseStore(tmp_path / "releases")
+    manifest = _write_release(tmp_path / "source")
+
+    created = store.import_release_with_result(manifest)
+    repeated = store.import_release_with_result(manifest)
+
+    assert created.created is True
+    assert repeated.created is False
+    assert created.release == repeated.release
+
+
 def test_tampered_archive_is_rejected_without_creating_release(tmp_path: Path) -> None:
     manifest_path = _write_release(tmp_path / "source")
     archive_path = manifest_path.parent / "speech-capture-0.1.25-alpha.zip"
@@ -154,3 +166,15 @@ def test_release_store_has_no_job_or_publication_dependency() -> None:
     assert "job_store" not in source
     assert "vault_publication" not in source
     assert "artifact_generation" not in source
+
+
+def test_symlinked_release_directory_is_rejected(tmp_path: Path) -> None:
+    external = ClientReleaseStore(tmp_path / "external")
+    external.import_release(_write_release(tmp_path / "source"))
+    store = ClientReleaseStore(tmp_path / "releases")
+    plugin_root = store.root / "speech-capture"
+    plugin_root.parent.mkdir(parents=True)
+    plugin_root.symlink_to(external.root / "speech-capture", target_is_directory=True)
+
+    with pytest.raises(ClientReleaseError, match="symbolic link"):
+        store.latest_release()

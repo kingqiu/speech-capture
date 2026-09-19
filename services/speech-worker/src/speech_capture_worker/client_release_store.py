@@ -46,6 +46,12 @@ class ClientPluginRelease:
     release_manifest_sha256: str
 
 
+@dataclass(frozen=True, slots=True)
+class ClientReleaseImportResult:
+    release: ClientPluginRelease
+    created: bool
+
+
 class ClientReleaseStore:
     """An immutable, task-independent store for verified client releases."""
 
@@ -53,6 +59,12 @@ class ClientReleaseStore:
         self.root = root.resolve()
 
     def import_release(self, release_manifest_path: Path) -> ClientPluginRelease:
+        return self.import_release_with_result(release_manifest_path).release
+
+    def import_release_with_result(
+        self,
+        release_manifest_path: Path,
+    ) -> ClientReleaseImportResult:
         manifest_path = release_manifest_path.resolve()
         if release_manifest_path.is_symlink() or not manifest_path.is_file():
             raise ClientReleaseError("release manifest must be a regular file")
@@ -84,16 +96,18 @@ class ClientReleaseStore:
 
         release_manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
         plugin_root = self.root / _PLUGIN_ID
+        if plugin_root.is_symlink():
+            raise ClientReleaseError("release plugin directory cannot be a symbolic link")
         target = plugin_root / parsed["version"]
         if target.exists():
             existing = self.get_release(parsed["version"])
             if existing.release_manifest_sha256 != release_manifest_sha256:
                 raise ClientReleaseError("release versions are immutable")
-            return existing
+            return ClientReleaseImportResult(release=existing, created=False)
 
-        plugin_root.mkdir(parents=True, exist_ok=True)
+        plugin_root.mkdir(parents=True, exist_ok=True, mode=0o700)
         staging = self.root / f".staging-{uuid.uuid4().hex}"
-        staging.mkdir(parents=False, exist_ok=False)
+        staging.mkdir(parents=False, exist_ok=False, mode=0o700)
         try:
             shutil.copyfile(manifest_path, staging / expected_manifest_name)
             shutil.copyfile(archive_path, staging / parsed["archive_filename"])
@@ -104,13 +118,21 @@ class ClientReleaseStore:
             if target.exists():
                 existing = self.get_release(parsed["version"])
                 if existing.release_manifest_sha256 == release_manifest_sha256:
-                    return existing
+                    return ClientReleaseImportResult(release=existing, created=False)
             raise
-        return self.get_release(parsed["version"])
+        return ClientReleaseImportResult(
+            release=self.get_release(parsed["version"]),
+            created=True,
+        )
 
     def get_release(self, version: str) -> ClientPluginRelease:
         _parse_version(version)
-        release_root = self.root / _PLUGIN_ID / version
+        plugin_root = self.root / _PLUGIN_ID
+        if plugin_root.is_symlink():
+            raise ClientReleaseError("release plugin directory cannot be a symbolic link")
+        release_root = plugin_root / version
+        if release_root.is_symlink():
+            raise ClientReleaseError("release version directory cannot be a symbolic link")
         manifest_path = release_root / f"{_PLUGIN_ID}-{version}-release.json"
         if not manifest_path.is_file() or manifest_path.is_symlink():
             raise ClientReleaseNotFound(f"release {version} is not installed")
@@ -153,6 +175,8 @@ class ClientReleaseStore:
 
     def latest_release(self) -> ClientPluginRelease | None:
         plugin_root = self.root / _PLUGIN_ID
+        if plugin_root.is_symlink():
+            raise ClientReleaseError("release plugin directory cannot be a symbolic link")
         if not plugin_root.is_dir():
             return None
         versions = [

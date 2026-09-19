@@ -4418,3 +4418,19 @@ Stage J 的新扩展，未经明确要求不 commit/push。
   release、部署 Worker、读取私人会议/Vault、安装插件或向远端外发文件；
 - 下一步先增加仅限宿主本机管理员执行的 release 导入命令及审计输出，再实现插件内“检查、下载、校验、
   明确确认”界面；helper、退出后安装和回滚仍在后续门内，手工脚本继续作为恢复路径。
+
+## 132. 2026-09-19 宿主本机 release 管理命令完成
+
+- Worker Manager 新增 `client-release-import`：只接受显式绝对 release manifest 路径，在本机复用严格
+  `ClientReleaseStore` 校验并以同卷 staging/原子 rename 导入 `<data-dir>/client-releases`；运行中的只读 API
+  可在下一次请求看到新版本，不需要停止 Worker；
+- 新增 `client-release-status`，读取时重新校验 latest。两条命令均不启动 launchd 操作、不要求 Worker
+  executable，也不会创建 `worker.sqlite3`、`security.sqlite3`、任务、配对或 Vault 状态；
+- 导入 JSON 审计只含 created、插件/版本/兼容性、固定文件名、大小和 SHA-256；不返回 manifest 源路径、
+  data dir、设备、Vault 或内容。相同版本同字节重复导入返回 `created=false`，不同字节不可覆盖；
+- 损坏包、相对路径、符号链接 release 目录及不可验证 store 全部 fail closed，并返回稳定脱敏
+  `CLIENT_RELEASE_IMPORT_FAILED`；网络 API 仍只有 GET，没有远程导入、覆盖或删除权限；
+- Worker 全量 725 项、完整 Ruff、协议生成检查及补丁格式检查通过。本批没有导入宿主真实 release、部署
+  Worker、安装插件、访问私人会议/Vault 或向远端外发文件；
+- 下一步进入插件侧只执行“检查更新 → 下载 → 本地校验 → 明确确认”的阶段，暂不执行安装。只有该阶段的
+  状态机和损坏/断网测试通过后，才实现退出 Obsidian 后运行的最小 helper。

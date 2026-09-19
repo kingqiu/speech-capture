@@ -39,6 +39,7 @@ PUBLIC_ERROR_MESSAGES = {
     "SERVICE_NOT_INSTALLED": "The Worker background service is not installed.",
     "SERVICE_INSTALL_CONFLICT": "A different Worker service configuration already exists.",
     "SERVICE_COMMAND_FAILED": "macOS could not complete the Worker service operation.",
+    "CLIENT_RELEASE_IMPORT_FAILED": "The client release could not be verified and imported.",
 }
 
 

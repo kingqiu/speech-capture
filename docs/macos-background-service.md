@@ -50,6 +50,15 @@ uv run speech-capture-manager diagnostic-bundle \
   --output "/private/tmp/worker-diagnostics.zip" \
   --executable "$PWD/.venv/bin/speech-capture-worker"
 
+# Import one immutable plugin release from an explicit local release manifest.
+# This does not require stopping the Worker and exposes no network write API.
+uv run speech-capture-manager client-release-import \
+  --data-dir runtime/dev-worker \
+  --release-manifest "/absolute/path/speech-capture-0.1.25-release.json"
+
+uv run speech-capture-manager client-release-status \
+  --data-dir runtime/dev-worker
+
 uv run speech-capture-manager restart \
   --executable "$PWD/.venv/bin/speech-capture-worker"
 
@@ -86,6 +95,14 @@ The diagnostic bundle contains only fixed JSON entries for public environment ve
 status, activation identity, full model validation, and per-entry hashes. Raw logs are intentionally excluded. The
 command refuses existing outputs and does not print the requested path or filename in its result. The example path
 above is for development only; a future native Manager will present a normal save dialog.
+
+`client-release-import` is a host-local administrator command. It requires an absolute path to a release manifest,
+verifies that manifest plus the adjacent ZIP and installer, then atomically imports the immutable version under the
+Worker data directory. Its machine-readable result contains only version, filenames, sizes and hashes; it never
+prints the source path, data directory, device, Vault or content information. Re-importing identical bytes is
+idempotent, while different bytes can never replace an existing version. `client-release-status` performs the same
+on-read verification for the latest stored release and likewise returns no local path. Neither command installs the
+plugin or adds a remote upload endpoint.
 
 ## 3. Restart and login conditions
 

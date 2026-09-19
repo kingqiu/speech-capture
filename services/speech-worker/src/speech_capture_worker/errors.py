@@ -227,6 +227,10 @@ class DiagnosticBundleFailed(WorkerCoreError):
     code = "DIAGNOSTIC_BUNDLE_FAILED"
 
 
+class ClientReleaseImportFailed(WorkerCoreError):
+    code = "CLIENT_RELEASE_IMPORT_FAILED"
+
+
 class PublicationLeaseConflict(WorkerCoreError):
     code = "PUBLICATION_LEASE_CONFLICT"
 

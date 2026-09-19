@@ -9,8 +9,17 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
+from speech_capture_worker.client_release_store import (
+    ClientPluginRelease,
+    ClientReleaseError,
+    ClientReleaseStore,
+)
 from speech_capture_worker.diagnostic_bundle import build_diagnostic_bundle
-from speech_capture_worker.errors import InvalidJobRequest, WorkerCoreError
+from speech_capture_worker.errors import (
+    ClientReleaseImportFailed,
+    InvalidJobRequest,
+    WorkerCoreError,
+)
 from speech_capture_worker.launchd_service import (
     DEFAULT_LAUNCHD_LABEL,
     LaunchdServiceConfig,
@@ -31,6 +40,49 @@ from speech_capture_worker.redaction import public_cli_error_payload
 def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     try:
+        if args.command in {"client-release-import", "client-release-status"}:
+            releases = ClientReleaseStore(args.data_dir.resolve() / "client-releases")
+            if args.command == "client-release-status":
+                try:
+                    latest = releases.latest_release()
+                except ClientReleaseError as exc:
+                    raise ClientReleaseImportFailed(
+                        "The client release store could not be verified."
+                    ) from exc
+                print(
+                    json.dumps(
+                        {
+                            "client_release_store": {
+                                "available": latest is not None,
+                                "latest": _client_release_payload(latest) if latest else None,
+                            }
+                        },
+                        sort_keys=True,
+                    )
+                )
+                return 0
+            if not args.release_manifest.is_absolute():
+                raise ClientReleaseImportFailed(
+                    "The client release manifest path must be absolute."
+                )
+            try:
+                result = releases.import_release_with_result(args.release_manifest)
+            except (ClientReleaseError, OSError) as exc:
+                raise ClientReleaseImportFailed(
+                    "The client release package could not be verified and imported."
+                ) from exc
+            print(
+                json.dumps(
+                    {
+                        "client_release_import": {
+                            "created": result.created,
+                            "release": _client_release_payload(result.release),
+                        }
+                    },
+                    sort_keys=True,
+                )
+            )
+            return 0
         config = _config_from_args(args)
         if args.command in {
             "model-activate",
@@ -117,9 +169,15 @@ def _build_parser() -> argparse.ArgumentParser:
         "model-rollback",
         "model-activation-status",
         "diagnostic-bundle",
+        "client-release-import",
+        "client-release-status",
     ):
         subparser = subparsers.add_parser(command)
         subparser.add_argument("--data-dir", type=Path, default=default_data_dir())
+        if command == "client-release-import":
+            subparser.add_argument("--release-manifest", type=Path, required=True)
+        if command in {"client-release-import", "client-release-status"}:
+            continue
         subparser.add_argument("--executable", type=Path)
         subparser.add_argument("--host", default="127.0.0.1")
         subparser.add_argument("--port", type=int, default=8765)
@@ -162,6 +220,28 @@ def _find_worker_executable() -> Path:
             "The Worker executable was not found; provide --executable explicitly."
         )
     return Path(candidate)
+
+
+def _client_release_payload(release: ClientPluginRelease) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "plugin_id": release.plugin_id,
+        "version": release.version,
+        "min_app_version": release.min_app_version,
+        "desktop_only": True,
+        "archive": {
+            "filename": release.archive_path.name,
+            "sha256": release.archive_sha256,
+            "size_bytes": release.archive_size_bytes,
+        },
+        "installer": {
+            "filename": release.installer_path.name,
+            "sha256": release.installer_sha256,
+            "size_bytes": release.installer_size_bytes,
+        },
+        "main_sha256": release.main_sha256,
+        "release_manifest_sha256": release.release_manifest_sha256,
+    }
 
 
 if __name__ == "__main__":

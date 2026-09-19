@@ -2,7 +2,7 @@
 
 日期：2026-09-19
 
-状态：发布清单、不可变 Worker release store 和认证只读 API 已完成；插件更新入口尚未实现
+状态：发布清单、不可变 Worker release store、宿主本机导入命令和认证只读 API 已完成；插件更新入口尚未实现
 
 ## 1. 目标
 
@@ -105,3 +105,7 @@ V1 只服务于 macOS 桌面个人 Alpha。它必须显式征得用户确认，�
 步骤 2 的实现额外固定：普通配对设备只有 GET 权限；latest/archive 均先认证；archive 每次响应前重新验证
 不可变 store，返回强 ETag、SHA-256 与 private cache 头并支持 304；任何磁盘篡改都脱敏失败，不降级为
 未经验证的下载。生产分发前仍需由宿主本机管理员显式导入 release，网络 API 不承担该职责。
+
+宿主本机导入现由 `speech-capture-manager client-release-import` 承担：必须给出绝对 manifest 路径，导入前
+完整验证相邻 ZIP 与 installer，使用同卷 staging 和原子 rename；相同版本同字节幂等，不同字节不可覆盖。
+命令与 `client-release-status` 的 JSON 审计结果只含固定公开元数据、大小和哈希，不含本机路径或私人状态。

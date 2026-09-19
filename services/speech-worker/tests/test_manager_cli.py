@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import zipfile
+from pathlib import Path
 from types import SimpleNamespace
 
+from speech_capture_worker.client_release_store import ClientReleaseStore
 from speech_capture_worker.errors import ServiceCommandFailed
 from speech_capture_worker.launchd_service import LaunchdServiceStatus
 from speech_capture_worker.manager_cli import main
@@ -16,6 +20,61 @@ def _executable(tmp_path):
     executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     executable.chmod(0o700)
     return executable
+
+
+def _write_client_release(root: Path, version: str = "0.1.25") -> Path:
+    root.mkdir(parents=True)
+    files = {
+        "main.js": b"compiled-manager-release",
+        "manifest.json": json.dumps(
+            {
+                "id": "speech-capture",
+                "version": version,
+                "minAppVersion": "1.11.4",
+                "isDesktopOnly": True,
+            },
+            separators=(",", ":"),
+        ).encode(),
+        "styles.css": b".speech-capture{display:block}",
+    }
+    archive_name = f"speech-capture-{version}-alpha.zip"
+    archive_path = root / archive_name
+    with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name, content in files.items():
+            archive.writestr(f"speech-capture/{name}", content)
+    installer_name = f"install-speech-capture-{version}.zsh"
+    installer_path = root / installer_name
+    installer_path.write_bytes(b"#!/bin/zsh\nexit 0\n")
+    manifest = {
+        "schema_version": 1,
+        "plugin": {
+            "id": "speech-capture",
+            "version": version,
+            "min_app_version": "1.11.4",
+            "desktop_only": True,
+        },
+        "archive": {
+            "filename": archive_name,
+            "sha256": hashlib.sha256(archive_path.read_bytes()).hexdigest(),
+            "size_bytes": archive_path.stat().st_size,
+            "entries": [f"speech-capture/{name}" for name in files],
+        },
+        "installer": {
+            "filename": installer_name,
+            "sha256": hashlib.sha256(installer_path.read_bytes()).hexdigest(),
+            "size_bytes": installer_path.stat().st_size,
+        },
+        "files": {
+            name: {
+                "sha256": hashlib.sha256(content).hexdigest(),
+                "size_bytes": len(content),
+            }
+            for name, content in files.items()
+        },
+    }
+    manifest_path = root / f"speech-capture-{version}-release.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    return manifest_path
 
 
 def test_manager_cli_returns_content_free_service_status(tmp_path, monkeypatch, capsys) -> None:
@@ -302,6 +361,97 @@ def test_manager_cli_builds_diagnostic_bundle_without_returning_output_path(
     assert output.err == ""
     assert json.loads(output.out)["diagnostic_bundle"]["created"] is True
     assert str(output_path) not in output.out
+
+
+def test_manager_cli_imports_release_idempotently_without_exposing_paths(
+    tmp_path,
+    capsys,
+) -> None:
+    data_dir = tmp_path / "runtime"
+    manifest_path = _write_client_release(tmp_path / "private-release-source")
+    command = [
+        "client-release-import",
+        "--data-dir",
+        str(data_dir),
+        "--release-manifest",
+        str(manifest_path),
+    ]
+
+    assert main(command) == 0
+    first_output = capsys.readouterr()
+    first = json.loads(first_output.out)["client_release_import"]
+    assert first["created"] is True
+    assert first["release"]["version"] == "0.1.25"
+    assert first["release"]["archive"]["sha256"] == hashlib.sha256(
+        (manifest_path.parent / "speech-capture-0.1.25-alpha.zip").read_bytes()
+    ).hexdigest()
+    assert str(tmp_path) not in first_output.out
+    assert first_output.err == ""
+
+    assert main(command) == 0
+    repeated = json.loads(capsys.readouterr().out)["client_release_import"]
+    assert repeated["created"] is False
+
+    assert main(["client-release-status", "--data-dir", str(data_dir)]) == 0
+    status_output = capsys.readouterr()
+    status = json.loads(status_output.out)["client_release_store"]
+    assert status["available"] is True
+    assert status["latest"]["version"] == "0.1.25"
+    assert str(tmp_path) not in status_output.out
+    assert not (data_dir / "worker.sqlite3").exists()
+    assert not (data_dir / "security.sqlite3").exists()
+    assert ClientReleaseStore(data_dir / "client-releases").latest_release() is not None
+
+
+def test_manager_cli_release_import_fails_closed_without_private_details(
+    tmp_path,
+    capsys,
+) -> None:
+    data_dir = tmp_path / "runtime"
+    manifest_path = _write_client_release(tmp_path / "private-release-source")
+    archive_path = manifest_path.parent / "speech-capture-0.1.25-alpha.zip"
+    archive_path.write_bytes(archive_path.read_bytes() + b"tampered")
+
+    result = main([
+        "client-release-import",
+        "--data-dir",
+        str(data_dir),
+        "--release-manifest",
+        str(manifest_path),
+    ])
+    output = capsys.readouterr()
+
+    assert result == 2
+    assert output.out == ""
+    assert json.loads(output.err)["error"] == {
+        "code": "CLIENT_RELEASE_IMPORT_FAILED",
+        "message": "The client release package could not be verified and imported.",
+    }
+    assert str(tmp_path) not in output.err
+    assert ClientReleaseStore(data_dir / "client-releases").latest_release() is None
+
+
+def test_manager_cli_release_import_requires_absolute_manifest_path(
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    result = main([
+        "client-release-import",
+        "--data-dir",
+        str(tmp_path / "runtime"),
+        "--release-manifest",
+        "relative-release.json",
+    ])
+    error = json.loads(capsys.readouterr().err)["error"]
+
+    assert result == 2
+    assert error == {
+        "code": "CLIENT_RELEASE_IMPORT_FAILED",
+        "message": "The client release manifest path must be absolute.",
+    }
 
 
 class SimpleStatus:
